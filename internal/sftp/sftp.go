@@ -20,9 +20,9 @@ type Conn struct {
 	SSH    *sshc.Client
 }
 
-// Dial 建立 SFTP 连接（底层复用 sshc.Connect 与 known_hosts 校验）
+// Dial 建立 SFTP 连接（认证走原始凭据，不合并 ~/.ssh/config）
 func Dial(h *model.Host, password string, opts ...sshc.Option) (*Conn, error) {
-	sshCl, err := sshc.Connect(h, password, opts...)
+	sshCl, err := sshc.ConnectRaw(h, password, opts...)
 	if err != nil {
 		return nil, err
 	}

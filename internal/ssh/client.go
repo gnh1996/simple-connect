@@ -35,15 +35,23 @@ func WithHostKeyCallback(cb ssh.HostKeyCallback) Option {
 	}
 }
 
-// Connect 建立 SSH 连接
+// Connect 建立 SSH 连接（自动合并 ~/.ssh/config，支持 ProxyJump 跳板）
 func Connect(h *model.Host, password string, opts ...Option) (*Client, error) {
-	cfg := &ssh.ClientConfig{
-		User:            h.User,
-		Auth:            authMethods(h, password),
-		HostKeyCallback: hostKeyCallback(h.Addr()),
-		Timeout:         10 * time.Second,
-		ClientVersion:   "SSH-2.0-simple-connect",
+	target, jumps := ResolveSSHConfig(h)
+	cfg := newConfig(target, password)
+	for _, o := range opts {
+		o(cfg)
 	}
+	conn, err := dialWithJumps(jumps, cfg, opts, password, target)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{Client: conn, Host: target}, nil
+}
+
+// ConnectRaw 建立 SSH 连接（不合并 ~/.ssh/config，测试与内嵌 SFTP 使用）
+func ConnectRaw(h *model.Host, password string, opts ...Option) (*Client, error) {
+	cfg := newConfig(h, password)
 	for _, o := range opts {
 		o(cfg)
 	}
@@ -54,14 +62,80 @@ func Connect(h *model.Host, password string, opts ...Option) (*Client, error) {
 	return &Client{Client: conn, Host: h}, nil
 }
 
+// newConfig 构造 SSH 客户端配置
+func newConfig(h *model.Host, password string) *ssh.ClientConfig {
+	return &ssh.ClientConfig{
+		User:            h.User,
+		Auth:            authMethods(h, password),
+		HostKeyCallback: hostKeyCallback(h.Addr()),
+		Timeout:         10 * time.Second,
+		ClientVersion:   "SSH-2.0-simple-connect",
+	}
+}
+
+// dialWithJumps 依次经跳板机隧道连接目标；无跳板时直连
+func dialWithJumps(jumps []*model.Host, targetCfg *ssh.ClientConfig, opts []Option, password string, target *model.Host) (*ssh.Client, error) {
+	var current *ssh.Client
+	var err error
+	for _, j := range jumps {
+		jcfg := newConfig(j, password) // 跳板复用目标保存的密码与密钥
+		for _, o := range opts {
+			o(jcfg)
+		}
+		if current == nil {
+			current, err = ssh.Dial("tcp", j.Addr(), jcfg)
+		} else {
+			var c net.Conn
+			c, err = current.Dial("tcp", j.Addr())
+			if err == nil {
+				cc, chans, reqs, e := ssh.NewClientConn(c, j.Addr(), jcfg)
+				if e != nil {
+					err = e
+				} else {
+					current = ssh.NewClient(cc, chans, reqs)
+				}
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("连接跳板 %s 失败: %w", j.Addr(), err)
+		}
+	}
+
+	if current == nil {
+		return ssh.Dial("tcp", target.Addr(), targetCfg)
+	}
+	c, err := current.Dial("tcp", target.Addr())
+	if err != nil {
+		return nil, fmt.Errorf("经跳板连接 %s 失败: %w", target.Addr(), err)
+	}
+	cc, chans, reqs, err := ssh.NewClientConn(c, target.Addr(), targetCfg)
+	if err != nil {
+		return nil, err
+	}
+	return ssh.NewClient(cc, chans, reqs), nil
+}
+
 // NewSession 创建会话（带 PTY 的交互终端）
 func (c *Client) NewTerminalSession(term string, rows, cols int) (*ssh.Session, error) {
 	s, err := c.NewSession()
 	if err != nil {
 		return nil, err
 	}
+	// 与 OpenSSH 对齐的 tty 模式
 	modes := ssh.TerminalModes{
 		ssh.ECHO:          1,
+		ssh.ECHOE:         1,
+		ssh.ECHOK:         1,
+		ssh.ECHOKE:        1,
+		ssh.ECHOCTL:       1,
+		ssh.ICANON:        1,
+		ssh.IEXTEN:        1,
+		ssh.ISIG:          1,
+		ssh.IXON:          1,
+		ssh.ICRNL:         1,
+		ssh.OPOST:         1,
+		ssh.ONLCR:         1,
+		ssh.CS8:           1,
 		ssh.TTY_OP_ISPEED: 14400,
 		ssh.TTY_OP_OSPEED: 14400,
 	}
@@ -72,7 +146,7 @@ func (c *Client) NewTerminalSession(term string, rows, cols int) (*ssh.Session, 
 	return s, nil
 }
 
-// authMethods 根据认证方式生成认证方法
+// authMethods 根据认证方式生成认证方法（私钥 + 密码 + keyboard-interactive + agent）
 func authMethods(h *model.Host, password string) []ssh.AuthMethod {
 	var methods []ssh.AuthMethod
 	if h.Auth == model.AuthKey && h.KeyPath != "" {
@@ -82,12 +156,25 @@ func authMethods(h *model.Host, password string) []ssh.AuthMethod {
 	}
 	if password != "" {
 		methods = append(methods, ssh.Password(password))
+		// 兼容部分服务器使用 keyboard-interactive 认证
+		methods = append(methods, ssh.KeyboardInteractive(passwordAnswer(password)))
 	}
 	// 代理认证兜底
 	if agent, err := agentSigner(); err == nil {
 		methods = append(methods, ssh.PublicKeysCallback(agent))
 	}
 	return methods
+}
+
+// passwordAnswer 用保存的密码应答 keyboard-interactive 全部提示
+func passwordAnswer(password string) func(string, string, []string, []bool) ([]string, error) {
+	return func(name, instruction string, questions []string, echos []bool) ([]string, error) {
+		answers := make([]string, len(questions))
+		for i := range answers {
+			answers[i] = password
+		}
+		return answers, nil
+	}
 }
 
 // loadSigner 加载私钥签名器（支持加密私钥）
@@ -102,13 +189,9 @@ func loadSigner(keyPath, passphrase string) (ssh.Signer, error) {
 	return ssh.ParsePrivateKey(pem)
 }
 
-// agentSigner 返回 ssh-agent 中的全部签名器（支持 SSH_AUTH_SOCK）
+// agentSigner 返回 ssh-agent 中的全部签名器
 func agentSigner() (func() ([]ssh.Signer, error), error) {
-	addr := os.Getenv("SSH_AUTH_SOCK")
-	if addr == "" {
-		return nil, os.ErrNotExist
-	}
-	conn, err := net.Dial("unix", addr)
+	conn, err := agentConn()
 	if err != nil {
 		return nil, err
 	}

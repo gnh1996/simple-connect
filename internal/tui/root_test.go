@@ -2,6 +2,7 @@ package tui
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -74,14 +75,28 @@ func TestListConnectAndQuit(t *testing.T) {
 	_ = s.Add(h)
 
 	root := NewRoot(s)
-	// Enter 触发连接
+	// 密码认证主机：Enter 先进入免密提示待确认态
 	rm, cmd := root.Update(pressKey(tea.KeyEnter))
+	if cmd != nil {
+		t.Fatalf("Enter 不应直接连接，应进入待确认态，实际返回命令")
+	}
+	root = rm.(*Root)
+	if root.list.connectID != h.ID {
+		t.Fatalf("应进入连接待确认态，connectID=%q", root.list.connectID)
+	}
+	view := root.View().Content
+	if !strings.Contains(view, "免密提示") {
+		t.Fatalf("界面应显示免密提示，实际: %q", view)
+	}
+
+	// 再次 Enter 确认连接
+	rm, cmd = root.Update(pressKey(tea.KeyEnter))
 	cm, ok := cmd().(tea.Msg)
 	if !ok {
 		t.Fatal("cmd 应返回 Msg")
 	}
 	if _, isConnect := cm.(connectMsg); !isConnect {
-		t.Fatalf("Enter 应产生 connectMsg，实际 %T", cm)
+		t.Fatalf("确认后应产生 connectMsg，实际 %T", cm)
 	}
 	root = rm.(*Root)
 	root.Action = ActionSSH
@@ -91,6 +106,34 @@ func TestListConnectAndQuit(t *testing.T) {
 	_, cmd2 := root.Update(press("q"))
 	if _, isQuit := cmd2().(quitMsg); !isQuit {
 		t.Fatalf("q 应产生 quitMsg，实际 %T", cmd2().(tea.Msg))
+	}
+}
+
+func TestListConnectConfirmCancel(t *testing.T) {
+	s := testStore(t)
+	h := &model.Host{Name: "测试机", Host: "10.0.0.1", User: "root", Auth: model.AuthPassword}
+	_ = s.Add(h)
+
+	root := NewRoot(s)
+	// Enter 进入待确认态
+	root = upd(root, pressKey(tea.KeyEnter))
+	if root.list.connectID != h.ID {
+		t.Fatalf("应进入连接待确认态")
+	}
+	// Esc 取消
+	root = upd(root, pressKey(tea.KeyEsc))
+	if root.list.connectID != "" {
+		t.Fatalf("Esc 应取消连接确认")
+	}
+	// 取消后不应产生 connectMsg（无命令）
+	rm, cmd := root.Update(pressKey(tea.KeyEnter))
+	_ = rm
+	if cmd != nil {
+		t.Fatal("取消后 Enter 应重新进入待确认态而不是直接连接")
+	}
+	root = rm.(*Root)
+	if root.list.connectID != h.ID {
+		t.Fatalf("Enter 应再次进入待确认态")
 	}
 }
 
@@ -134,6 +177,33 @@ func TestFormAddHost(t *testing.T) {
 	h := root.Store.Hosts()[0]
 	if h.Name != "生产服务器" || h.Host != "10.1.2.3" || h.User != "admin" {
 		t.Fatalf("保存的连接数据异常: %+v", h)
+	}
+}
+
+func TestListKeyAuthNoAgentHint(t *testing.T) {
+	// 模拟无 agent 环境
+	old, had := os.LookupEnv("SSH_AUTH_SOCK")
+	_ = os.Setenv("SSH_AUTH_SOCK", filepath.Join(t.TempDir(), "no-agent.sock"))
+	t.Cleanup(func() {
+		if had {
+			_ = os.Setenv("SSH_AUTH_SOCK", old)
+		} else {
+			_ = os.Unsetenv("SSH_AUTH_SOCK")
+		}
+	})
+
+	s := testStore(t)
+	h := &model.Host{Name: "密钥机", Host: "10.0.0.2", User: "root",
+		Auth: model.AuthKey, KeyPath: "~/.ssh/id_ed25519"}
+	_ = s.Add(h)
+
+	root := NewRoot(s)
+	root = upd(root, pressKey(tea.KeyEnter))
+	if root.list.connectID != h.ID {
+		t.Fatalf("密钥认证 + 无 agent 应进入待确认态")
+	}
+	if !strings.Contains(root.list.connectHint, "ssh-agent") {
+		t.Fatalf("提示应提及 ssh-agent，实际: %q", root.list.connectHint)
 	}
 }
 

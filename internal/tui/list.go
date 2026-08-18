@@ -17,15 +17,17 @@ import (
 // ---- 连接列表页 ----
 
 type listModel struct {
-	store     *store.Store
-	hosts     []*model.Host
-	filtered  []*model.Host
-	status    map[string]sshc.Status
-	cursor    int
-	filter    string
-	filtering bool
-	confirmID string // 待删除确认的连接 ID
-	err       string
+	store       *store.Store
+	hosts       []*model.Host
+	filtered    []*model.Host
+	status      map[string]sshc.Status
+	cursor      int
+	filter      string
+	filtering   bool
+	confirmID   string // 待删除确认的连接 ID
+	connectID   string // 待免密确认连接的连接 ID
+	connectHint string // 免密提示文案
+	err         string
 }
 
 func newListModel(s *store.Store) *listModel {
@@ -39,6 +41,8 @@ func (m *listModel) reload(hosts []*model.Host) {
 	m.status = map[string]sshc.Status{}
 	m.cursor = 0
 	m.confirmID = ""
+	m.connectID = ""
+	m.connectHint = ""
 	m.err = ""
 	m.applyFilter()
 }
@@ -102,6 +106,9 @@ func (m *listModel) Update(msg tea.Msg) (*listModel, tea.Cmd) {
 	case statusTickMsg:
 		return m, m.runStatusChecks()
 	case tea.KeyPressMsg:
+		if m.connectID != "" {
+			return m.handleConnectConfirm(msg)
+		}
 		if m.confirmID != "" {
 			return m.handleConfirm(msg)
 		}
@@ -111,6 +118,46 @@ func (m *listModel) Update(msg tea.Msg) (*listModel, tea.Cmd) {
 		return m.handleNav(msg)
 	}
 	return m, nil
+}
+
+// handleConnectConfirm 处理免密提示的二次确认
+func (m *listModel) handleConnectConfirm(msg tea.KeyPressMsg) (*listModel, tea.Cmd) {
+	k := msg.Key()
+	if k.Code == tea.KeyEnter {
+		h := m.store.Find(m.connectID)
+		m.connectID = ""
+		m.connectHint = ""
+		if h != nil {
+			return m, tea.Cmd(func() tea.Msg { return connectMsg{host: h} })
+		}
+		return m, nil
+	}
+	if k.Code == tea.KeyEsc || k.Text == "n" || k.Text == "N" || k.Text == "q" || k.Text == "c" {
+		m.connectID = ""
+		m.connectHint = ""
+	}
+	return m, nil
+}
+
+// connectHint 检测选中主机连接时是否可能无法自动认证，返回提示文案（空串表示可直接连接）
+func connectHint(h *model.Host) string {
+	if h.Auth == model.AuthPassword {
+		if !h.HasPassword {
+			return "该连接未保存密码，将无法自动认证；请按 e 编辑并设置密码"
+		}
+		return "" // 已保存密码，自建会话直接免密
+	}
+	if h.Auth == model.AuthKey {
+		if !sshc.AgentAvailable() {
+			return sshc.AgentHint()
+		}
+		if h.KeyPath != "" {
+			if in, known := sshc.KeyInAgent(sshc.ExpandPath(h.KeyPath)); known && !in {
+				return fmt.Sprintf("私钥 %s 未加入 ssh-agent，建议: ssh-add %s", h.KeyPath, h.KeyPath)
+			}
+		}
+	}
+	return ""
 }
 
 func (m *listModel) handleConfirm(msg tea.KeyPressMsg) (*listModel, tea.Cmd) {
@@ -198,8 +245,14 @@ func (m *listModel) handleNav(msg tea.KeyPressMsg) (*listModel, tea.Cmd) {
 		}
 	case tea.KeyEnter:
 		if n > 0 {
+			h := m.filtered[m.cursor]
+			if hint := connectHint(h); hint != "" {
+				m.connectID = h.ID
+				m.connectHint = hint
+				return m, nil
+			}
 			return m, tea.Cmd(func() tea.Msg {
-				return connectMsg{host: m.filtered[m.cursor]}
+				return connectMsg{host: h}
 			})
 		}
 	default:
@@ -264,6 +317,14 @@ func (m *listModel) View() tea.View {
 
 	if m.filtering {
 		b.WriteString("\n" + styleCursor.Render("过滤: ") + m.filter + "▌\n")
+	} else if m.connectID != "" {
+		h := m.store.Find(m.connectID)
+		name := ""
+		if h != nil {
+			name = h.Name
+		}
+		b.WriteString("\n" + styleInfo.Render("免密提示: "+m.connectHint) + "\n")
+		b.WriteString(styleDim.Render(fmt.Sprintf("连接 %q 仍将进行？ Enter 继续连接 / Esc 取消", name)) + "\n")
 	} else if m.confirmID != "" {
 		h := m.store.Find(m.confirmID)
 		name := ""
@@ -325,5 +386,6 @@ func renderListFooter() string {
 	keys := styleDim.Render(
 		"↑/↓ 移动  Enter 连接  f SFTP  a 新增  e 编辑  d 删除  s 刷新  / 过滤  q 退出",
 	)
-	return styleFooter.Render(keys)
+	hint := styleHint.Render("  免密: ssh-add")
+	return styleFooter.Render(lipgloss.JoinHorizontal(lipgloss.Top, keys, hint))
 }
