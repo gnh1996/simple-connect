@@ -85,6 +85,14 @@ LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION
 - unix：`SIGWINCH` → `WindowChange(rows, cols)`；Windows：500ms 轮询尺寸变更
 - 已知差距（可接受）：OpenSSH 会发送两次初始 window-change（连接后立即 + 稍后），本实现只随 pty-req 发一次。对现代服务器无感知差异
 
+### 尺寸换算（易错，务必遵守）
+
+- **`term.GetSize` 返回 `(width, height)`**，而 `RequestPty` / `WindowChange` 的参数语义是 `(rows, cols)`——**二者顺序相反**。
+- 一律经 `resolveTermSize(width, height) (rows, cols)` 换算（`internal/session/session.go`），禁止直接把 GetSize 返回值当 rows/cols 使用。
+- 尺寸非法（≤0）时回退 24×80。
+
+**踩坑史**：曾把 `term.GetSize` 的 `(width, height)` 直接当 `(rows, cols)` 使用，导致远程 PTY 行列颠倒（如 30×120 被请求成 120×30），远程按错误列宽换行，`ls` 输出后光标乱跑、退格重绘错乱；系统 ssh 用正确尺寸故表现正常。改动会话初始化逻辑时必须经 `TestResolveTermSize`（第 8 节）验证。
+
 ## 6. 认证行为（`internal/ssh/client.go` authMethods）
 
 尝试顺序：**私钥 → 密码（password + keyboard-interactive 同密码）→ ssh-agent**，全部失败才报错。
@@ -111,6 +119,7 @@ go test -race ./internal/session/ ./internal/sftp/ ./internal/tui/ -count=1
 
 - `TestSessionEnvForward`：locale 白名单透传 / 空值不传 / 非白名单不传
 - `TestSessionPtyIUTF8`：IUTF8=1 / IMAXBEL=1 / IXOFF=0 / 基础模式俱全
+- `TestResolveTermSize`：`(width, height)`→`(rows, cols)` 换算顺序 / 非法尺寸回退 24×80（PTY 尺寸颠倒的回归防线）
 - 新增行为必须补对应断言（服务端记录能力可扩展）
 
 ## 9. 踩坑史（时间线）
@@ -118,6 +127,7 @@ go test -race ./internal/session/ ./internal/sftp/ ./internal/tui/ -count=1
 | 日期 | 问题 | 根因 | 修复 |
 |---|---|---|---|
 | 2026-08 | 远程输入光标跳行首、CJK 对齐错乱 | 不传 locale env（远程 C locale）+ TerminalModes 缺 IUTF8/IMAXBEL 等 27 项 | PR #1：sessionEnv 白名单透传 + 40 项完整模式集 + 回归测试 |
+| 2026-08 | 远程输入布局乱、ls 输出后光标乱跑、退格错乱（系统 ssh 正常） | `term.GetSize` 返回 `(width, height)` 被当作 `(rows, cols)`，远程 PTY 行列颠倒 | `resolveTermSize` 换算 + `TestResolveTermSize` 回归（见第 5 节） |
 | 早期 | 不在 config 中的主机被改端口/认证方式 | `ssh_config.Get` 无匹配时返回默认值（Port=22、IdentityFile） | 基于解析结果取值（sshConfigGetter），加 `TestResolveSSHConfigNoConfigMatch` 回归 |
 
 ## 10. 维护约定

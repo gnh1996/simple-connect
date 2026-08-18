@@ -44,6 +44,7 @@ internal/
 - **内嵌 SFTP** 使用 `sshc.ConnectRaw`（不合并 config，避免测试污染与意外行为）。
 - **降级**：自建会话失败时 main 提示是否降级用系统 `ssh`。
 - **TerminalModes** 与 OpenSSH 对齐（ECHO/ECHOE/ICRNL/ONLCR/OPOST/CS8 等）。
+- **会话/SSH 层改动前必读 `docs/ssh-compat.md`**（覆盖 `internal/ssh`、`internal/session`、`internal/testutil`）：定义了与 OpenSSH 对齐的行为基线（pty-req/env/shell 顺序、40 项 TerminalModes、locale 白名单、`term.GetSize` 的 `(width,height)`→`(rows,cols)` 尺寸换算、known_hosts 等）。**任何会话/连接层行为变更须同步该文档与对应回归测试（含 `TestResolveTermSize`）**。
 
 ## 开发规范
 
