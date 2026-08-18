@@ -83,6 +83,8 @@ type sftpModel struct {
 
 	focus int // 当前焦点栏（paneLocal / paneRemote）
 
+	remoteCwd string // 会话内跟踪到的远程工作目录（热键唤起定位用，空串=默认）
+
 	mode     sftpMode
 	uploadIn *textinput.Model
 	newDirIn *textinput.Model
@@ -98,7 +100,7 @@ type sftpModel struct {
 	height int
 }
 
-func newSFTPModel(s *store.Store, h *model.Host) *sftpModel {
+func newSFTPModel(s *store.Store, h *model.Host, remoteCwd string) *sftpModel {
 	up := textInput("", "本地文件路径，可直接拖拽文件到终端")
 	nw := textInput("", "新目录名")
 	m := &sftpModel{
@@ -106,6 +108,7 @@ func newSFTPModel(s *store.Store, h *model.Host) *sftpModel {
 		uploadIn: &up, newDirIn: &nw,
 		confirmID: -1, localConfirmID: -1,
 		focus: paneRemote,
+		remoteCwd: remoteCwd,
 	}
 	if h.LocalDir != "" {
 		m.localCwd = h.LocalDir
@@ -154,6 +157,10 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 			m.cwd = cwd
 		} else {
 			m.cwd = "/"
+		}
+		// 会话热键唤起：优先定位到会话内跟踪到的目录
+		if m.remoteCwd != "" {
+			m.cwd = m.remoteCwd
 		}
 		m.busy = true
 		return m, m.loadList()
