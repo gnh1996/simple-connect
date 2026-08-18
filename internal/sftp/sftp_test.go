@@ -1,10 +1,13 @@
 package sftp
 
 import (
+	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 
 	"simple-connect/internal/model"
@@ -121,6 +124,135 @@ func TestTransferFailure(t *testing.T) {
 	_, _, finished, err := tup.Snapshot()
 	if !finished || err == nil {
 		t.Fatalf("上传应失败: finished=%v err=%v", finished, err)
+	}
+}
+
+func TestRecursiveUploadDownload(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	conn := dialTest(t, env)
+	defer conn.Close()
+
+	local := t.TempDir()
+	// 嵌套目录：sub/ 下有文件与空目录 empty/
+	_ = os.MkdirAll(filepath.Join(local, "sub", "empty"), 0o755)
+	_ = os.WriteFile(filepath.Join(local, "sub", "a.txt"), []byte("aaa"), 0o644)
+	_ = os.WriteFile(filepath.Join(local, "sub", "b.bin"), bytes.Repeat([]byte{0x1}, 3000), 0o644)
+	_ = os.WriteFile(filepath.Join(local, "top.txt"), []byte("top"), 0o644)
+	// 统计本地总字节
+	wantTotal := int64(3 + 3000 + 3)
+
+	// 递归上传目录
+	remoteDir := filepath.Join(env.Root, "proj")
+	tup := NewTransfer("proj", true)
+	UploadPath(conn.Client, tup, local, remoteDir)
+	_, _, finished, err := tup.Snapshot()
+	if !finished || err != nil {
+		t.Fatalf("递归上传异常: finished=%v err=%v", finished, err)
+	}
+	done, total, _, _ := tup.Snapshot()
+	if total != wantTotal || done != wantTotal {
+		t.Fatalf("上传进度 total=%d done=%d，期望 %d", total, done, wantTotal)
+	}
+
+	// 校验远程结构
+	checkRemoteFile(t, conn.Client, filepath.Join(remoteDir, "top.txt"), "top")
+	checkRemoteFile(t, conn.Client, filepath.Join(remoteDir, "sub", "a.txt"), "aaa")
+	checkRemoteFile(t, conn.Client, filepath.Join(remoteDir, "sub", "b.bin"), string(bytes.Repeat([]byte{0x1}, 3000)))
+	// 空目录保留
+	if st, err := conn.Client.Stat(filepath.Join(remoteDir, "sub", "empty")); err != nil || !st.IsDir() {
+		t.Fatalf("远程空目录应保留: %v", err)
+	}
+
+	// 递归下载到新目录
+	dst := t.TempDir()
+	td := NewTransfer("proj", false)
+	DownloadPath(conn.Client, td, remoteDir, filepath.Join(dst, "proj"))
+	_, _, finished, err = td.Snapshot()
+	if !finished || err != nil {
+		t.Fatalf("递归下载异常: finished=%v err=%v", finished, err)
+	}
+	checkLocalFile(t, filepath.Join(dst, "proj", "top.txt"), "top")
+	checkLocalFile(t, filepath.Join(dst, "proj", "sub", "a.txt"), "aaa")
+	if st, err := os.Stat(filepath.Join(dst, "proj", "sub", "empty")); err != nil || !st.IsDir() {
+		t.Fatalf("本地空目录应保留: %v", err)
+	}
+}
+
+func TestBatchTransfer(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	conn := dialTest(t, env)
+	defer conn.Close()
+
+	local := t.TempDir()
+	_ = os.WriteFile(filepath.Join(local, "f1.txt"), []byte("111"), 0o644)
+	_ = os.MkdirAll(filepath.Join(local, "dir2"), 0o755)
+	_ = os.WriteFile(filepath.Join(local, "dir2", "nested.txt"), bytes.Repeat([]byte{0x2}, 1000), 0o644)
+
+	remoteBase := filepath.Join(env.Root, "batch")
+	items := []BatchItem{
+		{Src: filepath.Join(local, "f1.txt"), Dst: filepath.Join(remoteBase, "f1.txt")},
+		{Src: filepath.Join(local, "dir2"), Dst: filepath.Join(remoteBase, "dir2")},
+	}
+	tb := NewTransfer("2 项", true)
+	BatchTransfer(conn.Client, tb, true, items)
+	_, _, finished, err := tb.Snapshot()
+	if !finished || err != nil {
+		t.Fatalf("批量上传异常: finished=%v err=%v", finished, err)
+	}
+	checkRemoteFile(t, conn.Client, filepath.Join(remoteBase, "f1.txt"), "111")
+	checkRemoteFile(t, conn.Client, filepath.Join(remoteBase, "dir2", "nested.txt"), string(bytes.Repeat([]byte{0x2}, 1000)))
+
+	// 批量下载
+	dst := t.TempDir()
+	items = []BatchItem{
+		{Src: filepath.Join(remoteBase, "f1.txt"), Dst: filepath.Join(dst, "f1.txt")},
+		{Src: filepath.Join(remoteBase, "dir2"), Dst: filepath.Join(dst, "dir2")},
+	}
+	td := NewTransfer("2 项", false)
+	BatchTransfer(conn.Client, td, false, items)
+	_, _, finished, err = td.Snapshot()
+	if !finished || err != nil {
+		t.Fatalf("批量下载异常: finished=%v err=%v", finished, err)
+	}
+	checkLocalFile(t, filepath.Join(dst, "f1.txt"), "111")
+	checkLocalFile(t, filepath.Join(dst, "dir2", "nested.txt"), string(bytes.Repeat([]byte{0x2}, 1000)))
+}
+
+func TestBatchTransferFailureAborts(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	conn := dialTest(t, env)
+	defer conn.Close()
+
+	items := []BatchItem{
+		{Src: filepath.Join(t.TempDir(), "missing"), Dst: filepath.Join(env.Root, "m1")},
+		{Src: filepath.Join(t.TempDir(), "also-missing"), Dst: filepath.Join(env.Root, "m2")},
+	}
+	tb := NewTransfer("2 项", true)
+	BatchTransfer(conn.Client, tb, true, items)
+	_, _, finished, err := tb.Snapshot()
+	if !finished || err == nil {
+		t.Fatalf("批量传输应失败: finished=%v err=%v", finished, err)
+	}
+}
+
+func checkRemoteFile(t *testing.T, cl *sftp.Client, p, want string) {
+	t.Helper()
+	f, err := cl.Open(p)
+	if err != nil {
+		t.Fatalf("远程文件 %s 打开失败: %v", p, err)
+	}
+	defer f.Close()
+	b, err := io.ReadAll(f)
+	if err != nil || string(b) != want {
+		t.Fatalf("远程文件 %s 校验失败: err=%v", p, err)
+	}
+}
+
+func checkLocalFile(t *testing.T, p, want string) {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil || string(b) != want {
+		t.Fatalf("本地文件 %s 校验失败: err=%v", p, err)
 	}
 }
 

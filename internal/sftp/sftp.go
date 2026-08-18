@@ -2,7 +2,10 @@ package sftp
 
 import (
 	"io"
+	"io/fs"
 	"os"
+	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -102,6 +105,13 @@ func (t *Transfer) setTotal(n int64) {
 	t.mu.Unlock()
 }
 
+// Err 返回传输结果错误（finished 前通常为 nil）
+func (t *Transfer) Err() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.err
+}
+
 func (t *Transfer) add(n int) {
 	t.mu.Lock()
 	t.done += int64(n)
@@ -117,15 +127,18 @@ func (t *Transfer) finish(err error) {
 
 // Upload 将本地文件异步上传到远程路径（在调用方 goroutine 中执行）
 func Upload(cl *sftp.Client, t *Transfer, localPath, remotePath string) {
+	t.setTotal(statSizeLocal(localPath))
+	uploadFile(cl, t, localPath, remotePath)
+	t.finish(t.Err())
+}
+
+func uploadFile(cl *sftp.Client, t *Transfer, localPath, remotePath string) {
 	f, err := os.Open(localPath)
 	if err != nil {
 		t.finish(err)
 		return
 	}
 	defer f.Close()
-	if st, err := f.Stat(); err == nil {
-		t.setTotal(st.Size())
-	}
 
 	rf, err := cl.Create(remotePath)
 	if err != nil {
@@ -137,20 +150,25 @@ func Upload(cl *sftp.Client, t *Transfer, localPath, remotePath string) {
 	if err == nil {
 		err = cerr
 	}
-	t.finish(err)
+	if err != nil {
+		t.finish(err)
+	}
 }
 
 // Download 将远程文件异步下载到本地路径（在调用方 goroutine 中执行）
 func Download(cl *sftp.Client, t *Transfer, remotePath, localPath string) {
+	t.setTotal(statSizeRemote(cl, remotePath))
+	downloadFile(cl, t, remotePath, localPath)
+	t.finish(t.Err())
+}
+
+func downloadFile(cl *sftp.Client, t *Transfer, remotePath, localPath string) {
 	rf, err := cl.Open(remotePath)
 	if err != nil {
 		t.finish(err)
 		return
 	}
 	defer rf.Close()
-	if st, err := rf.Stat(); err == nil {
-		t.setTotal(st.Size())
-	}
 
 	f, err := os.Create(localPath)
 	if err != nil {
@@ -162,7 +180,228 @@ func Download(cl *sftp.Client, t *Transfer, remotePath, localPath string) {
 	if err == nil {
 		err = cerr
 	}
-	t.finish(err)
+	if err != nil {
+		t.finish(err)
+	}
+}
+
+// BatchItem 批量传输条目（Src 为源，Dst 为目标）
+type BatchItem struct {
+	Src string
+	Dst string
+}
+
+// UploadPath 传输单个本地路径（文件或目录递归，进度汇总到 t）。
+func UploadPath(cl *sftp.Client, t *Transfer, localPath, remotePath string) {
+	total, err := dirSizeLocal(localPath)
+	if err != nil {
+		t.finish(err)
+		return
+	}
+	t.setTotal(total)
+	uploadItem(cl, t, localPath, remotePath)
+	t.finish(t.Err())
+}
+
+// DownloadPath 传输单个远程路径（文件或目录递归，进度汇总到 t）。
+func DownloadPath(cl *sftp.Client, t *Transfer, remotePath, localPath string) {
+	total, err := dirSizeRemote(cl, remotePath)
+	if err != nil {
+		t.finish(err)
+		return
+	}
+	t.setTotal(total)
+	downloadItem(cl, t, remotePath, localPath)
+	t.finish(t.Err())
+}
+
+// BatchTransfer 批量传输（文件或目录递归，进度汇总到 t）。
+// 在调用方 goroutine 中执行；首个失败即中止。
+func BatchTransfer(cl *sftp.Client, t *Transfer, up bool, items []BatchItem) {
+	total, err := batchTotal(cl, up, items)
+	if err != nil {
+		t.finish(err)
+		return
+	}
+	t.setTotal(total)
+	for _, it := range items {
+		if up {
+			uploadItem(cl, t, it.Src, it.Dst)
+		} else {
+			downloadItem(cl, t, it.Src, it.Dst)
+		}
+		if t.Err() != nil {
+			break
+		}
+	}
+	t.finish(t.Err())
+}
+
+func batchTotal(cl *sftp.Client, up bool, items []BatchItem) (int64, error) {
+	var total int64
+	for _, it := range items {
+		if up {
+			n, err := dirSizeLocal(it.Src)
+			if err != nil {
+				return 0, err
+			}
+			total += n
+		} else {
+			n, err := dirSizeRemote(cl, it.Src)
+			if err != nil {
+				return 0, err
+			}
+			total += n
+		}
+	}
+	return total, nil
+}
+
+// uploadItem 传输单个本地路径（文件或目录递归）
+func uploadItem(cl *sftp.Client, t *Transfer, localPath, remotePath string) {
+	st, err := os.Stat(localPath)
+	if err != nil {
+		t.finish(err)
+		return
+	}
+	if !st.IsDir() {
+		if err := cl.MkdirAll(path.Dir(remotePath)); err != nil {
+			t.finish(err)
+			return
+		}
+		uploadFile(cl, t, localPath, remotePath)
+		return
+	}
+	err = filepath.WalkDir(localPath, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(localPath, p)
+		if err != nil {
+			return err
+		}
+		remote := remotePath
+		if rel != "." {
+			remote = path.Join(remotePath, filepath.ToSlash(rel))
+		}
+		if d.IsDir() {
+			return cl.MkdirAll(remote)
+		}
+		if d.Type().IsRegular() {
+			uploadFile(cl, t, p, remote)
+		}
+		return t.Err()
+	})
+	if err != nil {
+		t.finish(err)
+	}
+}
+
+// downloadItem 传输单个远程路径（文件或目录递归）
+func downloadItem(cl *sftp.Client, t *Transfer, remotePath, localPath string) {
+	st, err := cl.Stat(remotePath)
+	if err != nil {
+		t.finish(err)
+		return
+	}
+	if !st.IsDir() {
+		downloadFile(cl, t, remotePath, localPath)
+		return
+	}
+	walker := cl.Walk(remotePath)
+	for walker.Step() {
+		if walker.Err() != nil {
+			t.finish(walker.Err())
+			return
+		}
+		p := walker.Path()
+		rel, err := filepath.Rel(filepath.FromSlash(remotePath), filepath.FromSlash(p))
+		if err != nil {
+			t.finish(err)
+			return
+		}
+		local := localPath
+		if rel != "." {
+			local = filepath.Join(localPath, rel)
+		}
+		if walker.Stat().IsDir() {
+			if err := os.MkdirAll(local, 0o755); err != nil {
+				t.finish(err)
+				return
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
+			t.finish(err)
+			return
+		}
+		downloadFile(cl, t, p, local)
+		if t.Err() != nil {
+			return
+		}
+	}
+}
+
+// statSizeLocal 单文件大小（目录时返回 0）
+func statSizeLocal(p string) int64 {
+	if st, err := os.Stat(p); err == nil && !st.IsDir() {
+		return st.Size()
+	}
+	return 0
+}
+
+func statSizeRemote(cl *sftp.Client, p string) int64 {
+	if st, err := cl.Stat(p); err == nil && !st.IsDir() {
+		return st.Size()
+	}
+	return 0
+}
+
+// dirSizeLocal 递归统计本地路径字节数（目录含子目录内全部文件）
+func dirSizeLocal(p string) (int64, error) {
+	st, err := os.Stat(p)
+	if err != nil {
+		return 0, err
+	}
+	if !st.IsDir() {
+		return st.Size(), nil
+	}
+	var total int64
+	err = filepath.WalkDir(p, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total, err
+}
+
+// dirSizeRemote 递归统计远程路径字节数（目录含子目录内全部文件）
+func dirSizeRemote(cl *sftp.Client, p string) (int64, error) {
+	st, err := cl.Stat(p)
+	if err != nil {
+		return 0, err
+	}
+	if !st.IsDir() {
+		return st.Size(), nil
+	}
+	var total int64
+	walker := cl.Walk(p)
+	for walker.Step() {
+		if walker.Err() != nil {
+			return 0, walker.Err()
+		}
+		if !walker.Stat().IsDir() {
+			total += walker.Stat().Size()
+		}
+	}
+	return total, nil
 }
 
 type countingWriter struct{ t *Transfer }

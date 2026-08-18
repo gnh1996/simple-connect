@@ -13,6 +13,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 
 	"simple-connect/internal/model"
@@ -28,6 +29,7 @@ const (
 	modeBrowse sftpMode = iota
 	modeUpload
 	modeNewDir
+	modeGoto
 )
 
 // 栏焦点
@@ -57,6 +59,20 @@ type sftpMsgText struct {
 	ok   bool
 }
 
+// sftpGotoCompleteMsg Tab 路径补全结果（input 为计算时的输入快照）
+type sftpGotoCompleteMsg struct {
+	input string
+	cands []string
+	err   error
+}
+
+// sftpGotoJumpMsg 远程路径跳转结果
+type sftpGotoJumpMsg struct {
+	path    string
+	entries []fs.FileInfo
+	err     error
+}
+
 // sftpModel 双栏（本地 | 远程）文件浏览/传输模型。
 // 远程栏：cwd/entries/cursor/confirmID（字段名向后兼容测试）；
 // 本地栏：localCwd/localEntries/localCursor/localConfirmID。
@@ -81,6 +97,12 @@ type sftpModel struct {
 	localTop       int
 	localConfirmID int // 待删除条目下标，-1 表示无
 
+	// 多选（按列表下标）
+	selLocal  map[int]struct{}
+	selRemote map[int]struct{}
+	// confirmBatch 批量删除确认中（有选中项按 x 触发）
+	confirmBatch bool
+
 	focus int // 当前焦点栏（paneLocal / paneRemote）
 
 	remoteCwd string // 会话内跟踪到的远程工作目录（热键唤起定位用，空串=默认）
@@ -88,6 +110,12 @@ type sftpModel struct {
 	mode     sftpMode
 	uploadIn *textinput.Model
 	newDirIn *textinput.Model
+	gotoIn   *textinput.Model
+
+	// 路径跳转 Tab 补全状态
+	gotoCandidates []string // 候选完整路径（当前输入快照下的匹配项）
+	gotoLastSet    string   // 最近一次写入输入框的值（用于 Tab 循环切换判断）
+	gotoSel        int
 
 	fromSession bool // 会话中热键唤起：q 返回时请求重连会话
 
@@ -101,12 +129,15 @@ type sftpModel struct {
 }
 
 func newSFTPModel(s *store.Store, h *model.Host, remoteCwd string) *sftpModel {
-	up := textInput("", "本地文件路径，可直接拖拽文件到终端")
+	up := textInput("", "本地文件/目录路径，可直接拖拽文件到终端")
 	nw := textInput("", "新目录名")
+	gt := textInput("", "路径（Tab 补全）")
 	m := &sftpModel{
 		store: s, host: h,
-		uploadIn: &up, newDirIn: &nw,
+		uploadIn: &up, newDirIn: &nw, gotoIn: &gt,
 		confirmID: -1, localConfirmID: -1,
+		selLocal:  map[int]struct{}{},
+		selRemote: map[int]struct{}{},
 		focus:     paneRemote,
 		remoteCwd: remoteCwd,
 	}
@@ -196,6 +227,27 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 		} else {
 			m.err = msg.text
 		}
+		return m, nil
+
+	case sftpGotoCompleteMsg:
+		return m.handleGotoComplete(msg)
+
+	case sftpGotoJumpMsg:
+		if msg.err != nil {
+			m.err = msg.err.Error()
+			m.busy = false
+			m.mode = modeBrowse
+			m.clearGotoCandidates()
+			return m, nil
+		}
+		m.cwd = msg.path
+		m.entries = msg.entries
+		m.cursor = 0
+		m.remoteTop = 0
+		m.clearSel()
+		m.busy = false
+		m.mode = modeBrowse
+		m.clearGotoCandidates()
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -318,12 +370,14 @@ func (m *sftpModel) enterCurrent() (*sftpModel, tea.Cmd) {
 			m.localCwd = path.Join(m.localCwd, e.Name())
 			m.localCursor = 0
 			m.localEntries = nil
+			m.clearSel()
 			m.busy = true
 			return m, m.loadLocal()
 		}
 		m.cwd = path.Join(m.cwd, e.Name())
 		m.cursor = 0
 		m.entries = nil
+		m.clearSel()
 		m.busy = true
 		return m, m.loadList()
 	}
@@ -343,6 +397,7 @@ func (m *sftpModel) goUp() (*sftpModel, tea.Cmd) {
 		m.localCwd = parent
 		m.localCursor = 0
 		m.localEntries = nil
+		m.clearSel()
 		m.busy = true
 		return m, m.loadLocal()
 	}
@@ -353,6 +408,7 @@ func (m *sftpModel) goUp() (*sftpModel, tea.Cmd) {
 	m.cwd = parent
 	m.cursor = 0
 	m.entries = nil
+	m.clearSel()
 	m.busy = true
 	return m, m.loadList()
 }
@@ -401,13 +457,9 @@ func (m *sftpModel) uploadEntry(localPath string) tea.Cmd {
 	return m.startTransfer(localPath, remote, true)
 }
 
-// downloadEntry 下载远程文件到本地栏当前目录
+// downloadEntry 下载远程条目到本地栏当前目录（目录递归）
 func (m *sftpModel) downloadEntry(e fs.FileInfo) (*sftpModel, tea.Cmd) {
 	if m.busy {
-		return m, nil
-	}
-	if e.IsDir() {
-		m.status = "暂不支持目录递归下载"
 		return m, nil
 	}
 	if err := os.MkdirAll(m.localCwd, 0o755); err != nil {
@@ -416,12 +468,210 @@ func (m *sftpModel) downloadEntry(e fs.FileInfo) (*sftpModel, tea.Cmd) {
 	}
 	remote := path.Join(m.cwd, e.Name())
 	local := filepath.Join(m.localCwd, e.Name())
+	if e.IsDir() {
+		return m, m.startPathTransfer(remote, local, false)
+	}
 	return m, m.startTransfer(remote, local, false)
 }
 
 func (m *sftpModel) startUpload(localPath string) tea.Cmd {
 	remote := path.Join(m.cwd, filepath.Base(localPath))
 	return m.startTransfer(localPath, remote, true)
+}
+
+// startUploadPath 上传本地文件或目录（目录递归）到远程栏当前目录
+func (m *sftpModel) startUploadPath(localPath string) tea.Cmd {
+	remote := path.Join(m.cwd, filepath.Base(localPath))
+	return m.startPathTransfer(localPath, remote, true)
+}
+
+// startBatch 批量传输：有选中项时本地栏=上传、远程栏=下载（文件夹递归）
+func (m *sftpModel) startBatch(up bool) (*sftpModel, tea.Cmd) {
+	items := m.collectBatchItems(up)
+	if len(items) == 0 {
+		return m, nil
+	}
+	t := sftpc.NewTransfer(fmt.Sprintf("%d 项", len(items)), up)
+	m.transfer = t
+	m.busy = true
+	m.status = ""
+	m.confirmBatch = false
+	m.clearSel()
+
+	cl := m.conn.Client
+	go sftpc.BatchTransfer(cl, t, up, items)
+	return m, tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+		return sftpProgressMsg{}
+	})
+}
+
+// collectBatchItems 收集焦点栏全部选中条目为批量传输项
+func (m *sftpModel) collectBatchItems(up bool) []sftpc.BatchItem {
+	sel := m.selectedMap()
+	if len(sel) == 0 {
+		return nil
+	}
+	entries := m.currentEntries()
+	items := make([]sftpc.BatchItem, 0, len(sel))
+	for i, e := range entries {
+		if _, ok := sel[i]; !ok {
+			continue
+		}
+		if up {
+			items = append(items, sftpc.BatchItem{
+				Src: filepath.Join(m.localCwd, e.Name()),
+				Dst: path.Join(m.cwd, e.Name()),
+			})
+		} else {
+			items = append(items, sftpc.BatchItem{
+				Src: path.Join(m.cwd, e.Name()),
+				Dst: filepath.Join(m.localCwd, e.Name()),
+			})
+		}
+	}
+	return items
+}
+
+// ---- 多选 ----
+
+func (m *sftpModel) selectedMap() map[int]struct{} {
+	if m.focus == paneLocal {
+		return m.selLocal
+	}
+	return m.selRemote
+}
+
+func (m *sftpModel) currentEntries() []fs.FileInfo {
+	if m.focus == paneLocal {
+		return m.localEntries
+	}
+	return m.entries
+}
+
+func (m *sftpModel) currentCursor() int {
+	if m.focus == paneLocal {
+		return m.localCursor
+	}
+	return m.cursor
+}
+
+func (m *sftpModel) hasSel() bool {
+	if m.focus == paneLocal {
+		return len(m.selLocal) > 0
+	}
+	return len(m.selRemote) > 0
+}
+
+func (m *sftpModel) selCount() int {
+	if m.focus == paneLocal {
+		return len(m.selLocal)
+	}
+	return len(m.selRemote)
+}
+
+// clearSel 清空双栏选中
+func (m *sftpModel) clearSel() {
+	m.selLocal = map[int]struct{}{}
+	m.selRemote = map[int]struct{}{}
+	m.confirmBatch = false
+}
+
+func (m *sftpModel) toggleSel() {
+	sel := m.selectedMap()
+	idx := m.currentCursor()
+	if _, ok := sel[idx]; ok {
+		delete(sel, idx)
+	} else {
+		sel[idx] = struct{}{}
+	}
+}
+
+// selectedNames 返回焦点栏选中条目的名字（有序，用于批量删除确认/渲染）
+func (m *sftpModel) selectedEntries() []fs.FileInfo {
+	sel := m.selectedMap()
+	entries := m.currentEntries()
+	var out []fs.FileInfo
+	for i, e := range entries {
+		if _, ok := sel[i]; ok {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// doBatchDelete 批量删除焦点栏全部选中条目（本地 RemoveAll / 远程递归）
+func (m *sftpModel) doBatchDelete() (*sftpModel, tea.Cmd) {
+	sel := m.selectedEntries()
+	m.confirmBatch = false
+	m.clearSel()
+	if len(sel) == 0 {
+		return m, nil
+	}
+	if m.focus == paneLocal {
+		p := m.localCwd
+		paths := make([]string, 0, len(sel))
+		for _, e := range sel {
+			paths = append(paths, filepath.Join(p, e.Name()))
+		}
+		return m, tea.Cmd(func() tea.Msg {
+			for _, lp := range paths {
+				if err := os.RemoveAll(lp); err != nil {
+					return sftpMsgText{text: fmt.Sprintf("删除失败: %v", err)}
+				}
+			}
+			entries, err := os.ReadDir(p)
+			if err != nil {
+				return sftpMsgText{text: fmt.Sprintf("读取目录失败: %v", err)}
+			}
+			infos := make([]fs.FileInfo, 0, len(entries))
+			for _, e := range entries {
+				if info, err := e.Info(); err == nil {
+					infos = append(infos, info)
+				}
+			}
+			sftpc.SortEntries(infos)
+			return sftpListMsg{kind: paneLocal, path: p, entries: infos,
+				notice: fmt.Sprintf("已删除 %d 项", len(paths))}
+		})
+	}
+	p := m.cwd
+	cl := m.conn.Client
+	type item struct {
+		path  string
+		isDir bool
+	}
+	items := make([]item, 0, len(sel))
+	for _, e := range sel {
+		items = append(items, item{path: path.Join(p, e.Name()), isDir: e.IsDir()})
+	}
+	return m, tea.Cmd(func() tea.Msg {
+		for _, it := range items {
+			if err := sftpc.Remove(cl, it.path, it.isDir); err != nil {
+				return sftpMsgText{text: fmt.Sprintf("删除失败: %v", err)}
+			}
+		}
+		entries, err := sftpc.List(cl, p)
+		return sftpListMsg{kind: paneRemote, path: p, entries: entries, err: err,
+			notice: fmt.Sprintf("已删除 %d 项", len(items))}
+	})
+}
+
+// startPathTransfer 异步传输单个文件或目录（递归），进度走同一轮询
+func (m *sftpModel) startPathTransfer(src, dst string, up bool) tea.Cmd {
+	t := sftpc.NewTransfer(filepath.Base(src), up)
+	m.transfer = t
+	m.busy = true
+	m.status = ""
+
+	cl := m.conn.Client
+	if up {
+		go sftpc.UploadPath(cl, t, src, dst)
+	} else {
+		go sftpc.DownloadPath(cl, t, src, dst)
+	}
+	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+		return sftpProgressMsg{}
+	})
 }
 
 // startTransfer 异步执行传输并返回进度命令
@@ -527,14 +777,20 @@ func (m *sftpModel) doDelete() (*sftpModel, tea.Cmd) {
 func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 	k := msg.Key()
 
-	// 确认删除（当前焦点栏）
-	if (m.focus == paneLocal && m.localConfirmID >= 0) || (m.focus == paneRemote && m.confirmID >= 0) {
+	// 确认删除（当前焦点栏，单个或批量）
+	singleConfirm := (m.focus == paneLocal && m.localConfirmID >= 0) ||
+		(m.focus == paneRemote && m.confirmID >= 0)
+	if singleConfirm || m.confirmBatch {
 		switch {
 		case k.Code == tea.KeyEnter:
 			fallthrough
 		case k.Text == "y" || k.Text == "Y":
+			if m.confirmBatch {
+				return m.doBatchDelete()
+			}
 			return m.doDelete()
 		case k.Code == tea.KeyEsc || k.Text == "n" || k.Text == "N" || k.Text == "q":
+			m.confirmBatch = false
 			if m.focus == paneLocal {
 				m.localConfirmID = -1
 			} else {
@@ -556,12 +812,17 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 				m.mode = modeBrowse
 				return m, nil
 			}
-			if st, err := os.Stat(sshc.ExpandPath(p)); err != nil || st.IsDir() {
-				m.err = "本地文件不存在"
+			abs := sshc.ExpandPath(p)
+			if st, err := os.Stat(abs); err != nil {
+				m.err = "本地路径不存在"
 				return m, nil
+			} else if !st.IsDir() {
+				m.mode = modeBrowse
+				return m, m.startUpload(abs)
+			} else {
+				m.mode = modeBrowse
+				return m, m.startUploadPath(abs)
 			}
-			m.mode = modeBrowse
-			return m, m.startUpload(sshc.ExpandPath(p))
 		}
 		in, cmd := m.uploadIn.Update(msg)
 		*m.uploadIn = in
@@ -587,10 +848,39 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 		return m, cmd
 	}
 
+	// 路径跳转输入
+	if m.mode == modeGoto {
+		switch k.Code {
+		case tea.KeyEsc:
+			m.mode = modeBrowse
+			m.clearGotoCandidates()
+			return m, nil
+		case tea.KeyEnter:
+			return m.gotoJump()
+		case tea.KeyTab:
+			return m.gotoComplete()
+		}
+		in, cmd := m.gotoIn.Update(msg)
+		if in.Value() != m.gotoLastSet {
+			m.clearGotoCandidates()
+		}
+		*m.gotoIn = in
+		return m, cmd
+	}
+
 	// 浏览模式
 	switch k.Code {
 	case tea.KeyTab:
 		m.focus = 1 - m.focus
+		m.confirmBatch = false
+		return m, nil
+	case tea.KeyEsc:
+		if m.hasSel() {
+			m.clearSel()
+			return m, nil
+		}
+	case tea.KeySpace:
+		m.toggleSel()
 		return m, nil
 	case tea.KeyUp:
 		m.moveCursor(-1)
@@ -609,6 +899,9 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 			m.setCursor(len(m.entries) - 1)
 		}
 	case tea.KeyEnter:
+		if m.hasSel() {
+			return m.startBatch(m.focus == paneLocal)
+		}
 		return m.enterCurrent()
 	case tea.KeyBackspace:
 		return m.goUp()
@@ -622,6 +915,11 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 				m.mode = modeUpload
 				m.uploadIn.Focus()
 				return m, nil
+			case "g":
+				if m.busy {
+					return m, nil
+				}
+				return m.openGoto()
 			case "n":
 				if m.busy {
 					return m, nil
@@ -630,13 +928,19 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 				m.newDirIn.Focus()
 				return m, nil
 			case "d":
-				if m.focus == paneRemote {
+				if m.focus == paneRemote && !m.hasSel() {
 					if e := m.currentEntry(); e != nil {
 						return m.downloadEntry(e)
 					}
 				}
 			case "x":
 				if m.busy {
+					return m, nil
+				}
+				if m.hasSel() {
+					m.confirmBatch = true
+					m.confirmID = -1
+					m.localConfirmID = -1
 					return m, nil
 				}
 				if m.focus == paneLocal {
@@ -709,6 +1013,172 @@ func (m *sftpModel) setCursor(idx int) {
 	m.ensureVisible(&m.remoteTop, m.cursor)
 }
 
+// ---- 路径跳转与 Tab 补全 ----
+
+func (m *sftpModel) clearGotoCandidates() {
+	m.gotoCandidates = nil
+	m.gotoLastSet = ""
+	m.gotoSel = 0
+}
+
+func (m *sftpModel) openGoto() (*sftpModel, tea.Cmd) {
+	m.mode = modeGoto
+	m.clearGotoCandidates()
+	if m.focus == paneLocal {
+		m.gotoIn.SetValue(m.localCwd)
+	} else {
+		m.gotoIn.SetValue(m.cwd)
+	}
+	m.gotoIn.Focus()
+	return m, nil
+}
+
+// gotoSplit 拆分输入为「目录部分 + 基础名」；无分隔符时 dir 返回空串。
+// 本地兼容 / 与 \ 分隔符，远程按 / 拆分。
+func (m *sftpModel) gotoSplit(v string) (dir, base string) {
+	if m.focus == paneLocal {
+		if strings.HasSuffix(v, "/") || strings.HasSuffix(v, string(os.PathSeparator)) {
+			return v, ""
+		}
+		i := strings.LastIndexAny(v, `/\`)
+		if i < 0 {
+			return "", v
+		}
+		return v[:i], v[i+1:]
+	}
+	if strings.HasSuffix(v, "/") {
+		return v, ""
+	}
+	i := strings.LastIndex(v, "/")
+	if i < 0 {
+		return "", v
+	}
+	return v[:i], v[i+1:]
+}
+
+// gotoJump 校验并跳转到输入路径（本地同步校验，远程异步 List 校验）
+func (m *sftpModel) gotoJump() (*sftpModel, tea.Cmd) {
+	v := strings.TrimSpace(m.gotoIn.Value())
+	m.clearGotoCandidates()
+	if v == "" {
+		m.mode = modeBrowse
+		return m, nil
+	}
+	if m.focus == paneLocal {
+		p := sshc.ExpandPath(v)
+		st, err := os.Stat(p)
+		if err != nil || !st.IsDir() {
+			m.err = "本地路径不存在或不是目录"
+			return m, nil
+		}
+		m.mode = modeBrowse
+		m.localCwd = p
+		m.localCursor = 0
+		m.localEntries = nil
+		m.localTop = 0
+		m.clearSel()
+		m.busy = true
+		return m, m.loadLocal()
+	}
+	cl := m.conn.Client
+	p := v
+	m.busy = true
+	return m, tea.Cmd(func() tea.Msg {
+		entries, err := sftpc.List(cl, p)
+		if err != nil {
+			return sftpGotoJumpMsg{path: p, err: fmt.Errorf("目录不存在或不是目录: %w", err)}
+		}
+		return sftpGotoJumpMsg{path: p, entries: entries}
+	})
+}
+
+// gotoComplete Tab 补全：有新鲜候选时循环切换，否则异步读取目录计算候选
+func (m *sftpModel) gotoComplete() (*sftpModel, tea.Cmd) {
+	v := m.gotoIn.Value()
+	if len(m.gotoCandidates) > 0 && v == m.gotoLastSet {
+		m.gotoSel = (m.gotoSel + 1) % len(m.gotoCandidates)
+		next := m.gotoCandidates[m.gotoSel]
+		m.gotoIn.SetValue(next)
+		m.gotoLastSet = next
+		return m, nil
+	}
+	m.clearGotoCandidates()
+	dir, base := m.gotoSplit(v)
+	if dir == "" {
+		if m.focus == paneLocal {
+			dir = m.localCwd
+		} else {
+			dir = m.cwd
+		}
+	} else if m.focus == paneLocal {
+		dir = sshc.ExpandPath(dir)
+	}
+	kind := m.focus
+	var cl *sftp.Client
+	if kind == paneRemote && m.conn != nil {
+		cl = m.conn.Client
+	}
+	return m, tea.Cmd(func() tea.Msg {
+		var names []string
+		if kind == paneLocal {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				return sftpGotoCompleteMsg{input: v, err: err}
+			}
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+		} else {
+			entries, err := sftpc.List(cl, dir)
+			if err != nil {
+				return sftpGotoCompleteMsg{input: v, err: err}
+			}
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+		}
+		var cands []string
+		for _, n := range names {
+			if n == "." || n == ".." {
+				continue
+			}
+			if base == "" || strings.HasPrefix(strings.ToLower(n), strings.ToLower(base)) {
+				cands = append(cands, joinGoto(dir, n, kind == paneLocal))
+			}
+		}
+		return sftpGotoCompleteMsg{input: v, cands: cands}
+	})
+}
+
+func (m *sftpModel) handleGotoComplete(msg sftpGotoCompleteMsg) (*sftpModel, tea.Cmd) {
+	if msg.input != m.gotoIn.Value() {
+		return m, nil // 输入已变化，丢弃陈旧结果
+	}
+	if msg.err != nil {
+		m.err = fmt.Sprintf("补全失败: %v", msg.err)
+		m.clearGotoCandidates()
+		return m, nil
+	}
+	if len(msg.cands) == 0 {
+		m.clearGotoCandidates()
+		m.status = "无匹配项"
+		return m, nil
+	}
+	m.gotoCandidates = msg.cands
+	m.gotoSel = 0
+	next := msg.cands[0]
+	m.gotoIn.SetValue(next)
+	m.gotoLastSet = next
+	return m, nil
+}
+
+func joinGoto(dir, name string, local bool) string {
+	if local {
+		return filepath.Join(dir, name)
+	}
+	return path.Join(dir, name)
+}
+
 // ---- 渲染 ----
 
 func (m *sftpModel) View() tea.View {
@@ -750,7 +1220,9 @@ func (m *sftpModel) View() tea.View {
 	}
 
 	// 删除确认
-	if m.focus == paneLocal && m.localConfirmID >= 0 && m.localConfirmID < len(m.localEntries) {
+	if m.confirmBatch {
+		b.WriteString("\n" + styleInfo.Render(fmt.Sprintf("确认删除 %d 项？ (y/N)", m.selCount())) + "\n")
+	} else if m.focus == paneLocal && m.localConfirmID >= 0 && m.localConfirmID < len(m.localEntries) {
 		b.WriteString("\n" + styleInfo.Render(fmt.Sprintf("确认删除 %q？ (y/N)", m.localEntries[m.localConfirmID].Name())) + "\n")
 	} else if m.confirmID >= 0 && m.confirmID < len(m.entries) {
 		b.WriteString("\n" + styleInfo.Render(fmt.Sprintf("确认删除 %q？ (y/N)", m.entries[m.confirmID].Name())) + "\n")
@@ -758,9 +1230,34 @@ func (m *sftpModel) View() tea.View {
 
 	// 输入模式
 	if m.mode == modeUpload {
-		b.WriteString("\n" + styleCursor.Render("上传 ") + "本地路径(可拖拽文件): " + m.uploadIn.View() + "\n")
+		b.WriteString("\n" + styleCursor.Render("上传 ") + "本地路径(可拖拽文件/目录): " + m.uploadIn.View() + "\n")
 	} else if m.mode == modeNewDir {
 		b.WriteString("\n" + styleCursor.Render("新建目录: ") + m.newDirIn.View() + "\n")
+	} else if m.mode == modeGoto {
+		b.WriteString("\n" + styleCursor.Render("跳转路径: ") + m.gotoIn.View() + "\n")
+		if len(m.gotoCandidates) > 0 {
+			max := len(m.gotoCandidates)
+			if max > 6 {
+				max = 6
+			}
+			for i := 0; i < max; i++ {
+				mark := "  "
+				if i == m.gotoSel {
+					mark = "▸ "
+				}
+				line := mark + m.gotoCandidates[i]
+				if i == m.gotoSel {
+					line = styleSelected.Render(line)
+				}
+				b.WriteString(line + "\n")
+			}
+		}
+		b.WriteString("\n" + styleHint.Render("Tab 补全  Enter 跳转  Esc 取消") + "\n")
+	}
+
+	// 多选状态提示
+	if m.hasSel() {
+		b.WriteString("\n" + styleHint.Render(fmt.Sprintf("已选中 %d 项（Enter 批量传输 / x 删除 / Esc 取消）", m.selCount())) + "\n")
 	}
 
 	// 状态/进度
@@ -866,19 +1363,31 @@ func (m *sftpModel) paneRows(kind, width int) []string {
 		}
 	}
 	for i := start; i < end; i++ {
-		rows = append(rows, m.renderEntry(entries[i], i, cursor, lay))
+		rows = append(rows, m.renderEntry(entries[i], i, cursor, lay, kind))
 	}
 	return rows
 }
 
-func (m *sftpModel) renderEntry(e fs.FileInfo, idx, cursor int, lay paneLayout) string {
+func (m *sftpModel) renderEntry(e fs.FileInfo, idx, cursor int, lay paneLayout, kind int) string {
 	nameStr := e.Name()
 	if e.IsDir() {
 		nameStr += "/"
 	}
-	prefix := "  "
+	selMark := " "
+	if kind == paneLocal {
+		if _, ok := m.selLocal[idx]; ok {
+			selMark = "●"
+		}
+	} else if _, ok := m.selRemote[idx]; ok {
+		selMark = "●"
+	}
+	cursorMark := " "
 	if idx == cursor {
-		prefix = styleCursor.Render("▸ ")
+		cursorMark = "▸"
+	}
+	prefix := cursorMark + selMark
+	if idx == cursor {
+		prefix = styleCursor.Render(prefix)
 	}
 	name := padRight(runewidth.Truncate(nameStr, lay.nameW, "…"), lay.nameW)
 	var b strings.Builder
@@ -909,5 +1418,5 @@ func renderProgress(name string, done, total int64) string {
 }
 
 func renderSFTPFooter() string {
-	return "Tab 切换栏  Enter 进入/传输(本地↑/远程↓)  ↑/↓ 移动  Backspace 上级  u 路径上传  n 新建目录  d 下载  x 删除  r 刷新  q 返回"
+	return "Tab 切换栏  Enter 进入/传输(本地↑/远程↓)  Space 多选  g 跳转路径  ↑/↓ 移动  Backspace 上级  u 路径上传  n 新建目录  d 下载  x 删除  r 刷新  q 返回"
 }

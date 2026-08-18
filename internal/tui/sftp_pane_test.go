@@ -231,3 +231,366 @@ func TestSFTPRemoteEnterDownload(t *testing.T) {
 		t.Fatalf("下载校验失败: %v", err)
 	}
 }
+
+func indexOfName(entries []os.FileInfo, name string) int {
+	for i, e := range entries {
+		if e.Name() == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestSFTPGotoLocalJump 本地栏 g 打开路径输入、Enter 跳转
+func TestSFTPGotoLocalJump(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	defer m.close()
+	m.focus = paneLocal
+
+	target := filepath.Join(m.localCwd, "goto-dir")
+	_ = os.MkdirAll(filepath.Join(target, "sub"), 0o755)
+	_ = os.WriteFile(filepath.Join(target, "f.txt"), []byte("x"), 0o644)
+
+	next, _ := m.openGoto()
+	if next.mode != modeGoto {
+		t.Fatalf("g 应进入路径跳转模式，实际 %d", next.mode)
+	}
+	next.gotoIn.SetValue(target)
+	next, cmd := next.gotoJump()
+	if cmd == nil {
+		t.Fatal("本地跳转应产生刷新命令")
+	}
+	// 执行刷新并应用
+	lm, ok := cmd().(sftpListMsg)
+	if !ok {
+		t.Fatalf("刷新命令应返回 sftpListMsg，实际 %T", lm)
+	}
+	next, _ = next.Update(lm)
+	if next.localCwd != target {
+		t.Fatalf("应跳转到 %s，实际 %s", target, next.localCwd)
+	}
+	if next.mode != modeBrowse {
+		t.Fatalf("跳转后应回浏览模式，实际 %d", next.mode)
+	}
+	if len(next.localEntries) != 2 {
+		t.Fatalf("目标目录应列出 2 项，实际 %d", len(next.localEntries))
+	}
+}
+
+// TestSFTPGotoLocalInvalid 本地跳转无效路径应报错且不退出输入
+func TestSFTPGotoLocalInvalid(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	defer m.close()
+	m.focus = paneLocal
+
+	next, _ := m.openGoto()
+	next.gotoIn.SetValue("/nonexistent/xyz")
+	next, cmd := next.gotoJump()
+	if cmd != nil {
+		t.Fatal("无效路径不应产生刷新命令")
+	}
+	if next.mode != modeGoto {
+		t.Fatalf("无效路径应留在输入模式，实际 %d", next.mode)
+	}
+	if next.err == "" {
+		t.Fatal("应提示路径错误")
+	}
+}
+
+// TestSFTPGotoRemoteJump 远程栏路径跳转（异步校验）
+func TestSFTPGotoRemoteJump(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+	m.focus = paneRemote
+	m.cwd = env.Root
+
+	target := filepath.Join(env.Root, "jump-dir")
+	_ = os.MkdirAll(target, 0o755)
+	_ = os.WriteFile(filepath.Join(target, "a.txt"), []byte("x"), 0o644)
+
+	next, _ := m.openGoto()
+	next.gotoIn.SetValue(target)
+	next, cmd := next.gotoJump()
+	if cmd == nil {
+		t.Fatal("远程跳转应产生命令")
+	}
+	jm, ok := cmd().(sftpGotoJumpMsg)
+	if !ok {
+		t.Fatalf("跳转命令应返回 sftpGotoJumpMsg，实际 %T", jm)
+	}
+	next, _ = next.Update(jm)
+	if next.cwd != target {
+		t.Fatalf("远程应跳转到 %s，实际 %s", target, next.cwd)
+	}
+	if next.mode != modeBrowse {
+		t.Fatalf("跳转后应回浏览模式，实际 %d", next.mode)
+	}
+	if len(next.entries) != 1 {
+		t.Fatalf("目标目录应列出 1 项，实际 %d", len(next.entries))
+	}
+}
+
+// TestSFTPGotoCompleteLocal 本地 Tab 补全：候选计算、自动补全、循环切换
+func TestSFTPGotoCompleteLocal(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	defer m.close()
+	m.focus = paneLocal
+
+	root := t.TempDir()
+	_ = os.WriteFile(filepath.Join(root, "alpha.txt"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "alpine.txt"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "beta.txt"), []byte("x"), 0o644)
+	m.localCwd = root
+
+	m.mode = modeGoto
+	m.gotoIn.SetValue("al")
+	next, cmd := m.gotoComplete()
+	cm, ok := cmd().(sftpGotoCompleteMsg)
+	if !ok {
+		t.Fatalf("补全命令应返回 sftpGotoCompleteMsg，实际 %T", cm)
+	}
+	if cm.err != nil {
+		t.Fatalf("补全失败: %v", cm.err)
+	}
+	if len(cm.cands) != 2 {
+		t.Fatalf("应匹配 2 个候选，实际 %v", cm.cands)
+	}
+	next, _ = next.Update(cm)
+	if len(next.gotoCandidates) != 2 {
+		t.Fatalf("候选应写入模型，实际 %v", next.gotoCandidates)
+	}
+	want1 := filepath.Join(root, "alpha.txt")
+	if next.gotoIn.Value() != want1 {
+		t.Fatalf("首次补全应填入 %s，实际 %s", want1, next.gotoIn.Value())
+	}
+
+	// Tab 循环到第二个
+	next, _ = next.gotoComplete()
+	if next.gotoIn.Value() != filepath.Join(root, "alpine.txt") {
+		t.Fatalf("二次 Tab 应填入 alpine.txt，实际 %s", next.gotoIn.Value())
+	}
+	// 再 Tab 回绕到第一个
+	next, _ = next.gotoComplete()
+	if next.gotoIn.Value() != want1 {
+		t.Fatalf("三次 Tab 应回绕到 %s，实际 %s", want1, next.gotoIn.Value())
+	}
+}
+
+// TestSFTPGotoCompleteRemote 远程 Tab 补全走 sftp 服务端列表
+func TestSFTPGotoCompleteRemote(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+	m.focus = paneRemote
+	m.cwd = env.Root
+
+	_ = os.WriteFile(filepath.Join(env.Root, "alpha.txt"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(env.Root, "alpine.txt"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(env.Root, "beta.txt"), []byte("x"), 0o644)
+
+	m.mode = modeGoto
+	m.gotoIn.SetValue("al")
+	next, cmd := m.gotoComplete()
+	cm, ok := cmd().(sftpGotoCompleteMsg)
+	if !ok {
+		t.Fatalf("补全命令应返回 sftpGotoCompleteMsg，实际 %T", cm)
+	}
+	if cm.err != nil || len(cm.cands) != 2 {
+		t.Fatalf("远程补全异常: err=%v cands=%v", cm.err, cm.cands)
+	}
+	next, _ = next.Update(cm)
+	want1 := path.Join(env.Root, "alpha.txt")
+	if next.gotoIn.Value() != want1 {
+		t.Fatalf("远程补全应填入 %s，实际 %s", want1, next.gotoIn.Value())
+	}
+}
+
+// TestSFTPGotoEsc 路径输入 Esc 取消回到浏览模式
+func TestSFTPGotoEsc(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	defer m.close()
+
+	next, _ := m.openGoto()
+	next, _ = next.handleKey(pressKey(tea.KeyEsc).(tea.KeyPressMsg))
+	if next.mode != modeBrowse {
+		t.Fatalf("Esc 应取消输入，实际 %d", next.mode)
+	}
+}
+
+// TestSFTPMultiSelectBatchUpload 本地多选（文件+目录）Enter 批量上传，文件夹递归
+func TestSFTPMultiSelectBatchUpload(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+	m.focus = paneLocal
+	m.cwd = env.Root
+
+	// 本地源：f1.txt + dir/n.txt（嵌套目录）
+	_ = os.WriteFile(filepath.Join(m.localCwd, "f1.txt"), []byte("111"), 0o644)
+	_ = os.MkdirAll(filepath.Join(m.localCwd, "dir", "sub"), 0o755)
+	_ = os.WriteFile(filepath.Join(m.localCwd, "dir", "n.txt"), []byte("nested"), 0o644)
+
+	// 刷新本地列表并多选 f1.txt 与 dir
+	lm := m.loadLocal()
+	next, _ := m.Update(lm())
+	next.selLocal[indexOfName(next.localEntries, "f1.txt")] = struct{}{}
+	next.selLocal[indexOfName(next.localEntries, "dir")] = struct{}{}
+	if next.selCount() != 2 {
+		t.Fatalf("应选中 2 项，实际 %d", next.selCount())
+	}
+
+	next, start := next.startBatch(true)
+	if start == nil {
+		t.Fatal("批量上传应产生进度命令")
+	}
+	next = driveProgress(t, next, start)
+	if next.err != "" {
+		t.Fatalf("批量上传失败: %s", next.err)
+	}
+	// 校验远程（含递归目录）
+	checkDisk(t, filepath.Join(env.Root, "f1.txt"), "111")
+	checkDisk(t, filepath.Join(env.Root, "dir", "n.txt"), "nested")
+	if next.hasSel() {
+		t.Fatal("批量传输后应清空选中")
+	}
+}
+
+// TestSFTPMultiSelectBatchDownload 远程多选 Enter 批量下载（含目录递归）
+func TestSFTPMultiSelectBatchDownload(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+	m.cwd = env.Root
+
+	_ = os.WriteFile(filepath.Join(env.Root, "r1.txt"), []byte("r1"), 0o644)
+	_ = os.MkdirAll(filepath.Join(env.Root, "rdir", "sub"), 0o755)
+	_ = os.WriteFile(filepath.Join(env.Root, "rdir", "n.txt"), []byte("rn"), 0o644)
+
+	// 刷新远程列表并多选 r1.txt 与 rdir（默认焦点远程栏）
+	m.entries = nil
+	rl := m.loadList()
+	next, _ := m.Update(rl())
+	next.selRemote[indexOfName(next.entries, "r1.txt")] = struct{}{}
+	next.selRemote[indexOfName(next.entries, "rdir")] = struct{}{}
+
+	next, start := next.startBatch(false)
+	if start == nil {
+		t.Fatal("批量下载应产生进度命令")
+	}
+	next = driveProgress(t, next, start)
+	if next.err != "" {
+		t.Fatalf("批量下载失败: %s", next.err)
+	}
+	checkDisk(t, filepath.Join(next.localCwd, "r1.txt"), "r1")
+	checkDisk(t, filepath.Join(next.localCwd, "rdir", "n.txt"), "rn")
+}
+
+// TestSFTPMultiSelectBatchDelete 多选批量删除（远程）
+func TestSFTPMultiSelectBatchDelete(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+	m.cwd = env.Root
+
+	_ = os.WriteFile(filepath.Join(env.Root, "d1.txt"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(env.Root, "d2.txt"), []byte("y"), 0o644)
+
+	m.entries = nil
+	rl := m.loadList()
+	next, _ := m.Update(rl())
+	next.selRemote[indexOfName(next.entries, "d1.txt")] = struct{}{}
+	next.selRemote[indexOfName(next.entries, "d2.txt")] = struct{}{}
+
+	// x → 批量删除确认；y 确认执行
+	next, _ = next.handleKey(press("x").(tea.KeyPressMsg))
+	if !next.confirmBatch {
+		t.Fatal("有选中项按 x 应进入批量删除确认")
+	}
+	next, dc := next.handleKey(press("y").(tea.KeyPressMsg))
+	if dc == nil {
+		t.Fatal("确认批量删除应产生命令")
+	}
+	dc()
+	if _, err := os.Stat(filepath.Join(env.Root, "d1.txt")); !os.IsNotExist(err) {
+		t.Fatal("d1.txt 应已删除")
+	}
+	if _, err := os.Stat(filepath.Join(env.Root, "d2.txt")); !os.IsNotExist(err) {
+		t.Fatal("d2.txt 应已删除")
+	}
+}
+
+// TestSFTPMultiSelectBatchDeleteLocal 多选批量删除（本地）
+func TestSFTPMultiSelectBatchDeleteLocal(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	defer m.close()
+	m.focus = paneLocal
+
+	root := t.TempDir()
+	m.localCwd = root
+	_ = os.WriteFile(filepath.Join(root, "l1.txt"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "l2.txt"), []byte("y"), 0o644)
+
+	lm := m.loadLocal()
+	next, _ := m.Update(lm())
+	next.selLocal[indexOfName(next.localEntries, "l1.txt")] = struct{}{}
+	next.selLocal[indexOfName(next.localEntries, "l2.txt")] = struct{}{}
+
+	next, _ = next.handleKey(press("x").(tea.KeyPressMsg))
+	if !next.confirmBatch {
+		t.Fatal("本地有选中项按 x 应进入批量删除确认")
+	}
+	next, dc := next.handleKey(press("y").(tea.KeyPressMsg))
+	if dc == nil {
+		t.Fatal("确认批量删除应产生命令")
+	}
+	dc()
+	if _, err := os.Stat(filepath.Join(root, "l1.txt")); !os.IsNotExist(err) {
+		t.Fatal("l1.txt 应已删除")
+	}
+	if _, err := os.Stat(filepath.Join(root, "l2.txt")); !os.IsNotExist(err) {
+		t.Fatal("l2.txt 应已删除")
+	}
+}
+
+// TestSFTPSelectionRender 选中条目渲染显示 ● 标记
+func TestSFTPSelectionRender(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	defer m.close()
+	m.focus = paneLocal
+
+	root := t.TempDir()
+	m.localCwd = root
+	_ = os.WriteFile(filepath.Join(root, "sel.txt"), []byte("x"), 0o644)
+	lm := m.loadLocal()
+	next, _ := m.Update(lm())
+	next.selLocal[indexOfName(next.localEntries, "sel.txt")] = struct{}{}
+
+	next.width, next.height = 100, 30
+	content := next.View().Content
+	if !strings.Contains(content, "●") {
+		t.Fatalf("选中条目应渲染 ● 标记，实际: %q", content)
+	}
+	if !strings.Contains(content, "已选中 1 项") {
+		t.Fatalf("应显示选中数量提示，实际: %q", content)
+	}
+}
+
+func checkDisk(t *testing.T, p, want string) {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil || string(b) != want {
+		t.Fatalf("文件 %s 校验失败: err=%v", p, err)
+	}
+}
