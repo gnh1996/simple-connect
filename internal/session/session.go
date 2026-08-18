@@ -16,6 +16,26 @@ import (
 // ErrDetach 表示用户在会话中按热键请求切换到 SFTP
 var ErrDetach = errors.New("用户请求切换到 SFTP")
 
+// localeEnvKeys 透传到远程会话的环境变量（对齐 OpenSSH 客户端默认 SendEnv LANG LC_*）。
+// 不传时远程落到 C/POSIX locale：readline 按字节处理输入，中文/非 ASCII 输入后
+// 命令行重绘光标错位（表现为跳行首），CJK 宽度对齐也全乱。
+var localeEnvKeys = []string{
+	"LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_COLLATE",
+	"LC_TIME", "LC_NUMERIC", "LC_MONETARY", "LC_PAPER", "LC_NAME",
+	"LC_ADDRESS", "LC_TELEPHONE", "LC_MEASUREMENT", "LC_IDENTIFICATION",
+}
+
+// sessionEnv 收集本机需透传到远程会话的环境变量（仅取非空值）
+func sessionEnv() map[string]string {
+	out := map[string]string{}
+	for _, k := range localeEnvKeys {
+		if v := os.Getenv(k); v != "" {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // 会话中唤起 SFTP 的热键序列：Ctrl+X 后按 f
 const (
 	detachCtrlX = 0x18
@@ -55,6 +75,13 @@ func runSession(c *sshc.Client, in io.Reader, out, errOut io.Writer, rows, cols 
 		return fmt.Errorf("请求远程 PTY 失败: %w", err)
 	}
 	defer s.Close()
+
+	// 透传 UTF-8 相关 locale（对齐 OpenSSH 客户端默认 SendEnv LANG LC_*）。
+	// 不传时远程落到 C/POSIX locale：readline 按字节处理多字节输入，
+	// 中文输入后光标位置计算错乱（表现为跳动/错位），ls/vim 中 CJK 宽度对齐也全乱。
+	for k, v := range sessionEnv() {
+		_ = s.Setenv(k, v)
+	}
 
 	s.Stdout = out
 	s.Stderr = errOut
