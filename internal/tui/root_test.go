@@ -75,7 +75,10 @@ func TestNewSFTPRootFromSession(t *testing.T) {
 	h := &model.Host{Name: "测试机", Host: "10.0.0.1", User: "root", Auth: model.AuthPassword}
 	_ = s.Add(h)
 
-	root := NewSFTPRoot(s, h, "")
+	// 会话挂起唤起：fromSession=true（newSFTPModel + 手动标记，避免真实连接）
+	sm := newSFTPModel(s, h, "", nil)
+	sm.fromSession = true
+	root := &Root{Store: s, page: pageSFTP, sftp: sm}
 	if root.page != pageSFTP || root.sftp == nil {
 		t.Fatalf("初始页应为 SFTP，实际 page=%d sftp=%v", root.page, root.sftp)
 	}
@@ -83,7 +86,7 @@ func TestNewSFTPRootFromSession(t *testing.T) {
 		t.Fatal("会话唤起场景 fromSession 应为 true")
 	}
 
-	// q 返回 → 应请求重连会话
+	// q 返回 → 应请求恢复会话
 	root = upd(root, backToListMsg{})
 	if root.Action != ActionResumeSSH {
 		t.Fatalf("会话唤起下 q 应返回 ActionResumeSSH，实际 %d", root.Action)

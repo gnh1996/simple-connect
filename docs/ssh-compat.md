@@ -14,6 +14,14 @@
 
 **为什么**：sshd 只有建立 PTY 后才会正确应用环境变量；env 必须发生在 shell 启动前，否则远程登录 shell 拿不到 locale/环境。
 
+### 挂起 / 恢复（Ctrl+X f 唤起 SFTP）
+
+- **detach 只挂起透传，不关闭 SSH 连接与远程 shell**：不调 `Session.Close()`、不关闭 `StdinPipe`（避免发 EOF），`oscTracker` 置静音丢弃挂起期间输出（继续消费防远端阻塞）。SSH 连接、shell 进程、工作目录全部保持原样。
+- **恢复**（`Handle.Resume`）：**原样恢复**——重新 `MakeRaw`、重建输入源与 SIGWINCH 监听、发一次当前尺寸 `WindowChange`（尺寸通知无语义副作用）；**不清屏、不发任何字节**（画面保持 detach 时状态，用户按键后自然刷新）。仅**首次进入**会话时本地清屏一次。
+- **首次进入注入 cwd 追踪钩子**：经 `StdinPipe` 发送一条 `export PROMPT_COMMAND=...` / zsh `precmd_functions` 拼接命令（见第 3 节），让 shell 在每次提示符前（空闲时刻）上报目录，绕开 sshd AcceptEnv 对 PROMPT_COMMAND 的拒绝。
+- **`Wait()` 只调一次**：`StartInteractive` 启动一次 goroutine 收 `Session.Wait()` 结果，挂起/恢复循环经 channel `select` 复用；detach 挂起期间 goroutine 阻塞，会话真正结束时返回。
+- **SFTP 复用同一 SSH 连接**（`sftp.NewClient` 开新 channel，不重新认证）；`Conn.Close` 只关 SFTP 通道，不影响会话。
+
 ## 2. TerminalModes 完整集（`internal/ssh/client.go` NewTerminalSession）
 
 **开关类模式必须显式发送，共 40 项**。未发送的项保留服务器 tty 默认值（唯一不可控来源）：老系统/网络设备/堡垒机默认可能关闭关键项。
@@ -62,7 +70,18 @@ LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION
 - **禁止透传 TERM**：本机 TERM（尤其 tmux-256color 等复合值）不代表远程能力，会话内 TERM 由 `os.Getenv("TERM")` 单独处理（有 xterm-256color fallback）
 - **禁止伪造 SSH_TTY/SSH_CLIENT/SSH_CONNECTION**：这些是 sshd 服务器设置的变量，客户端 env 请求无法（也不应）伪造
 - **禁止全量透传环境**：原始环境含路径、代理、会话特定变量，泄露语义到远程
-- **`PROMPT_COMMAND` 注入（会话 cwd 追踪）**：固定注入 `printf '\033]133;cwd=%s\007' "$PWD"`，让远程 bash 每次提示符前上报目录（OSC 133;cwd）。被远程 .bashrc 覆盖时失跟踪并安全降级。仅影响 bash；zsh/fish 忽略该变量无副作用
+- **cwd 追踪（会话目录上报，OSC 133;cwd）**：双层机制，见下
+
+### cwd 追踪（`internal/session/session.go`）
+
+目标：让远程 shell 在**每次提示符前（空闲时刻）**输出 `ESC ]133;cwd=<PWD> BEL`，`oscTracker` 解析（**解析后将该 OSC 序列从输出中剔除**，对齐 Tabby，不污染终端），detach 时作为 SFTP 页初始定位目录。**注意：sshd 默认 `AcceptEnv` 仅接受 `LANG LC_*`，`PROMPT_COMMAND` 的 env 请求会被服务器静默拒绝**，因此以 shell 内注入为主：
+
+1. **shell 内注入（主路径，绕开 AcceptEnv）**：首次进入会话时经 `StdinPipe` 发送一行钩子命令（`cwdHookCommand`）：
+   - **bash**：定义 `_sc_cwd` 上报函数（检测 `$TMUX`，tmux 内用 passthrough 序列 `\ePtmux;\e\e]133;cwd=%s\007\e\\`），`export PROMPT_COMMAND="_sc_cwd; ${PROMPT_COMMAND}"`——**追加保留用户已有钩子**（powerline 等）；
+   - **zsh**：`eval '_sc_cwd(){ ...; }; precmd_functions+=(_sc_cwd);'`——`precmd_functions` **追加不覆盖**（兼容 oh-my-zsh 等）；zsh 专属语法经 `eval` 包裹，避免 POSIX sh 解析报错；
+   - **sh/dash**：`$BASH_VERSION`/`$ZSH_VERSION` 均未定义，两分支短路静默（POSIX 无提示符前钩子机制，降级不跟踪）。
+   - 仅发送一次（首次进入）；SFTP 恢复时不发（原样恢复）。发送时用 `stty -echo` 包裹（`stty -echo\r<钩子>; stty echo\r`）——ECHO 关闭期间命令不回显，随后恢复，**屏幕仅残留一行 `stty -echo`**；命令本体**不含清行/清屏控制序列**（会干扰 bash readline 导致光标错位/输入不可见）；残余副作用：history 记录一条命令。
+2. **env 注入兜底（宽松服务器场景）**：`Setenv("PROMPT_COMMAND", oscPromptCommand)` 仍保留——若服务器 `AcceptEnv` 恰好允许，直接生效且不产生 history 副作用；被拒绝则忽略错误（无阻塞）。
 
 **为什么**：不传 → 远程 shell 落到 C/POSIX locale：
 - readline 按字节处理输入，命令行重绘（redisplay）光标位置错乱 → **输入时跳行首**
@@ -102,7 +121,7 @@ LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION
 
 ## 7. 输入链路（`internal/session/`）
 
-- 热键 Ctrl+X f：前缀状态机 `detachScanner`，正确处理跨 Read 边界、`\x18x`、`\x18\x18`；detach 后字节不转发
+- 热键 Ctrl+X f：前缀状态机 `detachScanner`，正确处理跨 Read 边界、`\x18x`、`\x18\x18`；detach 后字节不转发。**detach 为挂起而非中断**：不关闭会话/输入管道，输出静音（见第 1 节挂起/恢复）
 - **pollInput 10ms 忙等轮询（TODO）**：O_NONBLOCK+usleep 轮询有 10ms 级延迟且粘贴吞吐受限（≈51KB/s）。目标：阻塞读 + `poll(2)`/select 带停止信号唤醒
 - Enter 键：本地 raw 后 `\r`(0x0D) 直传远程 → 依赖远程 `ICRNL=1` 转 `\n`（第 2 节）
 
@@ -118,8 +137,14 @@ go test -race ./internal/session/ ./internal/sftp/ ./internal/tui/ -count=1
 ```
 
 - `TestSessionEnvForward`：locale 白名单透传 / 空值不传 / 非白名单不传
+- `TestSessionEnvPromptCommandRejected`：PROMPT_COMMAND env 请求被拒绝（对齐真实 OpenSSH AcceptEnv）
+- `TestSessionCwdHookInjected`：首次进入会话 shell 内注入 cwd 钩子（bash/zsh/tmux passthrough/清除序列）
+- `TestOSCTracker`：OSC 133;cwd 解析 + 从输出中剔除；非目标序列原样透传
 - `TestSessionPtyIUTF8`：IUTF8=1 / IMAXBEL=1 / IXOFF=0 / 基础模式俱全
 - `TestResolveTermSize`：`(width, height)`→`(rows, cols)` 换算顺序 / 非法尺寸回退 24×80（PTY 尺寸颠倒的回归防线）
+- `TestSessionDetachKeepsConnection`：detach 挂起后同一 SSH 连接仍可再建会话（不重连的回归防线）
+- `TestSessionResume`：detach 挂起 → 恢复同一会话透传 → EOF 正常结束（挂起/恢复循环回归）
+- `TestOSCTrackerQuiet`：静音丢弃输出但消费、OSC cwd 跟踪不受影响
 - 新增行为必须补对应断言（服务端记录能力可扩展）
 
 ## 9. 踩坑史（时间线）
@@ -128,6 +153,10 @@ go test -race ./internal/session/ ./internal/sftp/ ./internal/tui/ -count=1
 |---|---|---|---|
 | 2026-08 | 远程输入光标跳行首、CJK 对齐错乱 | 不传 locale env（远程 C locale）+ TerminalModes 缺 IUTF8/IMAXBEL 等 27 项 | PR #1：sessionEnv 白名单透传 + 40 项完整模式集 + 回归测试 |
 | 2026-08 | 远程输入布局乱、ls 输出后光标乱跑、退格错乱（系统 ssh 正常） | `term.GetSize` 返回 `(width, height)` 被当作 `(rows, cols)`，远程 PTY 行列颠倒 | `resolveTermSize` 换算 + `TestResolveTermSize` 回归（见第 5 节） |
+| 2026-08 | 会话中唤起 SFTP 会断开 SSH 并重连，重连后 shell 回 home、目录丢失 | detach 时 `Session.Close()` + main 重连 | 挂起/恢复架构（`Handle`）：detach 不关闭连接，输出静音，恢复同一会话；SFTP 复用同一连接；`TestSessionDetachKeepsConnection`/`TestSessionResume` 回归 |
+| 2026-08 | SSH 当前目录始终带不到 SFTP（tracker.Cwd 恒空） | `Setenv("PROMPT_COMMAND", ...)` 的 env 请求被 sshd 默认 `AcceptEnv`（仅 LANG/LC_*）拒绝，OSC 从未上报；内存测试服务器宽松接受 env 掩盖了该问题 | cwd 钩子改为首次进入会话时经 stdin **shell 内注入**（bash PROMPT_COMMAND 追加 / zsh precmd_functions 追加 / sh 静默），testutil 服务器对齐真实 OpenSSH 拒绝 PROMPT_COMMAND env；`TestSessionCwdHookInjected`/`TestSessionEnvPromptCommandRejected` 回归 |
+| 2026-08 | 注入命令明文回显、OSC 133;cwd 序列透传污染终端 | tty ECHO 无法关闭，注入命令必然回显；tracker 原样透传 OSC 到本地终端；命令内清行（`\033[1A\033[2K`）/清屏（`\033[2J\033[H`）控制序列干扰 bash readline（光标错位、输入不可见） | 发送前 `stty -echo` 关闭 ECHO（注入命令不回显，随后 `stty echo` 恢复），命令本体无控制序列；`oscTracker` 解析后**剔除** OSC 133;cwd 序列（对齐 Tabby），tmux 内用 passthrough 序列；`TestOSCTracker` 过滤断言回归 |
+| 2026-08 | 会话内远程登录横幅（Linux/Welcome/Last login）被重复多份、光标错位、输入不可见 | `oscTracker.scan` 在「无 ESC 序列」分支（`i<0`）把全部已透传数据又写回 `t.buf`，下一次 Write 时 `t.buf+p` 里残留内容被**重复输出**（横幅等纯文本跨 Write 边界重复） | `i<0` 分支不再向 `t.buf` 保留任何字节（跨 Write 的序列起点由 `i>=0 且 j<0` 分支保留）；另 `Write` 合并残留时拷贝到独立切片避免与 `t.buf` 共享底层数组。实测横幅由 6 次降为 1 次；`TestOSCTrackerNoDuplicateOnBoundary` 回归 |
 | 早期 | 不在 config 中的主机被改端口/认证方式 | `ssh_config.Get` 无匹配时返回默认值（Port=22、IdentityFile） | 基于解析结果取值（sshConfigGetter），加 `TestResolveSSHConfigNoConfigMatch` 回归 |
 
 ## 10. 维护约定

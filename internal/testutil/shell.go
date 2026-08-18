@@ -152,6 +152,15 @@ func serveShell(conn net.Conn, cfg *ssh.ServerConfig, env *ShellEnv) {
 						nl := int(binary.BigEndian.Uint32(req.Payload[:4]))
 						if len(req.Payload) >= 4+nl+4 {
 							name := string(req.Payload[4 : 4+nl])
+							// 对齐真实 OpenSSH：默认 AcceptEnv 仅接受 LANG/LC_*，
+							// PROMPT_COMMAND 不在白名单 → 拒绝该 env 请求且不记录
+							// （cwd 钩子改为 shell 内注入，见 internal/session）。
+							if name == "PROMPT_COMMAND" {
+								if req.WantReply {
+									_ = req.Reply(false, nil)
+								}
+								continue
+							}
 							vl := int(binary.BigEndian.Uint32(req.Payload[4+nl : 4+nl+4]))
 							if len(req.Payload) >= 4+nl+4+vl {
 								value := string(req.Payload[4+nl+4 : 4+nl+4+vl])

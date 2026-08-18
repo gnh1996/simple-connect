@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -35,6 +36,19 @@ func Dial(h *model.Host, password string, opts ...sshc.Option) (*Conn, error) {
 		return nil, err
 	}
 	return &Conn{Client: sftpCl, SSH: sshCl}, nil
+}
+
+// NewConnFromSSH 复用已有 SSH 连接建立 SFTP 通道（会话挂起场景，免重新认证）。
+// 返回的 Conn 不拥有底层连接：Close 只关闭 SFTP 通道，不影响 ssh.Client。
+func NewConnFromSSH(sshCl *sshc.Client) (*Conn, error) {
+	if sshCl == nil {
+		return nil, fmt.Errorf("nil SSH client")
+	}
+	sftpCl, err := sftp.NewClient(sshCl.Client)
+	if err != nil {
+		return nil, err
+	}
+	return &Conn{Client: sftpCl}, nil
 }
 
 // Close 关闭连接

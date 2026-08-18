@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -37,6 +38,19 @@ func (s *syncBuf) Contains(sub string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return bytes.Contains(s.b.Bytes(), []byte(sub))
+}
+
+// waitContains 轮询等待输出包含子串
+func waitContains(t *testing.T, buf *syncBuf, sub string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if buf.Contains(sub) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("等待 %q 超时，输出: %q", sub, buf.String())
 }
 
 func dialShell(t *testing.T, env *testutil.ShellEnv) *sshc.Client {
@@ -354,5 +368,105 @@ func TestSessionPtyIUTF8(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("会话未结束")
+	}
+}
+
+// TestSessionDetachKeepsConnection 验证 detach 只挂起透传、不关闭 SSH 连接：
+// 挂起后同一连接仍可再建会话（不重连）。
+func TestSessionDetachKeepsConnection(t *testing.T) {
+	env := testutil.StartShell(t)
+	cl := dialShell(t, env)
+	defer cl.Close()
+
+	inR, inW := io.Pipe()
+	out := &syncBuf{}
+	done := make(chan error, 1)
+	go func() {
+		done <- func() error { _, err := runSession(cl, inR, out, out, 24, 80); return err }()
+	}()
+
+	if _, err := inW.Write([]byte("before\n")); err != nil {
+		t.Fatal(err)
+	}
+	waitContains(t, out, "before")
+
+	// Ctrl+X f 挂起（不关闭连接）
+	if _, err := inW.Write([]byte{0x18, 'f'}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrDetach) {
+			t.Fatalf("应返回 ErrDetach，实际 %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("detach 未在期限内返回")
+	}
+
+	// 连接应保持存活：同一连接再开 shell 会话并回显
+	s2, err := cl.NewSession()
+	if err != nil {
+		t.Fatalf("detach 后连接应可再建会话: %v", err)
+	}
+	defer s2.Close()
+	var out2 syncBuf
+	s2.Stdout = &out2
+	s2.Stdin = strings.NewReader("alive\n")
+	if err := s2.Shell(); err != nil {
+		t.Fatalf("detach 后同一连接启动 shell 失败: %v", err)
+	}
+	waitContains(t, &out2, "alive")
+}
+
+// TestSessionResume 验证 detach 挂起后可用同一会话恢复透传（不重连）：
+// 挂起 → 恢复继续回显 → 输入 EOF 正常结束。
+func TestSessionResume(t *testing.T) {
+	env := testutil.StartShell(t)
+	cl := dialShell(t, env)
+	defer cl.Close()
+
+	inR, inW := io.Pipe()
+	out := &syncBuf{}
+	h, err := newTestHandle(cl, inR, out, 24, 80)
+	if err != nil {
+		t.Fatalf("建立会话失败: %v", err)
+	}
+
+	// 首次透传：回显后挂起
+	done := make(chan error, 1)
+	go func() { done <- h.Resume() }()
+	if _, err := inW.Write([]byte("hello\n")); err != nil {
+		t.Fatal(err)
+	}
+	waitContains(t, out, "hello")
+	if _, err := inW.Write([]byte{0x18, 'f'}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrDetach) {
+			t.Fatalf("首次应 detach，实际 %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("detach 未在期限内返回")
+	}
+
+	// 连接保持：恢复同一会话（目录/进程不变），继续回显
+	done2 := make(chan error, 1)
+	go func() { done2 <- h.Resume() }()
+	if _, err := inW.Write([]byte("again\n")); err != nil {
+		t.Fatal(err)
+	}
+	waitContains(t, out, "again")
+
+	// 关闭输入 → 远程 EOF → 会话正常结束
+	_ = inW.Close()
+	select {
+	case err := <-done2:
+		if err != nil {
+			t.Fatalf("恢复后会话应正常结束，实际 %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("恢复后会话未结束")
 	}
 }

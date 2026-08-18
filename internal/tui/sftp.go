@@ -81,6 +81,10 @@ type sftpModel struct {
 	host  *model.Host
 	conn  *sftpc.Conn
 
+	// sshClient 会话复用连接（Ctrl+X f 挂起会话唤起场景，非 nil 时 SFTP 复用同一
+	// SSH 连接，免重新认证；列表页进入为 nil，走独立 Dial）。
+	sshClient *sshc.Client
+
 	hostKeyCallback ssh.HostKeyCallback // 测试可注入
 
 	// 远程栏
@@ -128,13 +132,14 @@ type sftpModel struct {
 	height int
 }
 
-func newSFTPModel(s *store.Store, h *model.Host, remoteCwd string) *sftpModel {
+func newSFTPModel(s *store.Store, h *model.Host, remoteCwd string, sshCl *sshc.Client) *sftpModel {
 	up := textInput("", "本地文件/目录路径，可直接拖拽文件到终端")
 	nw := textInput("", "新目录名")
 	gt := textInput("", "路径（Tab 补全）")
 	m := &sftpModel{
 		store: s, host: h,
-		uploadIn: &up, newDirIn: &nw, gotoIn: &gt,
+		sshClient: sshCl,
+		uploadIn:  &up, newDirIn: &nw, gotoIn: &gt,
 		confirmID: -1, localConfirmID: -1,
 		selLocal:  map[int]struct{}{},
 		selRemote: map[int]struct{}{},
@@ -160,12 +165,19 @@ func (m *sftpModel) close() {
 
 func (m *sftpModel) Init() tea.Cmd {
 	return tea.Cmd(func() tea.Msg {
-		pass, _ := m.store.Password(m.host)
-		opts := []sshc.Option{}
-		if m.hostKeyCallback != nil {
-			opts = append(opts, sshc.WithHostKeyCallback(m.hostKeyCallback))
+		var conn *sftpc.Conn
+		var err error
+		if m.sshClient != nil {
+			// 会话挂起唤起：复用同一 SSH 连接（免重新认证，SFTP 通道独立）
+			conn, err = sftpc.NewConnFromSSH(m.sshClient)
+		} else {
+			pass, _ := m.store.Password(m.host)
+			opts := []sshc.Option{}
+			if m.hostKeyCallback != nil {
+				opts = append(opts, sshc.WithHostKeyCallback(m.hostKeyCallback))
+			}
+			conn, err = sftpc.Dial(m.host, pass, opts...)
 		}
-		conn, err := sftpc.Dial(m.host, pass, opts...)
 		if err != nil {
 			return sftpConnMsg{err: err}
 		}
@@ -192,6 +204,10 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 		// 会话热键唤起：优先定位到会话内跟踪到的目录
 		if m.remoteCwd != "" {
 			m.cwd = m.remoteCwd
+		} else if m.fromSession {
+			// 未能从会话跟踪到目录（PROMPT_COMMAND 注入未生效，如非 bash/zsh 或
+			// 服务器环境特殊），落到默认路径并提示，便于定位。
+			m.status = "未获取会话目录（shell 钩子未生效？目录可能不准确，可用 g 跳转）"
 		}
 		m.busy = true
 		return m, m.loadList()
@@ -322,17 +338,18 @@ func (m *sftpModel) ensureVisible(top *int, cursor int) {
 	}
 }
 
-// bodyHeight 列表可视行数（终端高度 - 标题/表头/分隔线/底部固定行）。
-// 双栏左右并排后列表区只有一套表头与分隔线（原上下堆叠是两套）。
+// bodyHeight 列表可视条目行数。总行数 = 标题1 + 表头1 + 分隔线1 + body + 动态行
+// + footer1 + 上下 padding2，必须恰为终端高度，footer 才能固定在最后一行。
+// 动态行（确认/输入/状态等）存在时列表区相应压缩。
 func (m *sftpModel) bodyHeight() int {
 	if m.height <= 0 {
 		return 0 // 未知尺寸：显示全部
 	}
-	h := m.height - 6 // 标题1 + 表头1 + 分隔线1 + 状态/底部3
-	if h < 1 {
-		h = 1
+	body := m.height - 6 - len(m.dynamicLines())
+	if body < 1 {
+		body = 1
 	}
-	return h
+	return body
 }
 
 // ---- 导航 ----
@@ -1182,98 +1199,116 @@ func joinGoto(dir, name string, local bool) string {
 // ---- 渲染 ----
 
 func (m *sftpModel) View() tea.View {
-	var b strings.Builder
-
-	// 栏宽：基于外层 Padding(1,2) 之外的实际内容宽（m.width-4）计算，扣除中间分隔线 " │ "（3 宽）
+	// 栏宽：基于外层 Padding(1,2) 之外的实际内容宽（m.width-4）计算。双栏并排时
+	// 中间分隔线 " │ " 占 3 宽，每栏右侧各预留 1 宽滚动箭头位 → 共 5 宽。
 	paneW := 40
 	if m.width > 0 {
 		contentW := m.width - 4
-		paneW = (contentW - 3) / 2
+		paneW = (contentW - 5) / 2
 		if paneW < 8 {
 			paneW = 8
 		}
 	}
 
-	// 标题行：焦点栏高亮（对纯文本截断后再上色，避免 runewidth 破坏 ANSI 序列）
-	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top,
-		title("本地", m.localCwd, m.focus == paneLocal, paneW),
-		styleDim.Render(" │ "),
-		title("远程", m.cwd, m.focus == paneRemote, paneW),
-	) + "\n")
+	dyn := m.dynamicLines()
 
-	// 两栏列表：左右并排，各自滚动；行数补平保证右栏逐行对齐
+	// 标题行：焦点栏高亮（对纯文本截断后再上色，避免 runewidth 破坏 ANSI 序列）。
+	// 宽度用 paneW+1 与列表行（含右侧滚动箭头位）对齐。
+	titleLine := lipgloss.JoinHorizontal(lipgloss.Top,
+		title("本地", m.localCwd, m.focus == paneLocal, paneW+1),
+		styleDim.Render(" │ "),
+		title("远程", m.cwd, m.focus == paneRemote, paneW+1))
+
+	// 两栏列表：左右并排，各自滚动；行数补平（含箭头位 paneW+1）保证左右逐行对齐
 	sep := styleDim.Render(" │ ")
 	left := m.paneRows(paneLocal, paneW)
 	right := m.paneRows(paneRemote, paneW)
-	n := len(left)
+	n := 2 + m.bodyHeight()
+	if len(left) > n {
+		n = len(left)
+	}
 	if len(right) > n {
 		n = len(right)
 	}
 	for len(left) < n {
-		left = append(left, strings.Repeat(" ", paneW))
+		left = append(left, strings.Repeat(" ", paneW+1))
 	}
 	for len(right) < n {
-		right = append(right, strings.Repeat(" ", paneW))
+		right = append(right, strings.Repeat(" ", paneW+1))
 	}
+
+	var b strings.Builder
+	b.WriteString(titleLine + "\n")
 	for i := 0; i < n; i++ {
 		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left[i], sep, right[i]) + "\n")
 	}
+	for _, l := range dyn {
+		b.WriteString(l + "\n")
+	}
+	if m.err != "" {
+		m.err = "" // 渲染后清空（dynamicLines 已包含错误行）
+	}
+	// 单行 footer（不用带边框的 styleFooter：边框渲染 3 行会打乱行数计算）
+	b.WriteString(styleDim.Render(renderSFTPFooter()))
+	return tea.NewView(lipgloss.NewStyle().Padding(1, 2).Render(b.String()))
+}
 
-	// 删除确认
+// dynamicLines 生成列表区与 footer 之间的动态区块行（删除确认/输入模式/多选/状态/错误等），
+// 渲染与高度计算共用，保证 footer 固定在终端最后一行。
+func (m *sftpModel) dynamicLines() []string {
+	var lines []string
+
+	// 删除确认（单个或批量）
 	if m.confirmBatch {
-		b.WriteString("\n" + styleInfo.Render(fmt.Sprintf("确认删除 %d 项？ (y/N)", m.selCount())) + "\n")
+		lines = append(lines, styleInfo.Render(fmt.Sprintf("确认删除 %d 项？ (y/N)", m.selCount())))
 	} else if m.focus == paneLocal && m.localConfirmID >= 0 && m.localConfirmID < len(m.localEntries) {
-		b.WriteString("\n" + styleInfo.Render(fmt.Sprintf("确认删除 %q？ (y/N)", m.localEntries[m.localConfirmID].Name())) + "\n")
+		lines = append(lines, styleInfo.Render(fmt.Sprintf("确认删除 %q？ (y/N)", m.localEntries[m.localConfirmID].Name())))
 	} else if m.confirmID >= 0 && m.confirmID < len(m.entries) {
-		b.WriteString("\n" + styleInfo.Render(fmt.Sprintf("确认删除 %q？ (y/N)", m.entries[m.confirmID].Name())) + "\n")
+		lines = append(lines, styleInfo.Render(fmt.Sprintf("确认删除 %q？ (y/N)", m.entries[m.confirmID].Name())))
 	}
 
 	// 输入模式
-	if m.mode == modeUpload {
-		b.WriteString("\n" + styleCursor.Render("上传 ") + "本地路径(可拖拽文件/目录): " + m.uploadIn.View() + "\n")
-	} else if m.mode == modeNewDir {
-		b.WriteString("\n" + styleCursor.Render("新建目录: ") + m.newDirIn.View() + "\n")
-	} else if m.mode == modeGoto {
-		b.WriteString("\n" + styleCursor.Render("跳转路径: ") + m.gotoIn.View() + "\n")
-		if len(m.gotoCandidates) > 0 {
-			max := len(m.gotoCandidates)
-			if max > 6 {
-				max = 6
-			}
-			for i := 0; i < max; i++ {
-				mark := "  "
-				if i == m.gotoSel {
-					mark = "▸ "
-				}
-				line := mark + m.gotoCandidates[i]
-				if i == m.gotoSel {
-					line = styleSelected.Render(line)
-				}
-				b.WriteString(line + "\n")
-			}
+	switch m.mode {
+	case modeUpload:
+		lines = append(lines, styleCursor.Render("上传 ")+"本地路径(可拖拽文件/目录): "+m.uploadIn.View())
+	case modeNewDir:
+		lines = append(lines, styleCursor.Render("新建目录: ")+m.newDirIn.View())
+	case modeGoto:
+		lines = append(lines, styleCursor.Render("跳转路径: ")+m.gotoIn.View())
+		max := len(m.gotoCandidates)
+		if max > 6 {
+			max = 6
 		}
-		b.WriteString("\n" + styleHint.Render("Tab 补全  Enter 跳转  Esc 取消") + "\n")
+		for i := 0; i < max; i++ {
+			mark := "  "
+			if i == m.gotoSel {
+				mark = "▸ "
+			}
+			line := mark + m.gotoCandidates[i]
+			if i == m.gotoSel {
+				line = styleSelected.Render(line)
+			}
+			lines = append(lines, line)
+		}
+		lines = append(lines, styleHint.Render("Tab 补全  Enter 跳转  Esc 取消"))
 	}
 
 	// 多选状态提示
 	if m.hasSel() {
-		b.WriteString("\n" + styleHint.Render(fmt.Sprintf("已选中 %d 项（Enter 批量传输 / x 删除 / Esc 取消）", m.selCount())) + "\n")
+		lines = append(lines, styleHint.Render(fmt.Sprintf("已选中 %d 项（Enter 批量传输 / x 删除 / Esc 取消）", m.selCount())))
 	}
 
 	// 状态/进度
 	if m.transfer != nil {
 		done, total, _, _ := m.transfer.Snapshot()
-		b.WriteString("\n" + styleInfo.Render(renderProgress(m.transfer.Name, done, total)) + "\n")
+		lines = append(lines, styleInfo.Render(renderProgress(m.transfer.Name, done, total)))
 	} else if m.status != "" {
-		b.WriteString("\n" + styleOK.Render(m.status) + "\n")
+		lines = append(lines, styleOK.Render(m.status))
 	}
 	if m.err != "" {
-		b.WriteString("\n" + styleError.Render(m.err) + "\n")
-		m.err = ""
+		lines = append(lines, styleError.Render(m.err))
 	}
-
-	b.WriteString("\n" + styleFooter.Render(styleDim.Render(renderSFTPFooter())))
-	return tea.NewView(lipgloss.NewStyle().Padding(1, 2).Render(b.String()))
+	return lines
 }
 
 // title 渲染栏标题。path 为纯文本，先截断到可用宽度再上色，
@@ -1326,6 +1361,8 @@ func computePaneLayout(width int) paneLayout {
 }
 
 // paneRows 渲染单栏各行（表头 + 分隔线 + 可见条目），不补行。
+// 每行末尾追加 1 宽滚动箭头位：表头行在可向上滚动（top>0）时显示 ▴，
+// 最后可见行在可向下滚动（top+body<len(entries)）时显示 ▾。
 func (m *sftpModel) paneRows(kind, width int) []string {
 	var entries []fs.FileInfo
 	var cursor, top int
@@ -1351,8 +1388,8 @@ func (m *sftpModel) paneRows(kind, width int) []string {
 	if lay.showTime {
 		header += styleDim.Render(padRight("时间", lay.timeW))
 	}
-	rows = append(rows, header)
-	rows = append(rows, styleDim.Render(strings.Repeat("─", width)))
+	rows = append(rows, header+scrollArrow(top > 0, "▴"))
+	rows = append(rows, styleDim.Render(strings.Repeat("─", width))+" ")
 
 	body := m.bodyHeight()
 	start, end := 0, len(entries)
@@ -1363,9 +1400,21 @@ func (m *sftpModel) paneRows(kind, width int) []string {
 		}
 	}
 	for i := start; i < end; i++ {
-		rows = append(rows, m.renderEntry(entries[i], i, cursor, lay, kind))
+		down := false
+		if i == end-1 {
+			down = body > 0 && top+body < len(entries)
+		}
+		rows = append(rows, m.renderEntry(entries[i], i, cursor, lay, kind)+scrollArrow(down, "▾"))
 	}
 	return rows
+}
+
+// scrollArrow 渲染 1 宽滚动箭头位（show 时显示指示字符，否则空白占位保持对齐）
+func scrollArrow(show bool, ch string) string {
+	if show {
+		return styleDim.Render(ch)
+	}
+	return " "
 }
 
 func (m *sftpModel) renderEntry(e fs.FileInfo, idx, cursor int, lay paneLayout, kind int) string {

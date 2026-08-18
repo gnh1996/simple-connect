@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
@@ -584,6 +585,111 @@ func TestSFTPSelectionRender(t *testing.T) {
 	}
 	if !strings.Contains(content, "已选中 1 项") {
 		t.Fatalf("应显示选中数量提示，实际: %q", content)
+	}
+}
+
+// TestSFTPFooterFixedAtBottom 验证按键提示栏固定在终端最后一行：
+// 大目录下列表滚动、View 总行数恒等于终端高度、footer 恒在最后一行。
+func TestSFTPFooterFixedAtBottom(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+
+	// 大目录：40 个文件，超出可视行数
+	root := env.Root
+	for i := 0; i < 40; i++ {
+		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("file%02d.txt", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.cwd = root
+	m.entries = nil
+	lm := m.loadList()
+	m, _ = m.Update(lm())
+	if len(m.entries) != 40 {
+		t.Fatalf("应列出 40 项，实际 %d", len(m.entries))
+	}
+
+	m.width, m.height = 100, 20
+	content := m.View().Content
+	lines := strings.Split(content, "\n")
+	if len(lines) != m.height {
+		t.Fatalf("View 行数应等于终端高度 %d，实际 %d", m.height, len(lines))
+	}
+	// Padding(1,2) 上下各 1 空行：footer 在倒数第二行（最后一行是底部 padding 空行）
+	if !strings.Contains(lines[len(lines)-2], "q 返回") {
+		t.Fatalf("footer 应固定在最后一行，实际最后一行: %q", lines[len(lines)-2])
+	}
+}
+
+// TestSFTPFooterFixedWithDynamicRows 验证动态行（状态等）存在时列表区压缩，
+// footer 仍固定在最后一行、总行数不变。
+func TestSFTPFooterFixedWithDynamicRows(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+	m.cwd = env.Root
+	m.width, m.height = 100, 15
+
+	m.status = "测试状态"
+	content := m.View().Content
+	lines := strings.Split(content, "\n")
+	if len(lines) != m.height {
+		t.Fatalf("含状态行时行数应仍等于终端高度 %d，实际 %d", m.height, len(lines))
+	}
+	if !strings.Contains(lines[len(lines)-2], "q 返回") {
+		t.Fatalf("含状态行时 footer 仍应固定在最后一行，实际: %q", lines[len(lines)-2])
+	}
+	if !strings.Contains(content, "测试状态") {
+		t.Fatalf("状态行应显示: %q", content)
+	}
+}
+
+// TestSFTPListScrollArrows 验证列表滚动与 ▴/▾ 箭头指示：
+// 可向下滚动时显示 ▾；下移光标后 remoteTop 跟随滚动并出现 ▴。
+func TestSFTPListScrollArrows(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+
+	root := env.Root
+	for i := 0; i < 40; i++ {
+		if err := os.WriteFile(filepath.Join(root, fmt.Sprintf("f%02d.txt", i)), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.cwd = root
+	m.entries = nil
+	lm := m.loadList()
+	m, _ = m.Update(lm())
+
+	m.width, m.height = 100, 12
+	if body := m.bodyHeight(); body != 6 {
+		t.Fatalf("bodyHeight 应为 6（12-6），实际 %d", body)
+	}
+
+	content := m.View().Content
+	if !strings.Contains(content, "▾") {
+		t.Fatalf("列表可向下滚动应显示 ▾，实际: %q", content)
+	}
+	if strings.Contains(content, "▴") {
+		t.Fatalf("顶部无向上滚动不应显示 ▴，实际: %q", content)
+	}
+
+	// 光标下移到超出可视区 → 滚动窗口下移
+	m.moveCursor(10)
+	if m.remoteTop != 5 {
+		t.Fatalf("光标下移后 remoteTop 应跟随滚动，实际 %d", m.remoteTop)
+	}
+	content = m.View().Content
+	if !strings.Contains(content, "▴") {
+		t.Fatalf("列表可向上滚动应显示 ▴，实际: %q", content)
+	}
+	if !strings.Contains(content, "▾") {
+		t.Fatalf("底部仍有未显示条目应保留 ▾，实际: %q", content)
 	}
 }
 

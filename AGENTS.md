@@ -38,10 +38,11 @@ internal/
 ## 连接机制（重点）
 
 - **自建会话**：`sshc.Connect`（读 keyring 保存的密码/密钥认证）→ `session.StartInteractive`（本地终端 raw 模式 + 远程 PTY 字节透传）。不做终端渲染，本地终端即渲染器，vim/tmux 与系统 ssh 表现一致。
-- **热键唤起 SFTP**：会话中按 `Ctrl+X f` 中断透传并返回 `ErrDetach`，main 进入该主机的 SFTP 页（`NewSFTPRoot`，独立连接），`q` 后自动重连会话（`resumeLoop`）。`runSession` 用 `StdinPipe()` 手动泵输入（勿用 `s.Stdin`，会因内部 stdin goroutine 阻塞 `Wait` 死锁）；unix 下 stdin 走非阻塞轮询（`pollInput`，detach 干净退出），Windows 阻塞读（detach 后残留读取 goroutine，下次按键自行退出，可能吞一键）。
+- **热键唤起 SFTP（挂起而非断开）**：会话中按 `Ctrl+X f` 只**挂起**透传并返回 `ErrDetach`——**不关闭 SSH 连接与远程 shell**，`oscTracker` 静音丢弃挂起期间输出（防污染 SFTP 页），目录/进程/连接全部保持。main 进入该主机 SFTP 页（`sftpLoop`），SFTP **复用同一 SSH 连接**（`sftpc.NewConnFromSSH`，免重新认证），`q` 后 `sess.Resume()` **原样恢复**同一会话（不清屏、不发任何字节，仅发一次尺寸同步 `WindowChange`；仅首次进入清屏并注入 cwd 钩子），再次挂起则继续循环。`Session.Wait()` 只起一次 goroutine，经 channel 复用（`Handle.waitDone`）；detach 不调 `s.Close()`、不关 `StdinPipe`（避免 EOF）。输入经 `StdinPipe()` 手动泵（`pumpInput`，勿用 `s.Stdin`，会因内部 stdin goroutine 阻塞 `Wait` 死锁）；unix 下 stdin 走非阻塞轮询（`pollInput`，detach 干净退出），Windows 阻塞读（detach 后残留读取 goroutine，下次按键自行退出，可能吞一键）。
+- **cwd 追踪（SSH 路径带到 SFTP）**：SSH 协议不提供 cwd 查询，靠 shell 在提示符前上报 OSC 133;cwd（`oscTracker` 解析，**解析后将该序列从输出中剔除**，不污染终端）。**注意 sshd 默认 `AcceptEnv` 拒绝 PROMPT_COMMAND**（env 注入失效），因此**首次进入会话时经 stdin 注入一行钩子命令**（`cwdHookCommand`）：bash 定义 `_sc_cwd` 函数追加 PROMPT_COMMAND、zsh 走 `precmd_functions` 追加（eval 包裹防 POSIX 语法错）、sh 静默降级；远程 tmux 内用 passthrough 序列上报；发送时用 `stty -echo` 包裹隐藏回显（命令本体无控制序列，避免干扰 readline）；仅发送一次，恢复时不发。SFTP 打开时用 `sess.Cwd()` 定位远程栏。**oscTracker 跨 Write 边界处理易踩坑**：`scan` 在「无 ESC 序列」分支（`i<0`）不得向 `t.buf` 保留已透传数据（否则登录横幅等纯文本跨边界重复输出、光标错位）；`Write` 合并残留时须拷贝到独立切片避免与 `t.buf` 共享底层数组。改前必看 `TestOSCTrackerNoDuplicateOnBoundary`。
 - **~/.ssh/config**：`sshc.Connect` 会合并 config（`Host` 别名、`User`、`Port`、`IdentityFile`、`ProxyJump`），跳板经隧道链式连接，跳板复用目标保存的密码。**注意：必须基于解析后的 `*ssh_config.Config` 取值（`sshConfigGetter`），禁止直接用 `ssh_config.Get`**——后者在无匹配条目时返回默认值（Port=22、IdentityFile=~/.ssh/identity），会把不在 config 中的主机改错端口和认证方式（严重 bug，已有回归测试 `TestResolveSSHConfigNoConfigMatch`）。
 - **认证**：`authMethods` = 私钥 + 密码 + keyboard-interactive（保存密码应答）+ ssh-agent，依次尝试。
-- **内嵌 SFTP** 使用 `sshc.ConnectRaw`（不合并 config，避免测试污染与意外行为）。
+- **内嵌 SFTP**：列表页进入用 `sshc.ConnectRaw` 独立连接（不合并 config，避免测试污染与意外行为）；会话挂起唤起复用 `sess.SSHClient()`（`NewConnFromSSH`，不重新认证）。
 - **降级**：自建会话失败时 main 提示是否降级用系统 `ssh`。
 - **TerminalModes** 与 OpenSSH 对齐（ECHO/ECHOE/ICRNL/ONLCR/OPOST/CS8 等）。
 - **会话/SSH 层改动前必读 `docs/ssh-compat.md`**（覆盖 `internal/ssh`、`internal/session`、`internal/testutil`）：定义了与 OpenSSH 对齐的行为基线（pty-req/env/shell 顺序、40 项 TerminalModes、locale 白名单、`term.GetSize` 的 `(width,height)`→`(rows,cols)` 尺寸换算、known_hosts 等）。**任何会话/连接层行为变更须同步该文档与对应回归测试（含 `TestResolveTermSize`）**。
