@@ -52,10 +52,11 @@ func run() error {
 			if h == nil {
 				continue
 			}
-			if err := startSSH(s, h); err != nil {
+			cwd, err := startSSH(s, h)
+			if err != nil {
 				if errors.Is(err, session.ErrDetach) {
 					// 会话中按 Ctrl+X f 唤起 SFTP：SFTP 页结束后自动重连会话
-					if rerr := resumeLoop(s, h); rerr != nil {
+					if rerr := resumeLoop(s, h, cwd); rerr != nil {
 						fmt.Fprintln(os.Stderr, styleError("SFTP 页面异常: "+rerr.Error()))
 					}
 					continue
@@ -76,10 +77,11 @@ func run() error {
 	}
 }
 
-// resumeLoop 会话 ⇄ SFTP 循环：热键唤起 SFTP 页，退出后重连会话，再次唤起则继续循环
-func resumeLoop(s *store.Store, h *model.Host) error {
+// resumeLoop 会话 ⇄ SFTP 循环：热键唤起 SFTP 页，退出后重连会话，再次唤起则继续循环。
+// cwd 为会话内跟踪到的远程工作目录（空串=未跟踪到，SFTP 用默认路径）。
+func resumeLoop(s *store.Store, h *model.Host, cwd string) error {
 	for {
-		root := tui.NewSFTPRoot(s, h)
+		root := tui.NewSFTPRoot(s, h, cwd)
 		p := tea.NewProgram(root)
 		result, err := p.Run()
 		if err != nil {
@@ -92,23 +94,26 @@ func resumeLoop(s *store.Store, h *model.Host) error {
 		if !ok || rm.Action != tui.ActionResumeSSH {
 			return nil // 正常返回列表
 		}
-		if err := startSSH(s, h); err != nil {
-			if errors.Is(err, session.ErrDetach) {
-				continue // 再次唤起 SFTP
+		var serr error
+		cwd, serr = startSSH(s, h)
+		if serr != nil {
+			if errors.Is(serr, session.ErrDetach) {
+				continue // 再次唤起 SFTP（cwd 已更新为本次会话跟踪值）
 			}
-			fmt.Fprintln(os.Stderr, styleError("重连会话失败: "+err.Error()))
+			fmt.Fprintln(os.Stderr, styleError("重连会话失败: "+serr.Error()))
 			return nil
 		}
 		return nil
 	}
 }
 
-// startSSH 使用保存的凭据建立自建交互会话
-func startSSH(s *store.Store, h *model.Host) error {
+// startSSH 使用保存的凭据建立自建交互会话。
+// 返回 (会话内跟踪到的远程工作目录, error)；detach 时 cwd 供 SFTP 页定位。
+func startSSH(s *store.Store, h *model.Host) (string, error) {
 	pass, _ := s.Password(h)
 	cl, err := sshc.Connect(h, pass)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer cl.Close()
 	fmt.Print("\x1b[2J\x1b[H") // 清理屏幕

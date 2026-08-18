@@ -30,7 +30,7 @@ func newTestSFTPModel(t *testing.T, env testutil.SFTPEnv) *sftpModel {
 	_ = s.Add(h)
 	_ = s.SetPassword(h, "secret")
 
-	m := newSFTPModel(s, h)
+	m := newSFTPModel(s, h, "")
 	m.hostKeyCallback = ssh.InsecureIgnoreHostKey()
 	m.localCwd = t.TempDir()
 	return m

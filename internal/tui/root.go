@@ -64,9 +64,10 @@ func NewRoot(s *store.Store) *Root {
 	}
 }
 
-// NewSFTPRoot 创建直接进入 SFTP 页的根模型（会话中热键唤起用）
-func NewSFTPRoot(s *store.Store, h *model.Host) *Root {
-	sm := newSFTPModel(s, h)
+// NewSFTPRoot 创建直接进入 SFTP 页的根模型（会话中热键唤起用）。
+// remoteCwd 为会话内跟踪到的远程工作目录（空串=未跟踪到，SFTP 用默认路径）。
+func NewSFTPRoot(s *store.Store, h *model.Host, remoteCwd string) *Root {
+	sm := newSFTPModel(s, h, remoteCwd)
 	sm.fromSession = true
 	return &Root{
 		Store: s,
@@ -106,7 +107,7 @@ func (m *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.page = pageForm
 		return m, m.form.Init()
 	case navSFTPMsg:
-		m.sftp = newSFTPModel(m.Store, msg.host)
+		m.sftp = newSFTPModel(m.Store, msg.host, "") // 列表页唤起无会话 cwd，用默认路径
 		m.page = pageSFTP
 		return m, m.sftp.Init()
 	case backToListMsg:

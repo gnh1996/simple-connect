@@ -62,6 +62,7 @@ LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION
 - **禁止透传 TERM**：本机 TERM（尤其 tmux-256color 等复合值）不代表远程能力，会话内 TERM 由 `os.Getenv("TERM")` 单独处理（有 xterm-256color fallback）
 - **禁止伪造 SSH_TTY/SSH_CLIENT/SSH_CONNECTION**：这些是 sshd 服务器设置的变量，客户端 env 请求无法（也不应）伪造
 - **禁止全量透传环境**：原始环境含路径、代理、会话特定变量，泄露语义到远程
+- **`PROMPT_COMMAND` 注入（会话 cwd 追踪）**：固定注入 `printf '\033]133;cwd=%s\007' "$PWD"`，让远程 bash 每次提示符前上报目录（OSC 133;cwd）。被远程 .bashrc 覆盖时失跟踪并安全降级。仅影响 bash；zsh/fish 忽略该变量无副作用
 
 **为什么**：不传 → 远程 shell 落到 C/POSIX locale：
 - readline 按字节处理输入，命令行重绘（redisplay）光标位置错乱 → **输入时跳行首**

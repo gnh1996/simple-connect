@@ -61,7 +61,7 @@ func TestSessionEcho(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- runSession(cl, inR, out, out, 24, 80)
+		done <- func() error { _, err := runSession(cl, inR, out, out, 24, 80); return err }()
 	}()
 
 	// 写入并等待回显
@@ -99,7 +99,7 @@ func TestSessionWindowSize(t *testing.T) {
 	inR, inW := io.Pipe()
 	out := &syncBuf{}
 	done := make(chan error, 1)
-	go func() { done <- runSession(cl, inR, out, out, 30, 100) }()
+	go func() { _, err := runSession(cl, inR, out, out, 30, 100); done <- err }()
 
 	// 等待服务器记录到窗口尺寸
 	deadline := time.Now().Add(5 * time.Second)
@@ -143,7 +143,7 @@ func TestSessionDetach(t *testing.T) {
 	out := &syncBuf{}
 	done := make(chan error, 1)
 	go func() {
-		done <- runSession(cl, inR, out, out, 24, 80)
+		done <- func() error { _, err := runSession(cl, inR, out, out, 24, 80); return err }()
 	}()
 
 	// 先写入普通内容，验证透传
@@ -194,7 +194,7 @@ func TestDetachBoundary(t *testing.T) {
 	out := &syncBuf{}
 	done := make(chan error, 1)
 	go func() {
-		done <- runSession(cl, inR, out, out, 24, 80)
+		done <- func() error { _, err := runSession(cl, inR, out, out, 24, 80); return err }()
 	}()
 
 	// \x18 后跟 x（非 f）→ 应转发，不触发 detach
@@ -244,7 +244,7 @@ func TestSessionEnvForward(t *testing.T) {
 	inR, inW := io.Pipe()
 	out := &syncBuf{}
 	done := make(chan error, 1)
-	go func() { done <- runSession(cl, inR, out, out, 24, 80) }()
+	go func() { done <- func() error { _, err := runSession(cl, inR, out, out, 24, 80); return err }() }()
 
 	// 轮询等待服务器收到 env 请求（env 在 Shell() 前发送）
 	deadline := time.Now().Add(5 * time.Second)
@@ -287,7 +287,7 @@ func TestSessionPtyIUTF8(t *testing.T) {
 	inR, inW := io.Pipe()
 	out := &syncBuf{}
 	done := make(chan error, 1)
-	go func() { done <- runSession(cl, inR, out, out, 24, 80) }()
+	go func() { done <- func() error { _, err := runSession(cl, inR, out, out, 24, 80); return err }() }()
 
 	// 轮询等待服务器记录到 pty 模式
 	deadline := time.Now().Add(5 * time.Second)

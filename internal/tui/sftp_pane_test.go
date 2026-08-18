@@ -11,6 +11,19 @@ import (
 	"simple-connect/internal/testutil"
 )
 
+// TestSFTPRemoteCwdFromSession 验证热键唤起时远程栏定位到会话内跟踪的目录
+func TestSFTPRemoteCwdFromSession(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	m.remoteCwd = "/var/log/nginx"
+	connect(t, m)
+	defer m.close()
+
+	if m.cwd != "/var/log/nginx" {
+		t.Fatalf("SFTP 应定位到会话 cwd /var/log/nginx，实际 %q", m.cwd)
+	}
+}
+
 // TestSFTPDualPaneFocus 验证双栏结构：默认焦点远程栏，Tab 切换焦点
 func TestSFTPDualPaneFocus(t *testing.T) {
 	env := testutil.StartSFTP(t)

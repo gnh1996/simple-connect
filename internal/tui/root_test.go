@@ -75,7 +75,7 @@ func TestNewSFTPRootFromSession(t *testing.T) {
 	h := &model.Host{Name: "测试机", Host: "10.0.0.1", User: "root", Auth: model.AuthPassword}
 	_ = s.Add(h)
 
-	root := NewSFTPRoot(s, h)
+	root := NewSFTPRoot(s, h, "")
 	if root.page != pageSFTP || root.sftp == nil {
 		t.Fatalf("初始页应为 SFTP，实际 page=%d sftp=%v", root.page, root.sftp)
 	}
