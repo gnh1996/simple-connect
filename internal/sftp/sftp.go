@@ -44,12 +44,8 @@ func (c *Conn) Close() {
 	}
 }
 
-// List 读取目录内容并按“目录优先、忽略大小写”排序
-func List(cl *sftp.Client, path string) ([]os.FileInfo, error) {
-	entries, err := cl.ReadDir(path)
-	if err != nil {
-		return nil, err
-	}
+// SortEntries 按"目录优先、忽略大小写"排序文件列表（远程/本地通用）
+func SortEntries(entries []os.FileInfo) {
 	sort.Slice(entries, func(i, j int) bool {
 		di, dj := entries[i].IsDir(), entries[j].IsDir()
 		if di != dj {
@@ -57,6 +53,15 @@ func List(cl *sftp.Client, path string) ([]os.FileInfo, error) {
 		}
 		return strings.ToLower(entries[i].Name()) < strings.ToLower(entries[j].Name())
 	})
+}
+
+// List 读取目录内容并按"目录优先、忽略大小写"排序
+func List(cl *sftp.Client, path string) ([]os.FileInfo, error) {
+	entries, err := cl.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	SortEntries(entries)
 	return entries, nil
 }
 

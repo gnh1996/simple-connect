@@ -174,7 +174,7 @@ func TestSFTPMkdirAndNavigate(t *testing.T) {
 		t.Fatal("未找到新建目录 data")
 	}
 	m.cursor = indexOfDir(m.entries, "data")
-	m, _ = m.enterDir()
+	m, _ = m.enterCurrent()
 	if m.cwd != path.Join(env.Root, "data") {
 		t.Fatalf("应进入 %s，实际 %s", path.Join(env.Root, "data"), m.cwd)
 	}
