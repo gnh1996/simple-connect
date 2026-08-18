@@ -121,23 +121,49 @@ func (c *Client) NewTerminalSession(term string, rows, cols int) (*ssh.Session, 
 	if err != nil {
 		return nil, err
 	}
-	// 与 OpenSSH 对齐的 tty 模式
+	// 与 OpenSSH 对齐的 tty 模式。
+	// 开关类模式显式发送（未发送的项保留服务器 tty 默认值，老系统/网络设备上
+	// 可能关闭 IUTF8/IMAXBEL 等关键项，导致退格吃半个 UTF-8 字符、光标错位）；
+	// 控制字符（VINTR/VERASE/VSUSP 等）不发送，保留服务器配置。
 	modes := ssh.TerminalModes{
 		ssh.ECHO:          1,
 		ssh.ECHOE:         1,
 		ssh.ECHOK:         1,
 		ssh.ECHOKE:        1,
 		ssh.ECHOCTL:       1,
+		ssh.ECHONL:        0,
 		ssh.ICANON:        1,
 		ssh.IEXTEN:        1,
 		ssh.ISIG:          1,
 		ssh.IXON:          1,
+		ssh.IXANY:         0,
+		ssh.IXOFF:         0,
+		ssh.IMAXBEL:       1,
+		ssh.IUTF8:         1, // 关键：line discipline 按 UTF-8 处理，退格/光标按字符而非字节
 		ssh.ICRNL:         1,
+		ssh.INLCR:         0,
+		ssh.IGNCR:         0,
+		ssh.IGNPAR:        0,
+		ssh.PARMRK:        0,
+		ssh.INPCK:         0,
+		ssh.ISTRIP:        0,
+		ssh.IUCLC:         0,
 		ssh.OPOST:         1,
 		ssh.ONLCR:         1,
+		ssh.OCRNL:         0,
+		ssh.ONOCR:         0,
+		ssh.ONLRET:        0,
+		ssh.OLCUC:         0,
 		ssh.CS8:           1,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
+		ssh.CS7:           0,
+		ssh.PARENB:        0,
+		ssh.PARODD:        0,
+		ssh.NOFLSH:        0,
+		ssh.TOSTOP:        0,
+		ssh.XCASE:         0,
+		ssh.PENDIN:        0,
+		ssh.TTY_OP_ISPEED: 38400,
+		ssh.TTY_OP_OSPEED: 38400,
 	}
 	if err := s.RequestPty(term, rows, cols, modes); err != nil {
 		_ = s.Close()

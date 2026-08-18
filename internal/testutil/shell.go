@@ -19,9 +19,11 @@ type ShellEnv struct {
 	User string
 	Pass string
 
-	mu   sync.Mutex
-	rows int
-	cols int
+	mu    sync.Mutex
+	rows  int
+	cols  int
+	envs  map[string]string // 收到的 env 请求（name → value）
+	modes map[uint32]uint32 // 收到的 pty-req 终端模式（opcode → value）
 }
 
 // WindowSize 读取测试服务器记录的最新 PTY 窗口尺寸
@@ -29,6 +31,28 @@ func (e *ShellEnv) WindowSize() (rows, cols int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.rows, e.cols
+}
+
+// Env 读取测试服务器收到的 env 请求（name → value）
+func (e *ShellEnv) Env() map[string]string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make(map[string]string, len(e.envs))
+	for k, v := range e.envs {
+		out[k] = v
+	}
+	return out
+}
+
+// PtyModes 读取测试服务器收到的 pty-req 终端模式（opcode → value）
+func (e *ShellEnv) PtyModes() map[uint32]uint32 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make(map[uint32]uint32, len(e.modes))
+	for k, v := range e.modes {
+		out[k] = v
+	}
+	return out
 }
 
 // StartShell 启动支持交互 shell 的测试 SSH 服务器。
@@ -84,6 +108,22 @@ func StartShell(t *testing.T) *ShellEnv {
 	return env
 }
 
+// parsePtyModes 解析 pty-req 的 tty 模式段：
+// 重复的 (opcode byte, value uint32 BE) 对，opcode 0 表示结束。
+func parsePtyModes(b []byte) map[uint32]uint32 {
+	modes := map[uint32]uint32{}
+	for len(b) >= 5 {
+		op := b[0]
+		if op == 0 {
+			break
+		}
+		modes[uint32(op)] = binary.BigEndian.Uint32(b[1:5])
+		b = b[5:]
+	}
+	return modes
+}
+
+// serveShell 处理单个 SSH 连接，回显 shell 数据并记录 PTY 尺寸/env/modes。
 func serveShell(conn net.Conn, cfg *ssh.ServerConfig, env *ShellEnv) {
 	sconn, chans, reqs, err := ssh.NewServerConn(conn, cfg)
 	if err != nil {
@@ -106,15 +146,45 @@ func serveShell(conn net.Conn, cfg *ssh.ServerConfig, env *ShellEnv) {
 			defer ch.Close()
 			for req := range requests {
 				switch req.Type {
+				case "env":
+					// payload = string(name) + string(value)
+					if len(req.Payload) >= 8 {
+						nl := int(binary.BigEndian.Uint32(req.Payload[:4]))
+						if len(req.Payload) >= 4+nl+4 {
+							name := string(req.Payload[4 : 4+nl])
+							vl := int(binary.BigEndian.Uint32(req.Payload[4+nl : 4+nl+4]))
+							if len(req.Payload) >= 4+nl+4+vl {
+								value := string(req.Payload[4+nl+4 : 4+nl+4+vl])
+								env.mu.Lock()
+								if env.envs == nil {
+									env.envs = map[string]string{}
+								}
+								env.envs[name] = value
+								env.mu.Unlock()
+							}
+						}
+					}
+					if req.WantReply {
+						_ = req.Reply(true, nil)
+					}
 				case "pty-req":
 					if len(req.Payload) >= 12 {
 						l := int(binary.BigEndian.Uint32(req.Payload[:4]))
 						if len(req.Payload) >= 4+l+8 {
 							cols := binary.BigEndian.Uint32(req.Payload[4+l : 4+l+4])
 							rows := binary.BigEndian.Uint32(req.Payload[4+l+4 : 4+l+8])
-							env.mu.Lock()
-							env.rows, env.cols = int(rows), int(cols)
-							env.mu.Unlock()
+							// modes: 跳过像素宽高(8B)，4 字节长度 + 数据
+							off := 4 + l + 8 + 8
+							if len(req.Payload) >= off+4 {
+								ml := int(binary.BigEndian.Uint32(req.Payload[off : off+4]))
+								if len(req.Payload) >= off+4+ml {
+									modes := parsePtyModes(req.Payload[off+4 : off+4+ml])
+									env.mu.Lock()
+									env.rows, env.cols = int(rows), int(cols)
+									env.modes = modes
+									env.mu.Unlock()
+								}
+							}
 						}
 					}
 					if req.WantReply {

@@ -228,3 +228,95 @@ func TestDetachBoundary(t *testing.T) {
 }
 
 var _ = errors.New
+
+// TestSessionEnvForward 验证 locale 环境变量被透传到远程（防止 C locale 导致
+// readline 重绘光标错位/跳行首、CJK 对齐错乱）。
+func TestSessionEnvForward(t *testing.T) {
+	t.Setenv("LANG", "zh_CN.UTF-8")
+	t.Setenv("LC_CTYPE", "zh_CN.UTF-8")
+	t.Setenv("LC_ALL", "") // 空值不透传
+	t.Setenv("TERM", "")   // TERM 不在透传列表，不应发送
+
+	env := testutil.StartShell(t)
+	cl := dialShell(t, env)
+	defer cl.Close()
+
+	inR, inW := io.Pipe()
+	out := &syncBuf{}
+	done := make(chan error, 1)
+	go func() { done <- runSession(cl, inR, out, out, 24, 80) }()
+
+	// 轮询等待服务器收到 env 请求（env 在 Shell() 前发送）
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := env.Env(); got["LANG"] == "zh_CN.UTF-8" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	got := env.Env()
+	if got["LANG"] != "zh_CN.UTF-8" {
+		t.Fatalf("LANG 未透传，收到: %v", got)
+	}
+	if got["LC_CTYPE"] != "zh_CN.UTF-8" {
+		t.Fatalf("LC_CTYPE 未透传，收到: %v", got)
+	}
+	if _, ok := got["LC_ALL"]; ok {
+		t.Fatalf("空值变量不应透传: %v", got)
+	}
+	if _, ok := got["TERM"]; ok {
+		t.Fatalf("非透传列表变量不应发送: %v", got)
+	}
+
+	_ = inW.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("会话未结束")
+	}
+}
+
+// TestSessionPtyIUTF8 验证 pty-req 发送 IUTF8 等关键 tty 模式
+// （缺失时远程退格按字节删除、光标错位）。
+func TestSessionPtyIUTF8(t *testing.T) {
+	env := testutil.StartShell(t)
+	cl := dialShell(t, env)
+	defer cl.Close()
+
+	inR, inW := io.Pipe()
+	out := &syncBuf{}
+	done := make(chan error, 1)
+	go func() { done <- runSession(cl, inR, out, out, 24, 80) }()
+
+	// 轮询等待服务器记录到 pty 模式
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if modes := env.PtyModes(); len(modes) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	modes := env.PtyModes()
+	if modes[ssh.IUTF8] != 1 {
+		t.Fatalf("IUTF8 模式应发送且为 1，实际: %v", modes)
+	}
+	if modes[ssh.IMAXBEL] != 1 {
+		t.Fatalf("IMAXBEL 模式应发送且为 1，实际: %v", modes)
+	}
+	if modes[ssh.IXOFF] != 0 {
+		t.Fatalf("IXOFF 应显式发送 0（防止服务器默认开启流控卡输入），实际: %v", modes)
+	}
+	// 关键基础模式仍在
+	if modes[ssh.ECHO] != 1 || modes[ssh.ICRNL] != 1 || modes[ssh.CS8] != 1 {
+		t.Fatalf("基础模式缺失: %v", modes)
+	}
+
+	_ = inW.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("会话未结束")
+	}
+}
