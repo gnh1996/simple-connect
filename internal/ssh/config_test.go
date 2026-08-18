@@ -3,6 +3,8 @@ package sshc
 import (
 	"testing"
 
+	"github.com/kevinburke/ssh_config"
+
 	"simple-connect/internal/model"
 )
 
@@ -84,5 +86,45 @@ func TestResolveSSHConfigNoMatch(t *testing.T) {
 	}
 	if len(jumps) != 0 {
 		t.Fatalf("无匹配时不应有跳板: %+v", jumps)
+	}
+}
+
+// TestResolveSSHConfigNoConfigMatch 回归：主机不在 config 中时，
+// 不得被默认值污染（Port 保持自定义端口、认证方式不被改成 key）
+func TestResolveSSHConfigNoConfigMatch(t *testing.T) {
+	cfg, err := ssh_config.DecodeBytes([]byte("Host aliyun\n  User root\n  Port 22\n  IdentityFile ~/.ssh/id_rsa\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &model.Host{Name: "t", Host: "127.0.0.1", Port: 46551, User: "tester", Auth: model.AuthPassword}
+	resolved, jumps := resolveSSHConfig(h, &sshConfigGetter{cfg: cfg})
+	if resolved.Port != 46551 {
+		t.Fatalf("无匹配主机的端口不应被默认值覆盖: %d", resolved.Port)
+	}
+	if resolved.Auth != model.AuthPassword || resolved.KeyPath != "" {
+		t.Fatalf("无匹配主机的认证方式不应被改为 key: %+v", resolved)
+	}
+	if len(jumps) != 0 {
+		t.Fatalf("不应有跳板: %+v", jumps)
+	}
+}
+
+// TestSSHConfigGetterMatch 匹配到 config 块时正确返回明确设置的值
+func TestSSHConfigGetterMatch(t *testing.T) {
+	cfg, err := ssh_config.DecodeBytes([]byte("Host myserver\n  HostName 10.0.0.9\n  User deploy\n  Port 2200\n  IdentityFile ~/.ssh/my_id\n  ProxyJump jump@bastion\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := &sshConfigGetter{cfg: cfg}
+	h := &model.Host{Name: "myserver", Host: "myserver", User: "root", Port: 22, Auth: model.AuthPassword}
+	resolved, jumps := resolveSSHConfig(h, g)
+	if resolved.Host != "10.0.0.9" || resolved.User != "deploy" || resolved.Port != 2200 {
+		t.Fatalf("匹配时应用 config 失败: %+v", resolved)
+	}
+	if resolved.Auth != model.AuthKey || resolved.KeyPath != ExpandPath("~/.ssh/my_id") {
+		t.Fatalf("IdentityFile 未应用: %+v", resolved)
+	}
+	if len(jumps) != 1 || jumps[0].User != "jump" || jumps[0].Host != "bastion" {
+		t.Fatalf("ProxyJump 未解析: %+v", jumps)
 	}
 }

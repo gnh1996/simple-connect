@@ -23,7 +23,7 @@ simple-connect 是一个使用 Go 开发的 SSH/SFTP 连接管理 TUI 应用：
 ## 目录结构
 
 ```
-main.go                  # 入口：TUI ⇄ 自建 SSH 会话的循环（失败可降级系统 ssh）
+main.go                  # 入口：TUI ⇄ 自建 SSH 会话 ⇄ SFTP 页循环（会话中热键可唤起 SFTP）
 internal/
   model/                 # 数据模型（Host、AuthType）
   store/                 # 持久化：JSON 配置 + Secrets 接口（keyring / 文件兜底）
@@ -38,7 +38,8 @@ internal/
 ## 连接机制（重点）
 
 - **自建会话**：`sshc.Connect`（读 keyring 保存的密码/密钥认证）→ `session.StartInteractive`（本地终端 raw 模式 + 远程 PTY 字节透传）。不做终端渲染，本地终端即渲染器，vim/tmux 与系统 ssh 表现一致。
-- **~/.ssh/config**：`sshc.Connect` 会合并 config（`Host` 别名、`User`、`Port`、`IdentityFile`、`ProxyJump`），跳板经隧道链式连接，跳板复用目标保存的密码。
+- **热键唤起 SFTP**：会话中按 `Ctrl+X f` 中断透传并返回 `ErrDetach`，main 进入该主机的 SFTP 页（`NewSFTPRoot`，独立连接），`q` 后自动重连会话（`resumeLoop`）。`runSession` 用 `StdinPipe()` 手动泵输入（勿用 `s.Stdin`，会因内部 stdin goroutine 阻塞 `Wait` 死锁）；unix 下 stdin 走非阻塞轮询（`pollInput`，detach 干净退出），Windows 阻塞读（detach 后残留读取 goroutine，下次按键自行退出，可能吞一键）。
+- **~/.ssh/config**：`sshc.Connect` 会合并 config（`Host` 别名、`User`、`Port`、`IdentityFile`、`ProxyJump`），跳板经隧道链式连接，跳板复用目标保存的密码。**注意：必须基于解析后的 `*ssh_config.Config` 取值（`sshConfigGetter`），禁止直接用 `ssh_config.Get`**——后者在无匹配条目时返回默认值（Port=22、IdentityFile=~/.ssh/identity），会把不在 config 中的主机改错端口和认证方式（严重 bug，已有回归测试 `TestResolveSSHConfigNoConfigMatch`）。
 - **认证**：`authMethods` = 私钥 + 密码 + keyboard-interactive（保存密码应答）+ ssh-agent，依次尝试。
 - **内嵌 SFTP** 使用 `sshc.ConnectRaw`（不合并 config，避免测试污染与意外行为）。
 - **降级**：自建会话失败时 main 提示是否降级用系统 `ssh`。
@@ -66,7 +67,7 @@ internal/
 - 所有测试文件与源码同包放置（`internal/tui/root_test.go`、`sftp_e2e_test.go`、`session_test.go` 等）。
 - TUI 模型测试用直接 `Update` 驱动（已禁用光标闪烁，无需真实程序）。
 - SFTP 测试统一使用 `internal/testutil.StartSFTP`（内存 SSH/SFTP 服务器），远程文件系统限定在 `t.TempDir()`，主机指纹通过 `sshc.WithHostKeyCallback(InsecureIgnoreHostKey())` 注入，禁止触碰真实 `~/.ssh/known_hosts`。
-- 交互会话测试使用 `internal/testutil.StartShell`（内存 SSH 服务器，仅 keyboard-interactive 认证 + shell 回显），用 `io.Pipe` 注入 in/out 驱动 `runSession`。
+- 交互会话测试使用 `internal/testutil.StartShell`（内存 SSH 服务器，仅 keyboard-interactive 认证 + shell 回显），用 `io.Pipe` 注入 in/out 驱动 `runSession`；热键 detach 用 `TestSessionDetach` 覆盖（Ctrl+X f 返回 `ErrDetach`、序列不转发远程、跨 Read 边界、`\x18x` 原样转发）。
 - 注意：测试服务器 `WithServerWorkingDirectory` 只对相对路径生效，测试中远程路径一律基于 `env.Root` 拼绝对路径。
 - 注意：`sshc.Connect` 会读取真实 `~/.ssh/config`，**测试一律用 `ConnectRaw`/`sftpc.Dial`** 避免污染；config 合并逻辑用注入的 `configGetter` 单测覆盖。
 - 新增功能必须补测试；修改传输/导航逻辑必须跑通 e2e 测试，并可用 `go test -race` 校验并发安全。

@@ -64,6 +64,8 @@ type sftpModel struct {
 	newDirIn  *textinput.Model
 	confirmID int // 待删除条目下标，-1 表示无
 
+	fromSession bool // 会话中热键唤起：q 返回时请求重连会话
+
 	transfer *sftpc.Transfer
 	status   string
 	err      string

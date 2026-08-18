@@ -69,6 +69,50 @@ func TestListRendersHosts(t *testing.T) {
 	}
 }
 
+// TestNewSFTPRootFromSession 验证会话唤起：初始即 SFTP 页，q 返回 ActionResumeSSH
+func TestNewSFTPRootFromSession(t *testing.T) {
+	s := testStore(t)
+	h := &model.Host{Name: "测试机", Host: "10.0.0.1", User: "root", Auth: model.AuthPassword}
+	_ = s.Add(h)
+
+	root := NewSFTPRoot(s, h)
+	if root.page != pageSFTP || root.sftp == nil {
+		t.Fatalf("初始页应为 SFTP，实际 page=%d sftp=%v", root.page, root.sftp)
+	}
+	if !root.sftp.fromSession {
+		t.Fatal("会话唤起场景 fromSession 应为 true")
+	}
+
+	// q 返回 → 应请求重连会话
+	root = upd(root, backToListMsg{})
+	if root.Action != ActionResumeSSH {
+		t.Fatalf("会话唤起下 q 应返回 ActionResumeSSH，实际 %d", root.Action)
+	}
+}
+
+// TestNewSFTPRootQuitToList 从列表进入的 SFTP 页 q 返回正常列表（无 resume）
+func TestNewSFTPRootQuitToList(t *testing.T) {
+	s := testStore(t)
+	h := &model.Host{Name: "测试机", Host: "10.0.0.1", User: "root", Auth: model.AuthPassword}
+	_ = s.Add(h)
+
+	root := NewRoot(s)
+	root = upd(root, navSFTPMsg{host: h})
+	if root.page != pageSFTP || root.sftp == nil {
+		t.Fatalf("应进入 SFTP 页，实际 page=%d", root.page)
+	}
+	if root.sftp.fromSession {
+		t.Fatal("列表进入的 SFTP 页 fromSession 应为 false")
+	}
+	root = upd(root, backToListMsg{})
+	if root.Action != ActionNone {
+		t.Fatalf("列表进入的 SFTP 页 q 应回列表（ActionNone），实际 %d", root.Action)
+	}
+	if root.page != pageList {
+		t.Fatalf("应返回列表页，实际 %d", root.page)
+	}
+}
+
 func TestListConnectAndQuit(t *testing.T) {
 	s := testStore(t)
 	h := &model.Host{Name: "测试机", Host: "10.0.0.1", User: "root", Auth: model.AuthPassword}

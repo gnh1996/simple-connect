@@ -133,4 +133,98 @@ func TestSessionAuthFailure(t *testing.T) {
 	}
 }
 
+// TestSessionDetach 验证 Ctrl+X f 中断会话并返回 ErrDetach，且热键字节不转发远程
+func TestSessionDetach(t *testing.T) {
+	env := testutil.StartShell(t)
+	cl := dialShell(t, env)
+	defer cl.Close()
+
+	inR, inW := io.Pipe()
+	out := &syncBuf{}
+	done := make(chan error, 1)
+	go func() {
+		done <- runSession(cl, inR, out, out, 24, 80)
+	}()
+
+	// 先写入普通内容，验证透传
+	if _, err := inW.Write([]byte("abc\n")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if out.Contains("abc") {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !out.Contains("abc") {
+		t.Fatalf("普通输入未透传，输出: %q", out.String())
+	}
+
+	// Ctrl+X（跨 Read 边界）再按 f → 应 detach
+	if _, err := inW.Write([]byte{0x18}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := inW.Write([]byte{'f'}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrDetach) {
+			t.Fatalf("应返回 ErrDetach，实际 %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("detach 未在期限内返回")
+	}
+	// 热键字节不应透传
+	if out.Contains(string([]byte{0x18, 'f'})) {
+		t.Fatalf("热键序列不应转发远程，输出: %q", out.String())
+	}
+}
+
+// TestDetachBoundary 验证 \x18x 不构成热键时原样转发
+func TestDetachBoundary(t *testing.T) {
+	env := testutil.StartShell(t)
+	cl := dialShell(t, env)
+	defer cl.Close()
+
+	inR, inW := io.Pipe()
+	out := &syncBuf{}
+	done := make(chan error, 1)
+	go func() {
+		done <- runSession(cl, inR, out, out, 24, 80)
+	}()
+
+	// \x18 后跟 x（非 f）→ 应转发，不触发 detach
+	if _, err := inW.Write([]byte{0x18, 'x'}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if out.Contains(string([]byte{0x18, 'x'})) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !out.Contains(string([]byte{0x18, 'x'})) {
+		t.Fatalf("\\x18x 应被转发，输出: %q", out.String())
+	}
+
+	// 关闭输入 → 会话正常结束（非 detach）
+	_ = inW.Close()
+	select {
+	case err := <-done:
+		if errors.Is(err, ErrDetach) {
+			t.Fatal("不应 detach")
+		}
+		if err != nil {
+			t.Fatalf("会话应正常结束，实际 %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("会话未在期限内结束")
+	}
+}
+
 var _ = errors.New

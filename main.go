@@ -53,6 +53,13 @@ func run() error {
 				continue
 			}
 			if err := startSSH(s, h); err != nil {
+				if errors.Is(err, session.ErrDetach) {
+					// 会话中按 Ctrl+X f 唤起 SFTP：SFTP 页结束后自动重连会话
+					if rerr := resumeLoop(s, h); rerr != nil {
+						fmt.Fprintln(os.Stderr, styleError("SFTP 页面异常: "+rerr.Error()))
+					}
+					continue
+				}
 				fmt.Fprintln(os.Stderr, styleError("连接失败: "+err.Error()))
 				fmt.Print("是否降级使用系统 ssh 连接？(y/N): ")
 				var ans string
@@ -66,6 +73,33 @@ func run() error {
 		default:
 			return nil
 		}
+	}
+}
+
+// resumeLoop 会话 ⇄ SFTP 循环：热键唤起 SFTP 页，退出后重连会话，再次唤起则继续循环
+func resumeLoop(s *store.Store, h *model.Host) error {
+	for {
+		root := tui.NewSFTPRoot(s, h)
+		p := tea.NewProgram(root)
+		result, err := p.Run()
+		if err != nil {
+			if errors.Is(err, tea.ErrInterrupted) {
+				return nil
+			}
+			return err
+		}
+		rm, ok := result.(*tui.Root)
+		if !ok || rm.Action != tui.ActionResumeSSH {
+			return nil // 正常返回列表
+		}
+		if err := startSSH(s, h); err != nil {
+			if errors.Is(err, session.ErrDetach) {
+				continue // 再次唤起 SFTP
+			}
+			fmt.Fprintln(os.Stderr, styleError("重连会话失败: "+err.Error()))
+			return nil
+		}
+		return nil
 	}
 }
 

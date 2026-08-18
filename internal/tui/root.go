@@ -24,6 +24,8 @@ const (
 	ActionNone Action = iota
 	ActionQuit
 	ActionSSH
+	// ActionResumeSSH 从 SFTP 页返回后请求重连会话（会话中热键唤起场景）
+	ActionResumeSSH
 )
 
 // 页面间消息
@@ -62,8 +64,32 @@ func NewRoot(s *store.Store) *Root {
 	}
 }
 
+// NewSFTPRoot 创建直接进入 SFTP 页的根模型（会话中热键唤起用）
+func NewSFTPRoot(s *store.Store, h *model.Host) *Root {
+	sm := newSFTPModel(s, h)
+	sm.fromSession = true
+	return &Root{
+		Store: s,
+		page:  pageSFTP,
+		sftp:  sm,
+	}
+}
+
 func (m *Root) Init() tea.Cmd {
-	return m.list.Init()
+	switch m.page {
+	case pageSFTP:
+		if m.sftp != nil {
+			return m.sftp.Init()
+		}
+	case pageForm:
+		if m.form != nil {
+			return m.form.Init()
+		}
+	}
+	if m.list != nil {
+		return m.list.Init()
+	}
+	return nil
 }
 
 func (m *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -83,14 +109,16 @@ func (m *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sftp = newSFTPModel(m.Store, msg.host)
 		m.page = pageSFTP
 		return m, m.sftp.Init()
-	case navListMsg, backToListMsg, formSavedMsg:
-		if m.sftp != nil {
+	case backToListMsg:
+		if m.sftp != nil && m.sftp.fromSession {
 			m.sftp.close()
 			m.sftp = nil
+			m.Action = ActionResumeSSH
+			return m, tea.Cmd(func() tea.Msg { return tea.Quit() })
 		}
-		m.page = pageList
-		m.list.reload(m.Store.Hosts())
-		return m, m.list.Init()
+		return m.returnToList()
+	case navListMsg, formSavedMsg:
+		return m.returnToList()
 	}
 
 	var cmd tea.Cmd
@@ -111,15 +139,31 @@ func (m *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m *Root) returnToList() (tea.Model, tea.Cmd) {
+	if m.sftp != nil {
+		m.sftp.close()
+		m.sftp = nil
+	}
+	m.page = pageList
+	m.list.reload(m.Store.Hosts())
+	return m, m.list.Init()
+}
+
 func (m *Root) View() tea.View {
 	var v tea.View
 	switch m.page {
 	case pageForm:
-		v = m.form.View()
+		if m.form != nil {
+			v = m.form.View()
+		}
 	case pageSFTP:
-		v = m.sftp.View()
+		if m.sftp != nil {
+			v = m.sftp.View()
+		}
 	default:
-		v = m.list.View()
+		if m.list != nil {
+			v = m.list.View()
+		}
 	}
 	v.AltScreen = true
 	return v
