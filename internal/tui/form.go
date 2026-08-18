@@ -86,6 +86,9 @@ func textInput(value, placeholder string) textinput.Model {
 	ti.Placeholder = placeholder
 	ti.Prompt = ""
 	ti.CharLimit = 256
+	// 必须显式设置宽度：v2 的 textinput 在 width=0 时 placeholder 只渲染首字符
+	// （占位提示几乎不可见），且长输入不滚动截断会溢出折行。
+	ti.SetWidth(40)
 	st := textinput.DefaultStyles(false)
 	st.Cursor.Blink = false
 	ti.SetStyles(st)

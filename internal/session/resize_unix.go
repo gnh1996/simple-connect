@@ -20,7 +20,8 @@ func startResize(s *ssh.Session) func() {
 		for {
 			select {
 			case <-ch:
-				if rows, cols, err := term.GetSize(os.Stdout.Fd()); err == nil {
+				if width, height, err := term.GetSize(os.Stdout.Fd()); err == nil {
+					rows, cols := resolveTermSize(width, height)
 					_ = s.WindowChange(rows, cols)
 				}
 			case <-done:

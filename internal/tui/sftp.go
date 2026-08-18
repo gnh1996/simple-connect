@@ -32,8 +32,8 @@ const (
 
 // 栏焦点
 const (
-	paneLocal = iota // 本地栏
-	paneRemote       // 远程栏
+	paneLocal  = iota // 本地栏
+	paneRemote        // 远程栏
 )
 
 // SFTP 页面消息
@@ -68,18 +68,18 @@ type sftpModel struct {
 	hostKeyCallback ssh.HostKeyCallback // 测试可注入
 
 	// 远程栏
-	cwd      string
-	entries  []fs.FileInfo
-	cursor   int
+	cwd       string
+	entries   []fs.FileInfo
+	cursor    int
 	remoteTop int // 滚动窗口顶部
 	confirmID int // 待删除条目下标，-1 表示无
 
 	// 本地栏
-	localCwd        string
-	localEntries    []fs.FileInfo
-	localCursor     int
-	localTop        int
-	localConfirmID  int // 待删除条目下标，-1 表示无
+	localCwd       string
+	localEntries   []fs.FileInfo
+	localCursor    int
+	localTop       int
+	localConfirmID int // 待删除条目下标，-1 表示无
 
 	focus int // 当前焦点栏（paneLocal / paneRemote）
 
@@ -107,7 +107,7 @@ func newSFTPModel(s *store.Store, h *model.Host, remoteCwd string) *sftpModel {
 		store: s, host: h,
 		uploadIn: &up, newDirIn: &nw,
 		confirmID: -1, localConfirmID: -1,
-		focus: paneRemote,
+		focus:     paneRemote,
 		remoteCwd: remoteCwd,
 	}
 	if h.LocalDir != "" {
@@ -270,12 +270,13 @@ func (m *sftpModel) ensureVisible(top *int, cursor int) {
 	}
 }
 
-// bodyHeight 列表可视行数（终端高度 - 标题/表头/底部固定行）
+// bodyHeight 列表可视行数（终端高度 - 标题/表头/分隔线/底部固定行）。
+// 双栏左右并排后列表区只有一套表头与分隔线（原上下堆叠是两套）。
 func (m *sftpModel) bodyHeight() int {
 	if m.height <= 0 {
 		return 0 // 未知尺寸：显示全部
 	}
-	h := m.height - 5 // 标题1 + 表头1 + 状态区3
+	h := m.height - 6 // 标题1 + 表头1 + 分隔线1 + 状态/底部3
 	if h < 1 {
 		h = 1
 	}
@@ -713,28 +714,40 @@ func (m *sftpModel) setCursor(idx int) {
 func (m *sftpModel) View() tea.View {
 	var b strings.Builder
 
+	// 栏宽：基于外层 Padding(1,2) 之外的实际内容宽（m.width-4）计算，扣除中间分隔线 " │ "（3 宽）
 	paneW := 40
 	if m.width > 0 {
-		paneW = (m.width - 3) / 2
-		if paneW < 20 {
-			paneW = 20
+		contentW := m.width - 4
+		paneW = (contentW - 3) / 2
+		if paneW < 8 {
+			paneW = 8
 		}
 	}
 
-	// 标题行：焦点栏高亮
-	localTitle := title("本地", m.localCwd, m.focus == paneLocal)
-	remoteTitle := title("远程", m.cwd, m.focus == paneRemote)
-	if m.width > 0 {
-		localTitle = runewidth.Truncate(localTitle, paneW, "…")
-		remoteTitle = runewidth.Truncate(remoteTitle, paneW, "…")
-	}
+	// 标题行：焦点栏高亮（对纯文本截断后再上色，避免 runewidth 破坏 ANSI 序列）
 	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top,
-		localTitle, styleDim.Render(" │ "), remoteTitle) + "\n\n")
+		title("本地", m.localCwd, m.focus == paneLocal, paneW),
+		styleDim.Render(" │ "),
+		title("远程", m.cwd, m.focus == paneRemote, paneW),
+	) + "\n")
 
-	// 两栏列表
-	b.WriteString(m.paneView(paneLocal, paneW))
-	b.WriteString("\n")
-	b.WriteString(m.paneView(paneRemote, paneW))
+	// 两栏列表：左右并排，各自滚动；行数补平保证右栏逐行对齐
+	sep := styleDim.Render(" │ ")
+	left := m.paneRows(paneLocal, paneW)
+	right := m.paneRows(paneRemote, paneW)
+	n := len(left)
+	if len(right) > n {
+		n = len(right)
+	}
+	for len(left) < n {
+		left = append(left, strings.Repeat(" ", paneW))
+	}
+	for len(right) < n {
+		right = append(right, strings.Repeat(" ", paneW))
+	}
+	for i := 0; i < n; i++ {
+		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left[i], sep, right[i]) + "\n")
+	}
 
 	// 删除确认
 	if m.focus == paneLocal && m.localConfirmID >= 0 && m.localConfirmID < len(m.localEntries) {
@@ -766,16 +779,57 @@ func (m *sftpModel) View() tea.View {
 	return tea.NewView(lipgloss.NewStyle().Padding(1, 2).Render(b.String()))
 }
 
-func title(label, p string, focused bool) string {
-	s := styleDim.Render(label + ": " + p)
+// title 渲染栏标题。path 为纯文本，先截断到可用宽度再上色，
+// 避免对含 ANSI 的字符串做 runewidth 截断导致颜色序列被破坏/宽度错乱。
+func title(label, p string, focused bool, width int) string {
+	prefix := ""
 	if focused {
-		s = styleCursor.Render("▸ " + label + ": " + p)
+		prefix = "▸ "
 	}
-	return s
+	avail := width - runewidth.StringWidth(prefix+label+": ")
+	if avail < 1 {
+		avail = 1
+	}
+	text := prefix + label + ": " + runewidth.Truncate(p, avail, "…")
+	if focused {
+		return styleCursor.Render(text)
+	}
+	return styleDim.Render(text)
 }
 
-// paneView 渲染单栏列表（滚动窗口 top 起 bodyHeight 行）
-func (m *sftpModel) paneView(kind, width int) string {
+// pane 列布局：每行 = 前缀 2 + 名称 + 大小(9) + 时间(12)，总宽 = 栏宽。
+// 窄屏时按序丢弃时间列、大小列，保证不折行。
+const (
+	panePrefixW = 2
+	paneSizeW   = 9
+	paneTimeW   = 12
+)
+
+type paneLayout struct {
+	nameW, sizeW, timeW int
+	showSize, showTime  bool
+}
+
+func computePaneLayout(width int) paneLayout {
+	lay := paneLayout{sizeW: paneSizeW, timeW: paneTimeW, showSize: true, showTime: true}
+	nameW := width - panePrefixW - paneSizeW - paneTimeW
+	if nameW < 8 {
+		lay.showTime = false
+		nameW = width - panePrefixW - paneSizeW
+		if nameW < 8 {
+			lay.showSize = false
+			nameW = width - panePrefixW
+			if nameW < 8 {
+				nameW = 8
+			}
+		}
+	}
+	lay.nameW = nameW
+	return lay
+}
+
+// paneRows 渲染单栏各行（表头 + 分隔线 + 可见条目），不补行。
+func (m *sftpModel) paneRows(kind, width int) []string {
 	var entries []fs.FileInfo
 	var cursor, top int
 	if kind == paneLocal {
@@ -784,16 +838,24 @@ func (m *sftpModel) paneView(kind, width int) string {
 		entries, cursor, top = m.entries, m.cursor, m.remoteTop
 	}
 	focused := m.focus == kind
+	lay := computePaneLayout(width)
 
-	var b strings.Builder
-	header := styleHeader.Render(padRight("名称", width-22)) +
-		styleDim.Render(padRight("大小", 9) + padRight("时间", 12))
-	row := header
+	var rows []string
+	header := strings.Repeat(" ", panePrefixW)
+	headerName := padRight("名称", lay.nameW)
 	if focused {
-		row = styleSelected.Render(padRight("名称", width-22)) + styleDim.Render(padRight("大小", 9)+padRight("时间", 12))
+		header += styleSelected.Render(headerName)
+	} else {
+		header += styleHeader.Render(headerName)
 	}
-	b.WriteString(row + "\n")
-	b.WriteString(styleDim.Render(strings.Repeat("─", width)) + "\n")
+	if lay.showSize {
+		header += styleDim.Render(padRight("大小", lay.sizeW))
+	}
+	if lay.showTime {
+		header += styleDim.Render(padRight("时间", lay.timeW))
+	}
+	rows = append(rows, header)
+	rows = append(rows, styleDim.Render(strings.Repeat("─", width)))
 
 	body := m.bodyHeight()
 	start, end := 0, len(entries)
@@ -804,34 +866,35 @@ func (m *sftpModel) paneView(kind, width int) string {
 		}
 	}
 	for i := start; i < end; i++ {
-		b.WriteString(m.renderEntry(entries[i], i, cursor, width) + "\n")
+		rows = append(rows, m.renderEntry(entries[i], i, cursor, lay))
 	}
-	return lipgloss.NewStyle().Width(width).Render(b.String())
+	return rows
 }
 
-func (m *sftpModel) renderEntry(e fs.FileInfo, idx, cursor, width int) string {
+func (m *sftpModel) renderEntry(e fs.FileInfo, idx, cursor int, lay paneLayout) string {
 	nameStr := e.Name()
 	if e.IsDir() {
 		nameStr += "/"
 	}
-	nameW := width - 22
-	if nameW < 8 {
-		nameW = 8
-	}
-	name := padRight(runewidth.Truncate(nameStr, nameW, "…"), nameW)
-	size := padRight(sftpc.FormatSize(e.Size()), 9)
-	if e.IsDir() {
-		size = padRight("-", 9)
-	}
-	line := lipgloss.JoinHorizontal(lipgloss.Top,
-		name,
-		styleDim.Render(size),
-		styleDim.Render(e.ModTime().Format("01-02 15:04")),
-	)
+	prefix := "  "
 	if idx == cursor {
-		return styleCursor.Render("▸ ") + line
+		prefix = styleCursor.Render("▸ ")
 	}
-	return "  " + line
+	name := padRight(runewidth.Truncate(nameStr, lay.nameW, "…"), lay.nameW)
+	var b strings.Builder
+	b.WriteString(prefix)
+	b.WriteString(name)
+	if lay.showSize {
+		size := sftpc.FormatSize(e.Size())
+		if e.IsDir() {
+			size = "-"
+		}
+		b.WriteString(styleDim.Render(padRight(size, lay.sizeW)))
+	}
+	if lay.showTime {
+		b.WriteString(styleDim.Render(padRight(e.ModTime().Format("01-02 15:04"), lay.timeW)))
+	}
+	return b.String()
 }
 
 func renderProgress(name string, done, total int64) string {

@@ -227,6 +227,42 @@ func TestDetachBoundary(t *testing.T) {
 	}
 }
 
+// TestResolveTermSize 验证 term.GetSize 的 (width, height) 与 PTY 请求的 (rows, cols)
+// 换算顺序。曾把 width/height 直接当 rows/cols 使用，导致远程 PTY 行列颠倒：
+// 终端 30 行 x 120 列被请求为 120 行 x 30 列，远程按 30 列换行，输入/退格光标全乱。
+func TestResolveTermSize(t *testing.T) {
+	cases := []struct {
+		name   string
+		width  int
+		height int
+	}{
+		{"常规宽屏", 120, 30},
+		{"正方形", 80, 80},
+		{"高窄屏", 60, 100},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rows, cols := resolveTermSize(c.width, c.height)
+			if rows != c.height || cols != c.width {
+				t.Fatalf("resolveTermSize(%d, %d) = (%d, %d)，应为 (行=%d, 列=%d)",
+					c.width, c.height, rows, cols, c.height, c.width)
+			}
+		})
+	}
+
+	t.Run("非法尺寸回退 24x80", func(t *testing.T) {
+		if rows, cols := resolveTermSize(0, 0); rows != 24 || cols != 80 {
+			t.Fatalf("尺寸非法应回退 24x80，实际 %dx%d", rows, cols)
+		}
+		if rows, cols := resolveTermSize(-1, 50); rows != 24 || cols != 80 {
+			t.Fatalf("宽度非法应回退 24x80，实际 %dx%d", rows, cols)
+		}
+		if rows, cols := resolveTermSize(120, 0); rows != 24 || cols != 80 {
+			t.Fatalf("高度非法应回退 24x80，实际 %dx%d", rows, cols)
+		}
+	})
+}
+
 var _ = errors.New
 
 // TestSessionEnvForward 验证 locale 环境变量被透传到远程（防止 C locale 导致

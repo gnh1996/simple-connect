@@ -4,6 +4,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
@@ -127,6 +128,71 @@ func TestSFTPLocalEnterUpload(t *testing.T) {
 	// 校验远程出现文件
 	if b, err := os.ReadFile(filepath.Join(env.Root, "pane-src.bin")); err != nil || string(b) != string(content) {
 		t.Fatalf("远程上传校验失败: %v", err)
+	}
+}
+
+// TestSFTPDualPaneRender 验证双栏左右并排渲染：本地/远程标题在同一行、列表行带分隔线、
+// 且不因栏宽计算溢出换行（曾上下堆叠 + 右栏被挤出换行）。
+func TestSFTPDualPaneRender(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+
+	m.cwd = env.Root
+	m.localCwd = t.TempDir()
+	_ = os.WriteFile(filepath.Join(m.localCwd, "local.txt"), []byte("x"), 0o644)
+	_ = os.WriteFile(filepath.Join(env.Root, "remote.txt"), []byte("y"), 0o644)
+
+	// 刷新两侧列表
+	lm := m.loadLocal()
+	m, _ = m.Update(lm())
+	rl := m.loadList()
+	m, _ = m.Update(rl())
+
+	// 模拟 100x30 终端
+	m.width, m.height = 100, 30
+	content := m.View().Content
+
+	// 本地与远程标题应在同一行（中间只有 " │ "，无换行）
+	idxLocal := strings.Index(content, "本地")
+	idxRemote := strings.Index(content, "远程")
+	if idxLocal < 0 || idxRemote < 0 {
+		t.Fatalf("标题应同时包含本地/远程，实际: %q", content)
+	}
+	sep := strings.Index(content[idxLocal:], " │ ")
+	if sep < 0 {
+		t.Fatalf("标题行应含分隔线，实际: %q", content)
+	}
+	// 分隔线到换行之间应出现 "远程"（说明同排）
+	lineEnd := strings.Index(content[idxLocal:], "\n")
+	if lineEnd < 0 {
+		t.Fatal("标题行应换行")
+	}
+	if !strings.Contains(content[idxLocal:idxLocal+lineEnd], "远程") {
+		t.Fatalf("本地与远程标题应左右同排，实际: %q", content[idxLocal:idxLocal+lineEnd])
+	}
+
+	// 列表条目两侧都有
+	if !strings.Contains(content, "local.txt") || !strings.Contains(content, "remote.txt") {
+		t.Fatalf("两栏应各显示条目，实际: %q", content)
+	}
+}
+
+// TestSFTPComputePaneLayout 验证窄屏下列宽压缩（不折行）：宽度充足时含大小/时间列，
+// 过窄时按序丢弃。
+func TestSFTPComputePaneLayout(t *testing.T) {
+	full := computePaneLayout(40)
+	if !full.showSize || !full.showTime {
+		t.Fatalf("宽栏应含大小+时间列: %+v", full)
+	}
+	noTime := computePaneLayout(20)
+	if noTime.showTime {
+		t.Fatalf("窄栏应丢弃时间列: %+v", noTime)
+	}
+	noSize := computePaneLayout(10)
+	if noSize.showTime || noSize.showSize {
+		t.Fatalf("极窄栏应丢弃大小+时间列: %+v", noSize)
 	}
 }
 

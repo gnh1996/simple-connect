@@ -47,10 +47,10 @@ func sessionEnv() map[string]string {
 // `ESC ] 133;cwd=<path> BEL`。路径来自远程输出，仅用于 UI 展示/定位，
 // 绝不拼入本机 shell 执行。
 type oscTracker struct {
-	mu   sync.Mutex
-	cwd  string
-	buf  []byte // 跨 Write 边界残留（含序列头部但未收尾的部分）
-	out  io.Writer
+	mu  sync.Mutex
+	cwd string
+	buf []byte // 跨 Write 边界残留（含序列头部但未收尾的部分）
+	out io.Writer
 }
 
 func newOSCTracker(out io.Writer) *oscTracker {
@@ -108,6 +108,16 @@ const (
 	detachFKey  = 'f'
 )
 
+// resolveTermSize 将 term.GetSize 返回的 (width, height) 换算为 PTY 请求所需的
+// (rows, cols)。term.GetSize 的返回值语义是 (宽, 高)，而 RequestPty/WindowChange
+// 的参数语义是 (行, 列)，二者顺序相反，必须在此交换；尺寸非法时回退 24x80。
+func resolveTermSize(width, height int) (rows, cols int) {
+	if width <= 0 || height <= 0 {
+		return 24, 80
+	}
+	return height, width
+}
+
 // StartInteractive 建立自建交互式 SSH 会话。
 // 认证已由 sshc.Connect 使用保存的凭据完成；这里负责将本地终端置为 raw 模式，
 // 与远程 PTY 做字节透传，结束后恢复终端。
@@ -123,10 +133,8 @@ func StartInteractive(c *sshc.Client) (string, error) {
 	if cleanup != nil {
 		defer cleanup()
 	}
-	rows, cols, _ := term.GetSize(os.Stdout.Fd())
-	if rows <= 0 || cols <= 0 {
-		rows, cols = 24, 80
-	}
+	width, height, _ := term.GetSize(os.Stdout.Fd())
+	rows, cols := resolveTermSize(width, height)
 	return runSession(c, in, os.Stdout, os.Stderr, rows, cols)
 }
 
