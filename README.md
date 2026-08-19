@@ -22,6 +22,35 @@ simple-connect 定位为**单连接管理**工具：
 
 ## 安装
 
+### 一键安装（推荐）
+
+安装为全局命令 `simple-ssh`：
+
+**Linux / macOS**
+
+```bash
+# 从 GitHub Releases 下载预编译二进制（无需 Go 工具链）
+curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -- --release
+
+# 或指定版本
+curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -- --release v0.1.0
+
+# 自定义安装目录
+INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -- --release
+```
+
+**Windows**（PowerShell）
+
+```powershell
+# 从 GitHub Releases 下载预编译二进制（无需 Go 工具链）
+powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.ps1 | iex -Args @{Release='latest'}"
+
+# 或指定版本
+powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.ps1 | iex -Args @{Release='v0.1.0'}"
+```
+
+脚本会自动下载对应平台的预编译二进制并加入用户 PATH，之后直接在终端输入 `simple-ssh` 启动。
+
 ### 源码构建
 
 需要 Go 1.21+：
@@ -30,27 +59,25 @@ simple-connect 定位为**单连接管理**工具：
 go build -o simple-ssh .
 ```
 
-### 一键安装（推荐）
-
-安装为全局命令 `simple-ssh`：
+仓库内脚本也支持源码构建 / 使用本地预编译产物：
 
 **Linux / macOS**
 
 ```bash
-./scripts/install.sh
-# 自定义安装目录
-INSTALL_DIR=/usr/local/bin ./scripts/install.sh
+./scripts/install.sh                 # 源码构建（需 Go）
+./scripts/install.sh --release       # 下载 GitHub 最新 Release
+./scripts/install.sh --release v0.1.0
+INSTALL_DIR=/usr/local/bin ./scripts/install.sh   # 自定义安装目录
 ```
 
 **Windows**（PowerShell）
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1
-# 使用 dist/ 预编译二进制（无需 Go）
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -UsePrebuilt
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1                    # 源码构建（需 Go）
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release           # 下载 GitHub 最新 Release
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release v0.1.0    # 指定版本
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -UsePrebuilt       # 使用 dist/ 预编译二进制
 ```
-
-脚本会构建二进制并加入用户 PATH，之后直接在终端输入 `simple-ssh` 启动。
 
 ## 使用
 

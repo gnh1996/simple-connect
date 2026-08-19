@@ -1,18 +1,23 @@
 # simple-connect 安装脚本（Windows）
-# 源码构建（需 Go 工具链）安装为全局命令 simple-ssh.exe；
-# 无 Go 环境时可用 -UsePrebuilt 参数直接使用 dist/ 预编译二进制。
+# 安装为全局命令 simple-ssh.exe。
 #
 # 用法（PowerShell）：
-#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1
-#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -UsePrebuilt
+#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1              # 源码构建（需 Go）
+#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release     # 下载 GitHub 最新 Release
+#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release v0.1.0  # 指定版本
+#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -UsePrebuilt # 使用 dist/ 预编译二进制
 #   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -InstallDir D:\tools\simple-ssh
 
 param(
     [switch]$UsePrebuilt,
+    [string]$Release = "",
     [string]$InstallDir = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+# 仓库地址（用于 -Release 下载）
+$Repo = "gnh1996/simple-connect"
 
 # 默认安装目录：%LOCALAPPDATA%\simple-connect
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
@@ -27,8 +32,24 @@ $OutExe = Join-Path $InstallDir "simple-ssh.exe"
 # 创建安装目录
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
-if ($UsePrebuilt) {
-    # 使用预编译二进制（dist/ 目录）
+function Get-RemoteFile {
+    param([string]$Url, [string]$Out)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $Url -OutFile $Out -UseBasicParsing
+}
+
+if ($Release) {
+    # ---- 从 GitHub Releases 下载预编译二进制 ----
+    $Url = if ($Release -eq "latest") {
+        "https://github.com/$Repo/releases/latest/download/simple-connect-windows-amd64.exe"
+    } else {
+        "https://github.com/$Repo/releases/download/$Release/simple-connect-windows-amd64.exe"
+    }
+    Write-Host "==> 下载预编译版本（$Release，windows/amd64）..."
+    Write-Host "    $Url"
+    Get-RemoteFile -Url $Url -Out $OutExe
+} elseif ($UsePrebuilt) {
+    # ---- 使用 dist/ 预编译二进制 ----
     $Prebuilt = Join-Path $ProjectRoot "dist\simple-connect-windows-amd64.exe"
     if (-not (Test-Path $Prebuilt)) {
         Write-Host "错误：未找到预编译二进制 $Prebuilt 。" -ForegroundColor Red
@@ -38,11 +59,11 @@ if ($UsePrebuilt) {
     Write-Host "==> 使用预编译二进制 ..."
     Copy-Item $Prebuilt $OutExe -Force
 } else {
-    # 检查 go 工具链
+    # ---- 源码构建 ----
     $go = Get-Command go -ErrorAction SilentlyContinue
     if (-not $go) {
         Write-Host "错误：未找到 go 工具链。请安装 Go (https://go.dev/dl/) 后重试，" -ForegroundColor Red
-        Write-Host "或改用 -UsePrebuilt 参数直接安装预编译版本。" -ForegroundColor Red
+        Write-Host "或改用 -Release 参数直接安装预编译版本。" -ForegroundColor Red
         exit 1
     }
     Write-Host "==> 从源码构建 simple-ssh.exe ..."
