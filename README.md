@@ -41,7 +41,7 @@ INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/gnh1996/
 
 **Windows**（PowerShell）
 
-> 注意：不要使用 `irm ... | iex` 单行命令——该模式会触发 Windows Defender 的 AMSI 启发式拦截（典型的下载执行特征），可能被直接隔离。请使用下面的两步式安装：
+> 注意：不要使用 `irm ... | iex` 单行命令——该模式会触发 Windows Defender 的 AMSI 启发式拦截（典型的下载执行特征），可能被直接隔离。请使用下面的两步式安装。安装脚本已内置 UTF-8 BOM，Windows PowerShell 5.1（`powershell`）与 PowerShell 7（`pwsh`）均可正确执行。
 
 ```powershell
 # ① 下载安装脚本到本地
@@ -51,6 +51,8 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/gnh1996/simple-connect/
 # ② 移除下载来源标记并执行（安装到 %LOCALAPPDATA%\simple-connect，自动加入用户 PATH）
 Unblock-File "$env:TEMP\simple-connect-install.ps1"
 powershell -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" -Release v0.1.0
+# 若你使用 PowerShell 7，最后一行可换为：
+# pwsh -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" -Release v0.1.0
 ```
 
 脚本会自动下载对应平台的预编译二进制并加入用户 PATH，安装后新开终端直接输入 `simple-ssh` 启动。

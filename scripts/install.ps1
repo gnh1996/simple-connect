@@ -1,4 +1,4 @@
-# simple-connect 安装脚本（Windows）
+﻿# simple-connect 安装脚本（Windows）
 # 安装为全局命令 simple-ssh.exe。
 #
 # 用法（PowerShell）：
