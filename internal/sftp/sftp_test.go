@@ -114,7 +114,7 @@ func TestTransferUploadDownload(t *testing.T) {
 }
 
 // TestLargeFileConcurrentUpload 大文件上传走并发分片路径（> maxPacket），
-// 校验内容往返与进度计数正确（UseConcurrentWrites + 大拷贝 buffer 的回归测试）。
+// 校验内容往返与进度计数正确（UseConcurrentWrites + sftp.File.ReadFrom 并发写的回归测试）。
 func TestLargeFileConcurrentUpload(t *testing.T) {
 	env := testutil.StartSFTP(t)
 	conn := dialTest(t, env)

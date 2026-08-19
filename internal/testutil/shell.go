@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"sync"
-	"testing"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -58,17 +57,17 @@ func (e *ShellEnv) PtyModes() map[uint32]uint32 {
 // StartShell 启动支持交互 shell 的测试 SSH 服务器。
 // 认证仅走 keyboard-interactive（验证 User/Pass）；shell 请求后回显输入行，
 // 并记录最新 PTY 窗口尺寸（WindowSize 读取）。
-func StartShell(t *testing.T) *ShellEnv {
-	t.Helper()
+func StartShell(tb TB) *ShellEnv {
+	tb.Helper()
 	env := &ShellEnv{User: "tester", Pass: "secret"}
 
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	signer, err := ssh.NewSignerFromKey(priv)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	cfg := &ssh.ServerConfig{
 		// 拒绝 password 认证，仅接受 keyboard-interactive
@@ -90,9 +89,9 @@ func StartShell(t *testing.T) *ShellEnv {
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
-	t.Cleanup(func() { _ = ln.Close() })
+	tb.Cleanup(func() { _ = ln.Close() })
 
 	go func() {
 		for {

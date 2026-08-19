@@ -139,11 +139,6 @@ func (t *Transfer) finish(err error) {
 	t.mu.Unlock()
 }
 
-// transferBufSize 上传/下载的拷贝 buffer 大小。sftp.File.Write 在收到超过
-// maxPacket(32KB) 的 buffer 时才会拆分为并发分片（配合 UseConcurrentWrites），
-// 1MB 可让单次 Write 触发 32 路并发，显著提升高延迟链路吞吐（RTT×32KB 不再是上限）。
-const transferBufSize = 1 << 20
-
 // Upload 将本地文件异步上传到远程路径（在调用方 goroutine 中执行）
 func Upload(cl *sftp.Client, t *Transfer, localPath, remotePath string) {
 	t.setTotal(statSizeLocal(localPath))
@@ -164,7 +159,12 @@ func uploadFile(cl *sftp.Client, t *Transfer, localPath, remotePath string) {
 		t.finish(err)
 		return
 	}
-	_, err = io.CopyBuffer(io.MultiWriter(rf, countingWriter{t}), f, make([]byte, transferBufSize))
+	// 关键：不能再用 io.CopyBuffer(mw, f, bigBuf)——src 是 *os.File，实现了 io.WriterTo，
+	// io.CopyBuffer 会直接调用 f.WriteTo 并忽略传入的 buffer（历史 bug：1MB 并发分片
+	// 从未生效，落到 32KB 串行写，上传吞吐仅约下载的 1/4，详见 bufsize_bench_test.go）。
+	// 改用 sftp.File.ReadFrom：其经 reader.Stat 推断文件大小后走并发分片写（需 UseConcurrentWrites）。
+	// countingReader 透传 Stat() 给 ReadFrom 的并发判定，同时从源侧计数进度。
+	_, err = rf.ReadFrom(countingReader{r: f, t: t})
 	cerr := rf.Close()
 	if err == nil {
 		err = cerr
@@ -428,6 +428,29 @@ type countingWriter struct{ t *Transfer }
 func (w countingWriter) Write(p []byte) (int, error) {
 	w.t.add(len(p))
 	return len(p), nil
+}
+
+// countingReader 从源读取侧计数进度（供 uploadFile 的 ReadFrom 使用）。
+// 必须透传 Stat()：sftp.File.ReadFrom 依赖 reader 的大小推断并发分片数，
+// 若包装成普通 Reader 会丢失该信息，退化为串行 32KB 写（上传性能回退）。
+type countingReader struct {
+	r io.Reader
+	t *Transfer
+}
+
+func (r countingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.t.add(n)
+	}
+	return n, err
+}
+
+func (r countingReader) Stat() (os.FileInfo, error) {
+	if f, ok := r.r.(*os.File); ok {
+		return f.Stat()
+	}
+	return nil, os.ErrInvalid
 }
 
 // FormatSize 人类可读的文件大小

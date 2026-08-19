@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"testing"
 
 	pkgsftp "github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
@@ -18,18 +17,27 @@ type SFTPEnv struct {
 	Root string
 }
 
+// TB 测试/基准共用最小接口：*testing.T 与 *testing.B 均满足，
+// 使内存服务器既可用于 go test 也可用于 go test -bench。
+type TB interface {
+	Helper()
+	TempDir() string
+	Cleanup(func())
+	Fatal(...any)
+}
+
 // StartSFTP 启动内存测试 SSH/SFTP 服务器，远程文件系统限定在临时目录
-func StartSFTP(t *testing.T) SFTPEnv {
-	t.Helper()
-	root := t.TempDir()
+func StartSFTP(tb TB) SFTPEnv {
+	tb.Helper()
+	root := tb.TempDir()
 
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	signer, err := ssh.NewSignerFromKey(priv)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	cfg := &ssh.ServerConfig{
 		PasswordCallback: func(c ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
@@ -43,9 +51,9 @@ func StartSFTP(t *testing.T) SFTPEnv {
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
-	t.Cleanup(func() { _ = ln.Close() })
+	tb.Cleanup(func() { _ = ln.Close() })
 
 	go func() {
 		for {
