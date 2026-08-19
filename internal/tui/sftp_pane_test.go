@@ -369,16 +369,25 @@ func TestSFTPGotoCompleteLocal(t *testing.T) {
 	if next.gotoIn.Value() != want1 {
 		t.Fatalf("首次补全应填入 %s，实际 %s", want1, next.gotoIn.Value())
 	}
+	if pos := next.gotoIn.Position(); pos != len(want1) {
+		t.Fatalf("首次补全后光标应在末尾 %d，实际 %d", len(want1), pos)
+	}
 
 	// Tab 循环到第二个
 	next, _ = next.gotoComplete()
 	if next.gotoIn.Value() != filepath.Join(root, "alpine.txt") {
 		t.Fatalf("二次 Tab 应填入 alpine.txt，实际 %s", next.gotoIn.Value())
 	}
+	if pos := next.gotoIn.Position(); pos != len(filepath.Join(root, "alpine.txt")) {
+		t.Fatalf("循环切换后光标应在末尾 %d，实际 %d", len(filepath.Join(root, "alpine.txt")), pos)
+	}
 	// 再 Tab 回绕到第一个
 	next, _ = next.gotoComplete()
 	if next.gotoIn.Value() != want1 {
 		t.Fatalf("三次 Tab 应回绕到 %s，实际 %s", want1, next.gotoIn.Value())
+	}
+	if pos := next.gotoIn.Position(); pos != len(want1) {
+		t.Fatalf("回绕后光标应在末尾 %d，实际 %d", len(want1), pos)
 	}
 }
 
@@ -409,6 +418,9 @@ func TestSFTPGotoCompleteRemote(t *testing.T) {
 	want1 := path.Join(env.Root, "alpha.txt")
 	if next.gotoIn.Value() != want1 {
 		t.Fatalf("远程补全应填入 %s，实际 %s", want1, next.gotoIn.Value())
+	}
+	if pos := next.gotoIn.Position(); pos != len(want1) {
+		t.Fatalf("远程补全后光标应在末尾 %d，实际 %d", len(want1), pos)
 	}
 }
 

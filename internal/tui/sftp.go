@@ -1047,6 +1047,7 @@ func (m *sftpModel) openGoto() (*sftpModel, tea.Cmd) {
 		m.gotoIn.SetValue(m.cwd)
 	}
 	m.gotoIn.Focus()
+	m.gotoIn.CursorEnd() // SetValue 复用时不会重置光标，显式落到末尾便于追加/修改
 	return m, nil
 }
 
@@ -1116,6 +1117,7 @@ func (m *sftpModel) gotoComplete() (*sftpModel, tea.Cmd) {
 		m.gotoSel = (m.gotoSel + 1) % len(m.gotoCandidates)
 		next := m.gotoCandidates[m.gotoSel]
 		m.gotoIn.SetValue(next)
+		m.gotoIn.CursorEnd() // 循环切换后光标落到末尾便于继续输入
 		m.gotoLastSet = next
 		return m, nil
 	}
@@ -1185,6 +1187,7 @@ func (m *sftpModel) handleGotoComplete(msg sftpGotoCompleteMsg) (*sftpModel, tea
 	m.gotoSel = 0
 	next := msg.cands[0]
 	m.gotoIn.SetValue(next)
+	m.gotoIn.CursorEnd() // 首次补全后光标落到末尾便于继续输入
 	m.gotoLastSet = next
 	return m, nil
 }
