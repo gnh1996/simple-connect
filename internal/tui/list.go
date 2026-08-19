@@ -31,6 +31,7 @@ type listModel struct {
 }
 
 func newListModel(s *store.Store) *listModel {
+	_ = s.Reload() // 进入列表页时同步最新配置（多实例并发编辑可见）
 	m := &listModel{store: s, hosts: s.Hosts(), status: map[string]sshc.Status{}}
 	m.applyFilter()
 	return m
@@ -275,6 +276,9 @@ func (m *listModel) handleNav(msg tea.KeyPressMsg) (*listModel, tea.Cmd) {
 					m.confirmID = m.filtered[m.cursor].ID
 				}
 			case "s":
+				_ = m.store.Reload() // 刷新时同步其他实例的配置变更
+				m.hosts = m.store.Hosts()
+				m.applyFilter()
 				return m, m.runStatusChecks()
 			case "/":
 				m.filtering = true

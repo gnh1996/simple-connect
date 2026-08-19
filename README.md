@@ -163,6 +163,7 @@ go test ./... -count=1
 
 ## 已知限制
 
+- **多实例并发编辑配置**：可在 tmux/多页签并行运行多个实例，增删改经文件锁 + 写前重读 + 原子写安全合并（`go test -race` 覆盖）；同一主机被多实例同时修改时为后写整体覆盖（不做字段级合并）
 - **首次连接静默信任主机指纹**：自动追加 `~/.ssh/known_hosts`（未实现 OpenSSH 的指纹确认 ask 模式）
 - **keyboard-interactive 盲答**：对所有提示回填保存的密码；OTP/堡垒机二次验证场景可能认证失败，多次失败有锁号风险
 - **Windows detach 吞键**：Windows 下 stdin 阻塞读取，detach 后残留的读取 goroutine 在下次按键时自行退出，可能吞掉一键

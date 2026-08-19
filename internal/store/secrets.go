@@ -40,65 +40,70 @@ func (s keyringSecrets) Delete(key string) error {
 	return keyring.Delete(keyringService, key)
 }
 
-// fileSecrets 本地文件兜底后端（权限 0600），在无系统 keyring 时使用
+// fileSecrets 本地文件兜底后端（权限 0600），在无系统 keyring 时使用。
+// 每次 Get/Set/Delete 均从磁盘重读最新内容（不做内存缓存），
+// 配合 store 层文件锁与原子写，保证多实例并发安全。
 type fileSecrets struct {
 	path string
-	data map[string]string
 }
 
 func (s *fileSecrets) Get(key string) (string, bool, error) {
-	if s.data == nil {
-		if err := s.load(); err != nil {
-			return "", false, err
-		}
+	data, err := s.load()
+	if err != nil {
+		return "", false, err
 	}
-	v, ok := s.data[key]
+	v, ok := data[key]
 	return v, ok, nil
 }
 
 func (s *fileSecrets) Set(key, value string) error {
-	if s.data == nil {
-		if err := s.load(); err != nil {
-			s.data = map[string]string{}
-		}
+	data, err := s.load()
+	if err != nil {
+		return err
 	}
-	s.data[key] = value
-	return s.save()
+	data[key] = value
+	return s.save(data)
 }
 
 func (s *fileSecrets) Delete(key string) error {
-	if s.data == nil {
-		if err := s.load(); err != nil {
-			return nil
-		}
+	data, err := s.load()
+	if err != nil {
+		return err
 	}
-	delete(s.data, key)
-	return s.save()
+	delete(data, key)
+	return s.save(data)
 }
 
-func (s *fileSecrets) load() error {
+// load 从磁盘读取全部密钥（文件不存在返回空 map）
+func (s *fileSecrets) load() (map[string]string, error) {
 	b, err := os.ReadFile(s.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			s.data = map[string]string{}
-			return nil
+			return map[string]string{}, nil
 		}
-		return err
+		return nil, err
 	}
-	s.data = map[string]string{}
-	_ = json.Unmarshal(b, &s.data)
-	return nil
+	data := map[string]string{}
+	if err := json.Unmarshal(b, &data); err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
-func (s *fileSecrets) save() error {
-	b, err := json.MarshalIndent(s.data, "", "  ")
+// save 原子写回（临时文件 + rename），避免并发读看到半截文件
+func (s *fileSecrets) save(data map[string]string) error {
+	b, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, b, 0o600)
+	tmp := s.path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path)
 }
 
 // newSecrets 探测系统 keyring 是否可用，不可用则降级为本地文件

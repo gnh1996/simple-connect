@@ -154,6 +154,7 @@ func (m *Root) returnToList() (tea.Model, tea.Cmd) {
 		m.sftp = nil
 	}
 	m.page = pageList
+	_ = m.Store.Reload() // 回到列表时同步最新配置（多实例并发编辑可见）
 	m.list.reload(m.Store.Hosts())
 	return m, m.list.Init()
 }
