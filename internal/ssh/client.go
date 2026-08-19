@@ -38,7 +38,10 @@ func WithHostKeyCallback(cb ssh.HostKeyCallback) Option {
 // Connect 建立 SSH 连接（自动合并 ~/.ssh/config，支持 ProxyJump 跳板）
 func Connect(h *model.Host, password string, opts ...Option) (*Client, error) {
 	target, jumps := ResolveSSHConfig(h)
-	cfg := newConfig(target, password)
+	cfg, err := newConfig(target, password)
+	if err != nil {
+		return nil, err
+	}
 	for _, o := range opts {
 		o(cfg)
 	}
@@ -51,7 +54,10 @@ func Connect(h *model.Host, password string, opts ...Option) (*Client, error) {
 
 // ConnectRaw 建立 SSH 连接（不合并 ~/.ssh/config，测试与内嵌 SFTP 使用）
 func ConnectRaw(h *model.Host, password string, opts ...Option) (*Client, error) {
-	cfg := newConfig(h, password)
+	cfg, err := newConfig(h, password)
+	if err != nil {
+		return nil, err
+	}
 	for _, o := range opts {
 		o(cfg)
 	}
@@ -63,14 +69,18 @@ func ConnectRaw(h *model.Host, password string, opts ...Option) (*Client, error)
 }
 
 // newConfig 构造 SSH 客户端配置
-func newConfig(h *model.Host, password string) *ssh.ClientConfig {
+func newConfig(h *model.Host, password string) (*ssh.ClientConfig, error) {
+	hk, err := hostKeyCallback(h.Addr())
+	if err != nil {
+		return nil, err
+	}
 	return &ssh.ClientConfig{
 		User:            h.User,
 		Auth:            authMethods(h, password),
-		HostKeyCallback: hostKeyCallback(h.Addr()),
+		HostKeyCallback: hk,
 		Timeout:         10 * time.Second,
 		ClientVersion:   "SSH-2.0-simple-connect",
-	}
+	}, nil
 }
 
 // dialWithJumps 依次经跳板机隧道连接目标；无跳板时直连
@@ -78,7 +88,10 @@ func dialWithJumps(jumps []*model.Host, targetCfg *ssh.ClientConfig, opts []Opti
 	var current *ssh.Client
 	var err error
 	for _, j := range jumps {
-		jcfg := newConfig(j, password) // 跳板复用目标保存的密码与密钥
+		jcfg, err := newConfig(j, password) // 跳板复用目标保存的密码与密钥
+		if err != nil {
+			return nil, err
+		}
 		for _, o := range opts {
 			o(jcfg)
 		}
@@ -195,14 +208,19 @@ func authMethods(h *model.Host, password string) []ssh.AuthMethod {
 	return methods
 }
 
-// passwordAnswer 用保存的密码应答 keyboard-interactive 全部提示
+// passwordAnswer 用保存的密码应答 keyboard-interactive 提示。
+// 安全限制（对齐 OpenSSH 默认行为）：仅当「单个提示且不回显输入」时才回填密码；
+// 多提示（OTP/堡垒机二次验证）或提示回显输入时一律中止，避免用密码应答验证码
+// 提示导致多次失败锁账号。
 func passwordAnswer(password string) func(string, string, []string, []bool) ([]string, error) {
 	return func(name, instruction string, questions []string, echos []bool) ([]string, error) {
-		answers := make([]string, len(questions))
-		for i := range answers {
-			answers[i] = password
+		if len(questions) != 1 {
+			return nil, errors.New("keyboard-interactive 多提示，中止盲答")
 		}
-		return answers, nil
+		if len(echos) > 0 && echos[0] {
+			return nil, errors.New("keyboard-interactive 提示回显输入，中止盲答")
+		}
+		return []string{password}, nil
 	}
 }
 
@@ -228,11 +246,70 @@ func agentSigner() (func() ([]ssh.Signer, error), error) {
 	return ag.Signers, nil
 }
 
-// hostKeyCallback 校验主机指纹；首次连接自动信任并写入 known_hosts
-func hostKeyCallback(addr string) ssh.HostKeyCallback {
-	kh, err := knownhosts.New(defaultKnownHostsPath())
+// UnknownHostKeyError 首次连接错误：主机指纹不在 known_hosts 中。
+// 由调用方展示 Fingerprint 征求用户确认；确认后调 TrustHostKey 追加 known_hosts
+// 并重新连接（对齐 OpenSSH ask 模式，不再静默信任）。
+type UnknownHostKeyError struct {
+	Hostname    string
+	Fingerprint string
+	key         ssh.PublicKey
+}
+
+func (e *UnknownHostKeyError) Error() string {
+	return fmt.Sprintf("主机 %s 首次连接，指纹 SHA256:%s 未确认", e.Hostname, e.Fingerprint)
+}
+
+// TrustHostKey 将 UnknownHostKeyError 携带的主机指纹追加到 known_hosts
+//（用户确认信任后调用）。返回错误表示追加失败。
+func TrustHostKey(e *UnknownHostKeyError) error {
+	return trustHostKeyPath(e, defaultKnownHostsPath())
+}
+
+func trustHostKeyPath(e *UnknownHostKeyError, path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("创建 %s 失败: %w", filepath.Dir(path), err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
 	if err != nil {
-		return ssh.InsecureIgnoreHostKey()
+		return fmt.Errorf("打开 known_hosts 失败: %w", err)
+	}
+	defer f.Close()
+	line := knownhosts.Line([]string{e.Hostname}, e.key)
+	if _, err := f.WriteString(line + "\n"); err != nil {
+		return fmt.Errorf("写入 known_hosts 失败: %w", err)
+	}
+	return nil
+}
+
+// hostKeyCallback 校验主机指纹。
+//   - known_hosts 解析失败（如文件损坏）直接报错，禁止静默降级 InsecureIgnoreHostKey；
+//   - 首次连接（主机不在 known_hosts）返回 UnknownHostKeyError，由调用方展示指纹并
+//     征得用户确认后调 TrustHostKey 追加（对齐 OpenSSH ask 模式）；
+//   - 指纹不匹配（Want 非空）拒绝连接。
+func hostKeyCallback(addr string) (ssh.HostKeyCallback, error) {
+	return hostKeyCallbackPath(addr, defaultKnownHostsPath())
+}
+
+func hostKeyCallbackPath(addr, path string) (ssh.HostKeyCallback, error) {
+	// 首次使用（如全新安装）：known_hosts 文件不存在时先创建空文件，
+	// 否则 knownhosts.New 会报错（不存在的文件 ≠ 空列表）。
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			if mkErr := os.MkdirAll(filepath.Dir(path), 0o700); mkErr != nil {
+				return nil, fmt.Errorf("创建 %s 失败: %w", filepath.Dir(path), mkErr)
+			}
+			f, oErr := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+			if oErr != nil {
+				return nil, fmt.Errorf("创建 known_hosts 失败: %w", oErr)
+			}
+			_ = f.Close()
+		} else {
+			return nil, fmt.Errorf("读取 known_hosts（%s）失败: %w", path, err)
+		}
+	}
+	kh, err := knownhosts.New(path)
+	if err != nil {
+		return nil, fmt.Errorf("解析 known_hosts（%s）失败: %w", path, err)
 	}
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 		var keyErr *knownhosts.KeyError
@@ -241,23 +318,10 @@ func hostKeyCallback(addr string) ssh.HostKeyCallback {
 		} else if !errors.As(err, &keyErr) {
 			return err
 		} else if len(keyErr.Want) == 0 {
-			// 首次连接：信任并追加
-			appendKnownHosts(hostname, key)
-			return nil
+			return &UnknownHostKeyError{Hostname: hostname, Fingerprint: ssh.FingerprintSHA256(key), key: key}
 		}
 		return fmt.Errorf("主机指纹不匹配，请检查 known_hosts: %w", err)
-	}
-}
-
-func appendKnownHosts(hostname string, key ssh.PublicKey) {
-	path := defaultKnownHostsPath()
-	line := knownhosts.Line([]string{hostname}, key)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_, _ = f.WriteString(line + "\n")
+	}, nil
 }
 
 func defaultKnownHostsPath() string {

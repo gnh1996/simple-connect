@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -87,6 +88,13 @@ type sftpModel struct {
 
 	hostKeyCallback ssh.HostKeyCallback // 测试可注入
 
+	// trustHostKey 指纹确认后信任 known_hosts（测试可注入，避免触碰真实 ~/.ssh）
+	trustHostKey func(*sshc.UnknownHostKeyError) error
+
+	// pendingKey 首次连接待确认的主机指纹（非 nil 时页面进入确认态：
+	// 展示指纹，y 信任并重连，Esc/n/q 取消）
+	pendingKey *sshc.UnknownHostKeyError
+
 	// 远程栏
 	cwd       string
 	entries   []fs.FileInfo
@@ -145,6 +153,7 @@ func newSFTPModel(s *store.Store, h *model.Host, remoteCwd string, sshCl *sshc.C
 		selRemote: map[int]struct{}{},
 		focus:     paneRemote,
 		remoteCwd: remoteCwd,
+		trustHostKey: sshc.TrustHostKey,
 	}
 	if h.LocalDir != "" {
 		m.localCwd = h.LocalDir
@@ -185,6 +194,11 @@ func (m *sftpModel) Init() tea.Cmd {
 	})
 }
 
+// redial 指纹确认信任后重新建立连接（列表页独立连接场景）
+func (m *sftpModel) redial() tea.Cmd {
+	return m.Init()
+}
+
 func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -192,6 +206,13 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 		return m, nil
 	case sftpConnMsg:
 		if msg.err != nil {
+			var uk *sshc.UnknownHostKeyError
+			if errors.As(msg.err, &uk) {
+				// 首次连接：不静默信任，页面进入确认态展示指纹（对齐 OpenSSH ask）
+				m.pendingKey = uk
+				m.status = fmt.Sprintf("首次连接 %s，指纹 %s 未确认", uk.Hostname, uk.Fingerprint)
+				return m, nil
+			}
 			m.err = fmt.Sprintf("连接失败: %v", msg.err)
 			return m, nil
 		}
@@ -794,6 +815,28 @@ func (m *sftpModel) doDelete() (*sftpModel, tea.Cmd) {
 func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 	k := msg.Key()
 
+	// 首次连接指纹确认态：y/Enter 信任并重连，Esc/n/q 取消
+	if m.pendingKey != nil {
+		switch {
+		case k.Code == tea.KeyEnter:
+			fallthrough
+		case k.Text == "y" || k.Text == "Y":
+			uk := m.pendingKey
+			m.pendingKey = nil
+			if terr := m.trustHostKey(uk); terr != nil {
+				m.err = fmt.Sprintf("写入 known_hosts 失败: %v", terr)
+				return m, nil
+			}
+			m.status = "已信任主机指纹，正在重连…"
+			return m, m.redial()
+		case k.Code == tea.KeyEsc || k.Text == "n" || k.Text == "N" || k.Text == "q":
+			m.pendingKey = nil
+			m.err = "已取消连接（未信任主机指纹）"
+			return m, nil
+		}
+		return m, nil
+	}
+
 	// 确认删除（当前焦点栏，单个或批量）
 	singleConfirm := (m.focus == paneLocal && m.localConfirmID >= 0) ||
 		(m.focus == paneRemote && m.confirmID >= 0)
@@ -1260,6 +1303,13 @@ func (m *sftpModel) View() tea.View {
 // 渲染与高度计算共用，保证 footer 固定在终端最后一行。
 func (m *sftpModel) dynamicLines() []string {
 	var lines []string
+
+	// 首次连接指纹确认
+	if m.pendingKey != nil {
+		lines = append(lines, styleInfo.Render(fmt.Sprintf(
+			"首次连接 %s，指纹 %s 未确认，信任并继续？ (y/N)",
+			m.pendingKey.Hostname, m.pendingKey.Fingerprint)))
+	}
 
 	// 删除确认（单个或批量）
 	if m.confirmBatch {

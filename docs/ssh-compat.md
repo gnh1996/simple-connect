@@ -92,11 +92,14 @@ LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION
 
 ## 4. known_hosts 策略（`internal/ssh/client.go` hostKeyCallback）
 
-- 连接前解析 `~/.ssh/known_hosts`（knownhosts.New）
+- 连接前解析 `~/.ssh/known_hosts`（knownhosts.New）；**文件不存在时先创建空文件**（否则 New 对不存在文件报错，而空 known_hosts 才能触发首次连接分支）
 - 匹配成功 → 放行；不匹配（KeyError 且 Want 非空）→ 报错拒绝，提示检查 known_hosts
-- 首次连接（Want 为空）→ **现状：静默信任并追加（TODO：改为展示 SHA256 指纹 + 用户确认，对齐 OpenSSH ask 模式）**
-- 追加前确保 `~/.ssh` 存在（0700），否则 O_CREATE 静默失败，下次连接退回不校验路径
-- **`knownhosts.New` 失败禁止静默降级 `InsecureIgnoreHostKey()`**（TODO：改为显式报错）——静默关闭校验是任何安全组件的禁忌
+- 首次连接（Want 为空）→ 返回 `UnknownHostKeyError`（含 SHA256 指纹与公钥），由调用方展示并征得用户确认后 `TrustHostKey` 追加并重连（**对齐 OpenSSH ask 模式，不再静默信任**）：
+  - main 会话路径（`startSSH`）：TUI 已退出、终端恢复非 raw，直接终端打印指纹提示 y/N，确认后信任并重连
+  - TUI SFTP 列表页路径（`sftpModel.pendingKey`）：页面进入确认态展示指纹，y/Enter 信任并重连，Esc/n/q 取消
+- 追加前确保 `~/.ssh` 存在（0700）
+- **`knownhosts.New` 失败直接显式报错**，禁止静默降级 `InsecureIgnoreHostKey`——静默关闭校验是任何安全组件的禁忌
+- 注：knownhosts 数据库在**创建回调时一次性读入文件**，信任追加后必须重新连接（新建回调）才生效
 
 ## 5. window-change 时序（`internal/session/resize_*.go`）
 
@@ -116,13 +119,13 @@ LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION
 
 尝试顺序：**私钥 → 密码（password + keyboard-interactive 同密码）→ ssh-agent**，全部失败才报错。
 
-- **k-i 盲答限制（TODO）**：当前对所有提示都回填密码。OTP/堡斯机二次验证场景会用密码应答验证码提示，多次失败可能锁账号。目标：仅当 `len(questions)==1 && !echos[0]` 时应答，多提示一律中止
+- **k-i 盲答限制**：`passwordAnswer` 仅当「单个提示且不回显输入」时才回填密码（未提供回显信息时默认视为不回显）；多提示（OTP/堡垒机二次验证）或回显输入提示一律中止，避免用密码应答验证码提示导致多次失败锁账号。中止时该认证方式失败，回落到其余认证方法（如 agent）
 - **跳板机复用目标密码**：`dialWithJumps` 假设跳板与目标凭据相同（文档化假设）。凭据不同时认证失败，报错信息已指明跳板环节
 
 ## 7. 输入链路（`internal/session/`）
 
 - 热键 Ctrl+X f：前缀状态机 `detachScanner`，正确处理跨 Read 边界、`\x18x`、`\x18\x18`；detach 后字节不转发。**detach 为挂起而非中断**：不关闭会话/输入管道，输出静音（见第 1 节挂起/恢复）
-- **pollInput 10ms 忙等轮询（TODO）**：O_NONBLOCK+usleep 轮询有 10ms 级延迟且粘贴吞吐受限（≈51KB/s）。目标：阻塞读 + `poll(2)`/select 带停止信号唤醒
+- **pollInput**：unix 下基于 poll(2) + 自管道（self-pipe）**阻塞读**——同时监听 stdin fd 与停止管道读端，detach 时向自管道写一字节唤醒阻塞的 poll 并返回 EOF，干净退出；无 10ms 忙等轮询延迟、无粘贴吞吐瓶颈（原 ≈51KB/s）。`syscall.Read` 在 EOF 时返回 `(0, nil)`，必须显式转为 `io.EOF`（否则 pumpInput 空读死循环）。自管道创建失败（极罕见）退回忙等轮询兜底。Windows 维持阻塞读（detach 后残留读取 goroutine，下次按键自行退出，可能吞一键）
 - Enter 键：本地 raw 后 `\r`(0x0D) 直传远程 → 依赖远程 `ICRNL=1` 转 `\n`（第 2 节）
 
 ## 8. 回归测试对照（`internal/testutil`）
@@ -145,6 +148,10 @@ go test -race ./internal/session/ ./internal/sftp/ ./internal/tui/ -count=1
 - `TestSessionDetachKeepsConnection`：detach 挂起后同一 SSH 连接仍可再建会话（不重连的回归防线）
 - `TestSessionResume`：detach 挂起 → 恢复同一会话透传 → EOF 正常结束（挂起/恢复循环回归）
 - `TestOSCTrackerQuiet`：静音丢弃输出但消费、OSC cwd 跟踪不受影响
+- `TestHostKeyCallbackFirstConnect`/`TestHostKeyTrustFlow`/`TestHostKeyCallbackCorruptKnownHosts`：首次连接返回 `UnknownHostKeyError`（不静默信任）、信任后同指纹放行/异指纹拒绝、known_hosts 解析失败显式报错（不降级 InsecureIgnoreHostKey）
+- `TestPasswordAnswer`：k-i 盲答限制——单提示不回显应答、回显/多提示中止
+- `TestPollInputDataAndStop`/`TestPollInputStdinEOF`：poll+自管道输入源——数据就绪返回、stop 唤醒返回 EOF、stdin EOF 返回 EOF
+- `TestSFTPFirstConnectFingerprintConfirm`：SFTP 页首次连接确认态——y 信任并重连、n 取消、信任失败提示
 - 新增行为必须补对应断言（服务端记录能力可扩展）
 
 ## 9. 踩坑史（时间线）
@@ -158,6 +165,7 @@ go test -race ./internal/session/ ./internal/sftp/ ./internal/tui/ -count=1
 | 2026-08 | 注入命令明文回显、OSC 133;cwd 序列透传污染终端 | tty ECHO 无法关闭，注入命令必然回显；tracker 原样透传 OSC 到本地终端；命令内清行（`\033[1A\033[2K`）/清屏（`\033[2J\033[H`）控制序列干扰 bash readline（光标错位、输入不可见） | 发送前 `stty -echo` 关闭 ECHO（注入命令不回显，随后 `stty echo` 恢复），命令本体无控制序列；`oscTracker` 解析后**剔除** OSC 133;cwd 序列（对齐 Tabby），tmux 内用 passthrough 序列；`TestOSCTracker` 过滤断言回归 |
 | 2026-08 | 注入命令回显难以隐藏（`stty -echo` 一次性写入靠时序赌注、慢网必漏；确认标记握手虽可靠但残留引导行） | 原实现 `inPipe.Write("stty -echo\r"+cwdHookCommand+"; stty echo\r")`；改确认标记握手后仍残留引导行 `stty -echo; printf ...` | **改 PTY 层 ECHO=0**（`ssh.Client.NewTerminalSession` pty-req 即关 ECHO）：注入命令从第一条起完全**不回显、无任何残留**（无需 stty -echo/握手/引导行），注入末尾 `stty echo` 恢复交互；`TestSessionPtyIUTF8` 断言 ECHO=0 回归 |
 | 2026-08 | 注入后多一个空行（bash 在 ECHO=0 下处理输入行输出 `\x1b[?2004l\r\r\n`） | 注入命令被 bash 执行时会额外输出一行换行序列，屏幕出现孤立空行 | 注入命令末尾追加 `clear`，清除注入产生的空行，提示符干净出现在屏幕顶部；`TestRealHostFinalInjection`（临时）真实验证 |
+| 2026-08 | 首次连接静默信任主机指纹（安全缺口）；known_hosts 解析失败静默降级 `InsecureIgnoreHostKey`；k-i 对所有提示盲答密码；unix 输入 10ms 忙等轮询 | 早期安全/性能取舍 | ① 首次连接返回 `UnknownHostKeyError`，展示指纹 + 用户确认后 `TrustHostKey` 并重连（main 终端提示 / SFTP 页确认态）；② `knownhosts.New` 失败显式报错；③ `passwordAnswer` 仅单提示不回显时应答；④ unix 输入改 poll(2)+自管道阻塞读；均补回归测试并同步本清单 |
 | 2026-08 | 会话内远程登录横幅（Linux/Welcome/Last login）被重复多份、光标错位、输入不可见 | `oscTracker.scan` 在「无 ESC 序列」分支（`i<0`）把全部已透传数据又写回 `t.buf`，下一次 Write 时 `t.buf+p` 里残留内容被**重复输出**（横幅等纯文本跨 Write 边界重复） | `i<0` 分支不再向 `t.buf` 保留任何字节（跨 Write 的序列起点由 `i>=0 且 j<0` 分支保留）；另 `Write` 合并残留时拷贝到独立切片避免与 `t.buf` 共享底层数组。实测横幅由 6 次降为 1 次；`TestOSCTrackerNoDuplicateOnBoundary` 回归 |
 | 早期 | 不在 config 中的主机被改端口/认证方式 | `ssh_config.Get` 无匹配时返回默认值（Port=22、IdentityFile） | 基于解析结果取值（sshConfigGetter），加 `TestResolveSSHConfigNoConfigMatch` 回归 |
 

@@ -114,10 +114,33 @@ func sftpLoop(s *store.Store, h *model.Host, sess *session.Handle) error {
 func startSSH(s *store.Store, h *model.Host) (*session.Handle, error) {
 	pass, _ := s.Password(h)
 	cl, err := sshc.Connect(h, pass)
+	var uk *sshc.UnknownHostKeyError
+	if errors.As(err, &uk) {
+		// 首次连接：展示指纹并征得用户确认后信任，再重新连接（对齐 OpenSSH ask 模式）
+		if !confirmHostFingerprint(uk) {
+			return nil, errors.New("已拒绝信任主机指纹，取消连接")
+		}
+		if terr := sshc.TrustHostKey(uk); terr != nil {
+			return nil, terr
+		}
+		cl, err = sshc.Connect(h, pass)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
 	return session.StartInteractive(cl)
+}
+
+// confirmHostFingerprint 在终端展示主机指纹并请求确认（TUI 已退出、终端恢复非 raw 模式）。
+func confirmHostFingerprint(uk *sshc.UnknownHostKeyError) bool {
+	fmt.Printf("无法确认主机 %q 的真实性。\n  指纹: %s\n是否信任并继续连接？(y/N): ",
+		uk.Hostname, uk.Fingerprint)
+	var ans string
+	_, _ = fmt.Scanln(&ans)
+	return strings.EqualFold(strings.TrimSpace(ans), "y")
 }
 
 func styleError(msg string) string {

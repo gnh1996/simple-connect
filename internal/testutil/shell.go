@@ -75,7 +75,7 @@ func StartShell(tb TB) *ShellEnv {
 			return nil, errors.New("password 认证禁用")
 		},
 		KeyboardInteractiveCallback: func(c ssh.ConnMetadata, challenge ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
-			answers, err := challenge("", "", []string{"Password: "}, []bool{true})
+			answers, err := challenge("", "", []string{"Password: "}, []bool{false})
 			if err != nil {
 				return nil, err
 			}
