@@ -48,6 +48,8 @@ if ($Release) {
     Write-Host "==> 下载预编译版本（$Release，windows/amd64）..."
     Write-Host "    $Url"
     Get-RemoteFile -Url $Url -Out $OutExe
+    # 移除下载来源标记（MOTW），避免 SmartScreen 拦截
+    Unblock-File -Path $OutExe -ErrorAction SilentlyContinue
 } elseif ($UsePrebuilt) {
     # ---- 使用 dist/ 预编译二进制 ----
     $Prebuilt = Join-Path $ProjectRoot "dist\simple-connect-windows-amd64.exe"
@@ -62,8 +64,12 @@ if ($Release) {
     # ---- 源码构建 ----
     $go = Get-Command go -ErrorAction SilentlyContinue
     if (-not $go) {
-        Write-Host "错误：未找到 go 工具链。请安装 Go (https://go.dev/dl/) 后重试，" -ForegroundColor Red
-        Write-Host "或改用 -Release 参数直接安装预编译版本。" -ForegroundColor Red
+        Write-Host "错误：未找到 go 工具链，无法源码构建。" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "请改用两步式下载安装（避开 iex 单行命令，防 Defender 拦截）：" -ForegroundColor Yellow
+        Write-Host '  Invoke-WebRequest -Uri "https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.ps1" -OutFile "$env:TEMP\simple-connect-install.ps1"' -ForegroundColor Cyan
+        Write-Host '  Unblock-File "$env:TEMP\simple-connect-install.ps1"' -ForegroundColor Cyan
+        Write-Host '  powershell -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" -Release v0.1.0' -ForegroundColor Cyan
         exit 1
     }
     Write-Host "==> 从源码构建 simple-ssh.exe ..."

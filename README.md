@@ -41,15 +41,54 @@ INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/gnh1996/
 
 **Windows**（PowerShell）
 
-```powershell
-# 从 GitHub Releases 下载预编译二进制（无需 Go 工具链）
-powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.ps1 | iex -Args @{Release='latest'}"
+> 注意：不要使用 `irm ... | iex` 单行命令——该模式会触发 Windows Defender 的 AMSI 启发式拦截（典型的下载执行特征），可能被直接隔离。请使用下面的两步式安装：
 
-# 或指定版本
-powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.ps1 | iex -Args @{Release='v0.1.0'}"
+```powershell
+# ① 下载安装脚本到本地
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.ps1 `
+  -OutFile "$env:TEMP\simple-connect-install.ps1"
+
+# ② 移除下载来源标记并执行（安装到 %LOCALAPPDATA%\simple-connect，自动加入用户 PATH）
+Unblock-File "$env:TEMP\simple-connect-install.ps1"
+powershell -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" -Release v0.1.0
 ```
 
-脚本会自动下载对应平台的预编译二进制并加入用户 PATH，之后直接在终端输入 `simple-ssh` 启动。
+脚本会自动下载对应平台的预编译二进制并加入用户 PATH，安装后新开终端直接输入 `simple-ssh` 启动。
+
+**手动安装（不执行任何脚本，最不易触发安全拦截）**
+
+```powershell
+# 下载二进制
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\simple-connect" | Out-Null
+Invoke-WebRequest -Uri https://github.com/gnh1996/simple-connect/releases/download/v0.1.0/simple-connect-windows-amd64.exe `
+  -OutFile "$env:LOCALAPPDATA\simple-connect\simple-ssh.exe"
+Unblock-File "$env:LOCALAPPDATA\simple-connect\simple-ssh.exe"
+
+# 加入用户 PATH（持久化）
+$dir = "$env:LOCALAPPDATA\simple-connect"
+$p = [Environment]::GetEnvironmentVariable("Path", "User")
+[Environment]::SetEnvironmentVariable("Path", "$p;$dir", "User")
+
+# 新开终端输入 simple-ssh 启动；当前会话可先执行：
+$env:Path += ";$dir"
+```
+
+**校验文件完整性（可选）**
+
+每个 Release 附有 `SHA256SUMS` 文件，可校验下载的二进制未被篡改：
+
+```powershell
+Get-FileHash "$env:LOCALAPPDATA\simple-connect\simple-ssh.exe" -Algorithm SHA256
+# 将输出与 https://github.com/gnh1996/simple-connect/releases/download/v0.1.0/SHA256SUMS 比对
+```
+
+**Defender 误报怎么办**
+
+simple-connect 是开源的未签名工具，首次下载运行时 Defender 可能提示"未知发布者"或误报隔离（常见于新发布的二进制，云信誉尚未建立）。处理方式：
+
+- **误报申诉（推荐）**：Windows 安全中心 → 病毒和威胁防护 → 保护历史记录 → 找到被隔离的文件 → 操作 → 还原并选择"添加到排除项"，再按提示提交误报申诉，几周后云信誉恢复正常。
+- **临时信任**：可在"病毒和威胁防护"→"排除项"中添加 `%LOCALAPPDATA%\simple-connect` 目录。
+- 你随时可以对照源码（`go build`）自行构建，或对比 `SHA256SUMS` 确认二进制与官方一致。
 
 ### 源码构建
 

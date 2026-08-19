@@ -64,6 +64,11 @@ jobs:
             rmdir "$d"
           done
           ls -lh
+      - name: 生成 SHA256SUMS 校验文件
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
       - name: 发布
         uses: softprops/action-gh-release@v2
         with:
