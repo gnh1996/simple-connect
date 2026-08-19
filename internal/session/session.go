@@ -104,40 +104,69 @@ func (t *oscTracker) Write(p []byte) (int, error) {
 // 注意：不能以「第一个 ESC 到第一个 BEL」为界——cwd OSC 之前可能已有其他 ESC
 // 序列（如 \x1b[?2004h 括号粘贴、光标移动），首个 ESC 并非 OSC 起点。
 // 必须精确定位 `\x1b]133;cwd=` 前缀。
+//
+// **关键：只对「可能是 `\x1b]133;cwd=` 前缀」的字节做跨 Write 保留（t.buf），
+// 其余一切立即原样透传，绝不因等待某个 BEL 而扣住数据。** 旧实现遇到任意 `\x1b]`
+// 且本 chunk 无 BEL 就保留整段尾部（含同步输出 `\x1b[?2026l`、光标定位/隐藏序列），
+// 会把 pi 这类「每按键整帧差分重绘 + 同步输出 + 逐行 OSC 8 复位」的 TUI 输出拆包
+// 延迟，终端在同步输出未闭合时收到残帧、重绘时序错乱，擦掉输入法 preedit →
+// 拼音选词阶段字母闪烁（系统 ssh 无字节处理故正常）。非 cwd 的 OSC（`\x1b]0;`/
+// `\x1b]8;;`/`\x1b]133;A` 等）即便 BEL 在下一 chunk，也先透传已到字节，字节序
+// 保持精确（透传不做任何语义拼接，只剔除 cwd）。
 func (t *oscTracker) scan(data []byte) []byte {
 	const oscMaxKeep = 4096
-	const prefix = "]133;cwd="
+	const prefix = "133;cwd=" // `\x1b]` 之后的固定前缀
 	var out []byte
 	t.buf = t.buf[:0]
-	for len(data) > 0 {
-		i := bytes.Index(data, []byte{0x1b, ']'})
-		if i < 0 {
-			// 本段无任何 ESC 序列起点：全部直接透传。无需在 t.buf 保留任何字节
-			//（否则会把已透传内容在下次 Write 时重复输出——历史 bug：登录横幅被
-			// 重复多份）。跨 Write 边界的序列起点会在 i>=0 且 j<0 分支保留。
-			out = append(out, data...)
-			return out
+	pos := 0
+	for pos < len(data) {
+		if data[pos] != 0x1b {
+			out = append(out, data[pos])
+			pos++
+			continue
 		}
-		out = append(out, data[:i]...)
-		// 从该 ESC 之后找 BEL 作为 OSC 终止符
-		j := bytes.IndexByte(data[i:], 0x07)
-		if j < 0 {
-			// 序列未收尾：保留尾部（含序列头部）跨边界续扫
-			tail := data[i:]
-			if len(tail) > oscMaxKeep {
-				tail = tail[len(tail)-oscMaxKeep:]
+		// data[pos] == ESC
+		if pos+1 < len(data) && data[pos+1] == ']' {
+			// 可能是 OSC：逐字节匹配 `]133;cwd=` 前缀
+			matched := 0
+			for matched < len(prefix) && pos+2+matched < len(data) && data[pos+2+matched] == prefix[matched] {
+				matched++
 			}
-			t.buf = append(t.buf, tail...)
-			return out
+			if pos+2+matched >= len(data) {
+				// 缓冲耗尽但前缀仍可能延续（可能是 cwd 序列未到 BEL）→ 保留跨边界续扫。
+				// 只在「确实是 cwd 前缀或 cwd 路径」时保留，非 cwd 的前缀在下一分支立即透传。
+				tail := data[pos:]
+				if len(tail) > oscMaxKeep {
+					tail = tail[len(tail)-oscMaxKeep:]
+				}
+				t.buf = append(t.buf, tail...)
+				return out
+			}
+			if matched == len(prefix) {
+				// 前缀完整匹配 `\x1b]133;cwd=`：收集路径直到 BEL 并从输出剔除
+				start := pos + 2 + matched
+				if j := bytes.IndexByte(data[start:], 0x07); j >= 0 {
+					t.cwd = string(data[start : start+j])
+					pos = start + j + 1
+					continue
+				}
+				// 路径未收尾：保留跨边界续扫
+				tail := data[pos:]
+				if len(tail) > oscMaxKeep {
+					tail = tail[len(tail)-oscMaxKeep:]
+				}
+				t.buf = append(t.buf, tail...)
+				return out
+			}
+			// 前缀不匹配（`\x1b]8`/`\x1b]0`/`\x1b]133;A` 等非 cwd OSC）→ 立即透传 ESC，
+			// 后续字节按普通数据继续（不因等 BEL 而扣住）
+			out = append(out, 0x1b)
+			pos++
+			continue
 		}
-		seq := data[i : i+j]
-		if bytes.HasPrefix(seq[1:], []byte(prefix)) {
-			t.cwd = string(seq[1+len(prefix):]) // 剔除该序列
-		} else {
-			out = append(out, seq...) // 其他序列原样透传
-			out = append(out, 0x07)
-		}
-		data = data[i+j+1:]
+		// 非 `\x1b]`：可能是 CSI/APC 等序列起点，原样透传
+		out = append(out, data[pos])
+		pos++
 	}
 	return out
 }

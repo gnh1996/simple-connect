@@ -90,6 +90,122 @@ func TestOSCTrackerCwdAfterCSI(t *testing.T) {
 	}
 }
 
+// TestOSCTrackerPiterminalNoHold 回归：pi 这类「每按键整帧差分重绘」TUI 的输出
+// （同步输出 \x1b[?2026h..l、逐行 OSC 8 复位、OSC 133 标记、光标定位/隐藏）必须
+// 原样、立即透传——即使 chunk 边界恰好切在 `\x1b]8;;` 与 BEL 之间，也**不得扣住
+// 尾部等待 BEL**（旧实现会把整段尾部挂起，拆包同步输出帧、延迟光标序列，导致
+// 输入法 preedit 被残帧重绘擦掉 → 拼音选词阶段字母闪烁）。
+func TestOSCTrackerPiterminalNoHold(t *testing.T) {
+	// 模拟 pi 一次按键后的差分重绘帧：同步输出包裹 + 逐行 OSC 8 复位 + OSC 133
+	// 标记 + 末尾光标定位/隐藏
+	frame := "\x1b[?2026h" +
+		"header\r\n\x1b[2K\x1b[0m\x1b]8;;\x07" +
+		"\r\n\x1b[2K\x1b[38;2;100;200;50m> \x1b[7m_\x1b[27m\x1b[0m\x1b]8;;\x07" +
+		"\r\n\x1b]133;A\x07\x1b[2Kfooter\x1b[0m\x1b]8;;\x07" +
+		"\x1b[?2026l\x1b[1A\x1b[3G\x1b[?25l"
+
+	// 逐字节喂入：任何边界都不得触发「等 BEL」的大段保留——允许保留的只有
+	// `\x1b]133;cwd=` 前缀片段（≤10 字节），且输出必须与输入逐字节一致
+	//（字节序精确，绝不丢失/重复/重排）。
+	prefixLen := len("\x1b]133;cwd=")
+	for i := 0; i < len(frame); i++ {
+		var buf bytes.Buffer
+		tr := newOSCTracker(&buf)
+		tr.Write([]byte(frame[:i]))
+		tr.Write([]byte(frame[i:]))
+		if len(tr.buf) > prefixLen {
+			t.Fatalf("切分点 %d: 非 cwd 输出最多只能保留 cwd 前缀片段（≤%d 字节），实际 %d: %q",
+				i, prefixLen, len(tr.buf), tr.buf)
+		}
+		if buf.String() != frame {
+			t.Fatalf("切分点 %d: 输出必须与输入逐字节一致，实际 %q", i, buf.String())
+		}
+	}
+}
+
+// TestOSCTrackerPiTerminalSplitBoundary 模拟更真实的 SSH 分块：把整帧按固定大小
+// 切分喂入，任何切分点都不得触发保留、输出必须逐字节一致。
+func TestOSCTrackerPiTerminalSplitBoundary(t *testing.T) {
+	var buf bytes.Buffer
+	tr := newOSCTracker(&buf)
+	frame := "\x1b[?2026h" +
+		"line1\x1b[0m\x1b]8;;\x07\r\n\x1b[2Kline2\x1b[0m\x1b]8;;\x07" +
+		"\r\n\x1b[0m\x1b]8;;\x07\x1b[?2026l\x1b[?25l"
+	// 多种切分大小覆盖「\x1b]8;; 与 \x07 被切开」「\x1b[?2026l 紧跟其后」等边界。
+	// 允许保留的只有 cwd 前缀片段（≤10 字节）；输出必须逐字节一致。
+	prefixLen := len("\x1b]133;cwd=")
+	for _, size := range []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 32, 50} {
+		buf.Reset()
+		tr = newOSCTracker(&buf)
+		for i := 0; i < len(frame); i += size {
+			end := i + size
+			if end > len(frame) {
+				end = len(frame)
+			}
+			if _, err := tr.Write([]byte(frame[i:end])); err != nil {
+				t.Fatal(err)
+			}
+			if len(tr.buf) > prefixLen {
+				t.Fatalf("size=%d 切到 %d 处: 保留不能超过 cwd 前缀片段（≤%d 字节），实际 %d: %q",
+					size, end, prefixLen, len(tr.buf), tr.buf)
+			}
+		}
+		if buf.String() != frame {
+			t.Fatalf("size=%d: 输出与输入不一致: %q", size, buf.String())
+		}
+	}
+}
+
+// TestOSCTrackerCwdPrefixHeldOnly 只有 `\x1b]133;cwd=` 前缀（或 cwd 路径未收尾）
+// 才允许跨 Write 保留；非 cwd 的 OSC（哪怕与 cwd 前缀仅差一个字符）必须立即透传。
+func TestOSCTrackerCwdPrefixHeldOnly(t *testing.T) {
+	// cwd 前缀被切开：允许保留（下一个 Write 补齐后剥离并跟踪）
+	var buf bytes.Buffer
+	tr := newOSCTracker(&buf)
+	tr.Write([]byte("pre\x1b]133;cwd="))
+	if len(tr.buf) == 0 {
+		t.Fatalf("cwd 前缀未收尾应保留跨边界续扫")
+	}
+	tr.Write([]byte("/var/log\x07post"))
+	if tr.Cwd() != "/var/log" {
+		t.Fatalf("应跟踪到 /var/log，实际 %q", tr.Cwd())
+	}
+	if buf.String() != "prepost" {
+		t.Fatalf("cwd 序列应被剔除: %q", buf.String())
+	}
+
+	// 与 cwd 前缀部分重合但非 cwd 的 OSC 必须立即透传（不等待 BEL）：
+	// OSC 10/11 前缀 `\x1b]1`，OSC 8 超链接 `\x1b]8`，OSC 133 标记 `\x1b]133;A`
+	for _, seq := range []string{
+		"\x1b]10;?\x07",
+		"\x1b]11;?\x07",
+		"\x1b]133;A\x07",
+		"\x1b]1337;File=...\x07",
+		"\x1b]8;;http://example.com/long\x07",
+	} {
+		var b bytes.Buffer
+		tr := newOSCTracker(&b)
+		// 切在 OSC 中间（BEL 未到）也应立即透传已到字节；允许保留的只有
+		// cwd 前缀片段（\x1b]1 之类，≤2 字节且下一个 chunk 即释放）
+		half := len(seq) / 2
+		if half < 2 {
+			half = 2
+		}
+		tr.Write([]byte(seq[:half]))
+		prefixLen := len("\x1b]133;cwd=")
+		if len(tr.buf) > prefixLen {
+			t.Fatalf("序列 %q 切到 %d 处保留超过 cwd 前缀（≤%d 字节）: %q", seq, half, prefixLen, tr.buf)
+		}
+		tr.Write([]byte(seq[half:]))
+		if len(tr.buf) != 0 {
+			t.Fatalf("序列 %q 透传完成后不应残留: %q", seq, tr.buf)
+		}
+		if b.String() != seq {
+			t.Fatalf("序列 %q 应原样透传: %q", seq, b.String())
+		}
+	}
+}
+
 // TestOSCTrackerNoDuplicateOnBoundary 回归：跨 Write 边界时，无 ESC 的纯文本
 // （如登录横幅）不得在后续 Write 中重复输出。历史 bug：scan 在「无 ESC 序列」
 // 分支把全部已透传数据又写回 t.buf，导致下一 Write 重复输出该内容（登录横幅

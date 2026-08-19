@@ -143,6 +143,7 @@ go test -race ./internal/session/ ./internal/sftp/ ./internal/tui/ -count=1
 - `TestSessionEnvPromptCommandRejected`：PROMPT_COMMAND env 请求被拒绝（对齐真实 OpenSSH AcceptEnv）
 - `TestSessionCwdHookInjected`：首次进入会话 shell 内注入 cwd 钩子（bash/zsh/tmux passthrough/清除序列）
 - `TestOSCTracker`：OSC 133;cwd 解析 + 从输出中剔除；非目标序列原样透传
+- `TestOSCTrackerPiterminalNoHold`/`TestOSCTrackerPiTerminalSplitBoundary`/`TestOSCTrackerCwdPrefixHeldOnly`：**只对 cwd 前缀片段（≤10 字节）跨 Write 保留，非 cwd 的 OSC（OSC 8/133、同步输出、光标序列）即使 BEL 在下一 chunk 也立即原样透传**——防 pi 这类每按键整帧差分重绘 TUI 输出被拆包延迟导致输入法 preedit 闪烁（见第 3 节）
 - `TestSessionPtyIUTF8`：IUTF8=1 / IMAXBEL=1 / IXOFF=0 / 基础模式俱全
 - `TestResolveTermSize`：`(width, height)`→`(rows, cols)` 换算顺序 / 非法尺寸回退 24×80（PTY 尺寸颠倒的回归防线）
 - `TestSessionDetachKeepsConnection`：detach 挂起后同一 SSH 连接仍可再建会话（不重连的回归防线）
@@ -166,6 +167,7 @@ go test -race ./internal/session/ ./internal/sftp/ ./internal/tui/ -count=1
 | 2026-08 | 注入命令回显难以隐藏（`stty -echo` 一次性写入靠时序赌注、慢网必漏；确认标记握手虽可靠但残留引导行） | 原实现 `inPipe.Write("stty -echo\r"+cwdHookCommand+"; stty echo\r")`；改确认标记握手后仍残留引导行 `stty -echo; printf ...` | **改 PTY 层 ECHO=0**（`ssh.Client.NewTerminalSession` pty-req 即关 ECHO）：注入命令从第一条起完全**不回显、无任何残留**（无需 stty -echo/握手/引导行），注入末尾 `stty echo` 恢复交互；`TestSessionPtyIUTF8` 断言 ECHO=0 回归 |
 | 2026-08 | 注入后多一个空行（bash 在 ECHO=0 下处理输入行输出 `\x1b[?2004l\r\r\n`） | 注入命令被 bash 执行时会额外输出一行换行序列，屏幕出现孤立空行 | 注入命令末尾追加 `clear`，清除注入产生的空行，提示符干净出现在屏幕顶部；`TestRealHostFinalInjection`（临时）真实验证 |
 | 2026-08 | 首次连接静默信任主机指纹（安全缺口）；known_hosts 解析失败静默降级 `InsecureIgnoreHostKey`；k-i 对所有提示盲答密码；unix 输入 10ms 忙等轮询 | 早期安全/性能取舍 | ① 首次连接返回 `UnknownHostKeyError`，展示指纹 + 用户确认后 `TrustHostKey` 并重连（main 终端提示 / SFTP 页确认态）；② `knownhosts.New` 失败显式报错；③ `passwordAnswer` 仅单提示不回显时应答；④ unix 输入改 poll(2)+自管道阻塞读；均补回归测试并同步本清单 |
+| 2026-08 | 经 simple-connect 用 pi（Ink 差分渲染 TUI）输入中文，拼音选词阶段字母闪烁；系统 ssh 直连不闪 | pi 每按键整帧差分重绘（同步输出 `\x1b[?2026h..l` + 逐行 OSC 8 复位 + 光标 hide/定位）。旧 `scan` 遇到任意 `\x1b]` 且本 chunk 无 BEL 就把整段尾部挂起等 BEL，SSH 分块恰切在 `\x1b]8;;` 与 BEL 之间时会把 pi 的帧拆包延迟，同步输出未闭合时终端收到残帧、重绘时序错乱，擦掉输入法 preedit | `scan` 改为**只对「`\x1b]133;cwd=` 前缀或其路径未收尾」的字节做跨 Write 保留（≤10 字节）**，非 cwd 的 OSC 即使 BEL 在下一 chunk 也立即原样透传（字节序精确，不做语义拼接）。对 pi 流量零保留、完全透明；`TestOSCTrackerPiterminalNoHold` 等回归 |
 | 2026-08 | 会话内远程登录横幅（Linux/Welcome/Last login）被重复多份、光标错位、输入不可见 | `oscTracker.scan` 在「无 ESC 序列」分支（`i<0`）把全部已透传数据又写回 `t.buf`，下一次 Write 时 `t.buf+p` 里残留内容被**重复输出**（横幅等纯文本跨 Write 边界重复） | `i<0` 分支不再向 `t.buf` 保留任何字节（跨 Write 的序列起点由 `i>=0 且 j<0` 分支保留）；另 `Write` 合并残留时拷贝到独立切片避免与 `t.buf` 共享底层数组。实测横幅由 6 次降为 1 次；`TestOSCTrackerNoDuplicateOnBoundary` 回归 |
 | 早期 | 不在 config 中的主机被改端口/认证方式 | `ssh_config.Get` 无匹配时返回默认值（Port=22、IdentityFile） | 基于解析结果取值（sshConfigGetter），加 `TestResolveSSHConfigNoConfigMatch` 回归 |
 
