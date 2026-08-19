@@ -97,7 +97,7 @@ if ($userPath -notmatch [regex]::Escape($InstallDir)) {
     [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
     Write-Host "==> Added $InstallDir to user PATH."
     Write-Host "    Open a new terminal and run simple-ssh; for this session run:"
-    Write-Host "      `$env:Path = \"$InstallDir;`$env:Path\""
+    Write-Host "      `$env:Path = `"$InstallDir;`$env:Path`""
 } else {
     Write-Host "==> $InstallDir already in user PATH."
 }
