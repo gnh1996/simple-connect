@@ -80,7 +80,7 @@ LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION
    - **bash**：定义 `_sc_cwd` 上报函数（检测 `$TMUX`，tmux 内用 passthrough 序列 `\ePtmux;\e\e]133;cwd=%s\007\e\\`），`export PROMPT_COMMAND="_sc_cwd; ${PROMPT_COMMAND}"`——**追加保留用户已有钩子**（powerline 等）；
    - **zsh**：`eval '_sc_cwd(){ ...; }; precmd_functions+=(_sc_cwd);'`——`precmd_functions` **追加不覆盖**（兼容 oh-my-zsh 等）；zsh 专属语法经 `eval` 包裹，避免 POSIX sh 解析报错；
    - **sh/dash**：`$BASH_VERSION`/`$ZSH_VERSION` 均未定义，两分支短路静默（POSIX 无提示符前钩子机制，降级不跟踪）。
-   - 仅发送一次（首次进入）；SFTP 恢复时不发（原样恢复）。发送时用 `stty -echo` 包裹（`stty -echo\r<钩子>; stty echo\r`）——ECHO 关闭期间命令不回显，随后恢复，**屏幕仅残留一行 `stty -echo`**；命令本体**不含清行/清屏控制序列**（会干扰 bash readline 导致光标错位/输入不可见）；残余副作用：history 记录一条命令。
+   - 仅发送一次（首次进入）；SFTP 恢复时不发（原样恢复）。**回显隐藏靠 PTY 层 ECHO=0**（见 `ssh.Client.NewTerminalSession`）：pty-req 时即关闭 ECHO，注入命令从第一条起**完全不回显、无任何引导行残留**；命令末尾 `stty echo` 恢复交互回显，随后 `clear` 清除注入命令处理时产生的空行（bash 在 ECHO=0 下处理输入行会输出 `\x1b[?2004l\r\r\n` 多一个换行），使提示符干净出现在屏幕顶部（与 run() 首次清屏行为一致，横幅本就不保留）。命令本体**不含清行/清屏控制序列**（会干扰 bash readline 导致光标错位/输入不可见）；残余副作用：history 记录一条命令。
 2. **env 注入兜底（宽松服务器场景）**：`Setenv("PROMPT_COMMAND", oscPromptCommand)` 仍保留——若服务器 `AcceptEnv` 恰好允许，直接生效且不产生 history 副作用；被拒绝则忽略错误（无阻塞）。
 
 **为什么**：不传 → 远程 shell 落到 C/POSIX locale：
@@ -156,6 +156,8 @@ go test -race ./internal/session/ ./internal/sftp/ ./internal/tui/ -count=1
 | 2026-08 | 会话中唤起 SFTP 会断开 SSH 并重连，重连后 shell 回 home、目录丢失 | detach 时 `Session.Close()` + main 重连 | 挂起/恢复架构（`Handle`）：detach 不关闭连接，输出静音，恢复同一会话；SFTP 复用同一连接；`TestSessionDetachKeepsConnection`/`TestSessionResume` 回归 |
 | 2026-08 | SSH 当前目录始终带不到 SFTP（tracker.Cwd 恒空） | `Setenv("PROMPT_COMMAND", ...)` 的 env 请求被 sshd 默认 `AcceptEnv`（仅 LANG/LC_*）拒绝，OSC 从未上报；内存测试服务器宽松接受 env 掩盖了该问题 | cwd 钩子改为首次进入会话时经 stdin **shell 内注入**（bash PROMPT_COMMAND 追加 / zsh precmd_functions 追加 / sh 静默），testutil 服务器对齐真实 OpenSSH 拒绝 PROMPT_COMMAND env；`TestSessionCwdHookInjected`/`TestSessionEnvPromptCommandRejected` 回归 |
 | 2026-08 | 注入命令明文回显、OSC 133;cwd 序列透传污染终端 | tty ECHO 无法关闭，注入命令必然回显；tracker 原样透传 OSC 到本地终端；命令内清行（`\033[1A\033[2K`）/清屏（`\033[2J\033[H`）控制序列干扰 bash readline（光标错位、输入不可见） | 发送前 `stty -echo` 关闭 ECHO（注入命令不回显，随后 `stty echo` 恢复），命令本体无控制序列；`oscTracker` 解析后**剔除** OSC 133;cwd 序列（对齐 Tabby），tmux 内用 passthrough 序列；`TestOSCTracker` 过滤断言回归 |
+| 2026-08 | 注入命令回显难以隐藏（`stty -echo` 一次性写入靠时序赌注、慢网必漏；确认标记握手虽可靠但残留引导行） | 原实现 `inPipe.Write("stty -echo\r"+cwdHookCommand+"; stty echo\r")`；改确认标记握手后仍残留引导行 `stty -echo; printf ...` | **改 PTY 层 ECHO=0**（`ssh.Client.NewTerminalSession` pty-req 即关 ECHO）：注入命令从第一条起完全**不回显、无任何残留**（无需 stty -echo/握手/引导行），注入末尾 `stty echo` 恢复交互；`TestSessionPtyIUTF8` 断言 ECHO=0 回归 |
+| 2026-08 | 注入后多一个空行（bash 在 ECHO=0 下处理输入行输出 `\x1b[?2004l\r\r\n`） | 注入命令被 bash 执行时会额外输出一行换行序列，屏幕出现孤立空行 | 注入命令末尾追加 `clear`，清除注入产生的空行，提示符干净出现在屏幕顶部；`TestRealHostFinalInjection`（临时）真实验证 |
 | 2026-08 | 会话内远程登录横幅（Linux/Welcome/Last login）被重复多份、光标错位、输入不可见 | `oscTracker.scan` 在「无 ESC 序列」分支（`i<0`）把全部已透传数据又写回 `t.buf`，下一次 Write 时 `t.buf+p` 里残留内容被**重复输出**（横幅等纯文本跨 Write 边界重复） | `i<0` 分支不再向 `t.buf` 保留任何字节（跨 Write 的序列起点由 `i>=0 且 j<0` 分支保留）；另 `Write` 合并残留时拷贝到独立切片避免与 `t.buf` 共享底层数组。实测横幅由 6 次降为 1 次；`TestOSCTrackerNoDuplicateOnBoundary` 回归 |
 | 早期 | 不在 config 中的主机被改端口/认证方式 | `ssh_config.Get` 无匹配时返回默认值（Port=22、IdentityFile） | 基于解析结果取值（sshConfigGetter），加 `TestResolveSSHConfigNoConfigMatch` 回归 |
 

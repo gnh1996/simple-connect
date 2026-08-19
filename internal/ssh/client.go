@@ -125,8 +125,11 @@ func (c *Client) NewTerminalSession(term string, rows, cols int) (*ssh.Session, 
 	// 开关类模式显式发送（未发送的项保留服务器 tty 默认值，老系统/网络设备上
 	// 可能关闭 IUTF8/IMAXBEL 等关键项，导致退格吃半个 UTF-8 字符、光标错位）；
 	// 控制字符（VINTR/VERASE/VSUSP 等）不发送，保留服务器配置。
+	// ECHO=0：会话建立即关闭回显——首条 cwd 钩子注入命令从第一条起就不回显
+	//（无 stty -echo 引导行残留，见 internal/session）；注入末尾 `stty echo`
+	// 恢复交互回显，之后与 OpenSSH（ECHO=1）表现一致。
 	modes := ssh.TerminalModes{
-		ssh.ECHO:          1,
+		ssh.ECHO:          0,
 		ssh.ECHOE:         1,
 		ssh.ECHOK:         1,
 		ssh.ECHOKE:        1,

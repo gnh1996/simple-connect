@@ -361,11 +361,13 @@ func (h *Handle) run() error {
 		}
 	}
 	// 仅首次进入：注入 cwd 追踪钩子（shell 在提示符前自动上报目录）。
-	// 用 `stty -echo` 包裹使注入命令不回显（随后恢复 ECHO），避免在命令内输出
-	// 清行/清屏控制序列干扰 bash readline（光标错位/输入不可见）。
+	// pty-req 已设 ECHO=0（见 ssh.Client.NewTerminalSession），注入命令从第一条起
+	// 就不回显、无 stty -echo 引导行残留；命令末尾 `stty echo` 恢复交互回显，
+	// 随后 `clear` 清除注入命令处理时产生的空行（bash 在 ECHO=0 下处理输入行会
+	// 输出 `\x1b[?2004l\r\r\n` 多一个换行），使提示符干净出现在屏幕顶部。
 	// 从 SFTP 恢复时不发任何字节（原样恢复）。
 	if !h.started {
-		_, _ = h.inPipe.Write([]byte("stty -echo\r" + cwdHookCommand + "; stty echo\r"))
+		_, _ = h.inPipe.Write([]byte(cwdHookCommand + "; stty echo; clear\r"))
 		h.started = true
 	}
 

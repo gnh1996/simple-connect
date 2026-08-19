@@ -249,9 +249,9 @@ func TestSessionCwdHookInjected(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- h.Resume() }()
 
-	// 注入命令应被回显（测试服务器 shell 原样回显 stdin）；ECHO 关闭期间发送，
-	// 屏幕仅残留 stty -echo 一行，注入命令本体（含控制序列不得出现）。
-	waitContains(t, out, "stty -echo")
+	// 注入命令经 stdin 发送（pty ECHO=0 保证不回显；测试服务器 shell 原样回显），
+	// 应包含 bash/zsh/tmux passthrough/恢复 echo 各分支，且无清屏/清行控制序列。
+	waitContains(t, out, "_sc_cwd(){")
 	for _, frag := range []string{
 		"_sc_cwd(){",                      // bash 函数定义
 		"precmd_functions+=(_sc_cwd)",     // zsh precmd 追加

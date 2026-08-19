@@ -358,8 +358,8 @@ func TestSessionPtyIUTF8(t *testing.T) {
 	if modes[ssh.IXOFF] != 0 {
 		t.Fatalf("IXOFF 应显式发送 0（防止服务器默认开启流控卡输入），实际: %v", modes)
 	}
-	// 关键基础模式仍在
-	if modes[ssh.ECHO] != 1 || modes[ssh.ICRNL] != 1 || modes[ssh.CS8] != 1 {
+	// 关键基础模式仍在（ECHO=0 为 cwd 钩子注入专用，注入末尾 stty echo 恢复）
+	if modes[ssh.ECHO] != 0 || modes[ssh.ICRNL] != 1 || modes[ssh.CS8] != 1 {
 		t.Fatalf("基础模式缺失: %v", modes)
 	}
 
