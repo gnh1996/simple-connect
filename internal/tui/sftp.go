@@ -210,7 +210,7 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 			m.status = "未获取会话目录（shell 钩子未生效？目录可能不准确，可用 g 跳转）"
 		}
 		m.busy = true
-		return m, m.loadList()
+		return m, tea.Batch(m.loadList(), m.loadLocal())
 
 	case sftpListMsg:
 		m.busy = false

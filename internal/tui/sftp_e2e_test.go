@@ -47,7 +47,36 @@ func connect(t *testing.T, m *sftpModel) {
 	} else {
 		t.Fatalf("连接命令应返回 sftpConnMsg，实际 %T", msg)
 	}
-	m, _ = m.Update(msg)
+	m2, cmd := m.Update(msg)
+	*m = *m2
+	// 连接成功后应自动加载远程与本地目录（tea.Batch 返回 BatchMsg）
+	bm, ok := cmd().(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("连接后命令应返回 tea.BatchMsg，实际 %T", cmd())
+	}
+	var remote, local bool
+	for _, subCmd := range bm {
+		lm, ok := subCmd().(sftpListMsg)
+		if !ok {
+			t.Fatalf("批量命令应返回 sftpListMsg，实际 %T", subCmd())
+		}
+		m2, c := m.Update(lm)
+		*m = *m2
+		if c != nil {
+			t.Fatalf("列表处理不应再返回命令，实际 %T", c())
+		}
+		if lm.kind == paneRemote {
+			remote = true
+		} else {
+			local = true
+		}
+	}
+	if !remote {
+		t.Fatal("连接后应自动加载远程栏目录")
+	}
+	if !local {
+		t.Fatal("连接后应自动加载本地栏目录")
+	}
 }
 
 // driveProgress 循环执行进度命令直到传输完成
