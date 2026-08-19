@@ -41,7 +41,7 @@ INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/gnh1996/
 
 **Windows**（PowerShell）
 
-> 注意：不要使用 `irm ... | iex` 单行命令——该模式会触发 Windows Defender 的 AMSI 启发式拦截（典型的下载执行特征），可能被直接隔离。请使用下面的两步式安装。安装脚本已内置 UTF-8 BOM，Windows PowerShell 5.1（`powershell`）与 PowerShell 7（`pwsh`）均可正确执行。
+> 注意：不要使用 `irm ... | iex` 单行命令——该模式会触发 Windows Defender 的 AMSI 启发式拦截（典型的下载执行特征），可能被直接隔离。请使用下面的两步式安装。安装脚本为纯 ASCII（英文输出），任何 PowerShell 版本（5.1 / 7）都能正确解析。
 
 ```powershell
 # ① 下载安装脚本到本地

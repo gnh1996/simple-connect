@@ -1,12 +1,16 @@
-﻿# simple-connect 安装脚本（Windows）
-# 安装为全局命令 simple-ssh.exe。
+# simple-connect install script (Windows)
+# Installs as global command simple-ssh.exe.
 #
-# 用法（PowerShell）：
-#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1              # 源码构建（需 Go）
-#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release     # 下载 GitHub 最新 Release
-#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release v0.1.0  # 指定版本
-#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -UsePrebuilt # 使用 dist/ 预编译二进制
+# Usage (PowerShell):
+#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1                # build from source (needs Go)
+#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release       # download latest GitHub Release
+#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release v0.1.0
+#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -UsePrebuilt   # use prebuilt binary in dist/
 #   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -InstallDir D:\tools\simple-ssh
+#
+# NOTE: This script is intentionally pure ASCII. Windows PowerShell 5.1 decodes
+# .ps1 files without BOM using the system ANSI codepage, so non-ASCII text can
+# corrupt parsing. Keep ALL output/comments ASCII.
 
 param(
     [switch]$UsePrebuilt,
@@ -16,20 +20,20 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# 仓库地址（用于 -Release 下载）
+# Repo for -Release downloads.
 $Repo = "gnh1996/simple-connect"
 
-# 默认安装目录：%LOCALAPPDATA%\simple-connect
+# Default install dir: %LOCALAPPDATA%\simple-connect
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
     $InstallDir = Join-Path $env:LOCALAPPDATA "simple-connect"
 }
 
-# 定位项目根目录（脚本位于项目根目录下 scripts/ 子目录）
+# Locate project root (script lives under scripts/).
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
 $OutExe = Join-Path $InstallDir "simple-ssh.exe"
 
-# 创建安装目录
+# Create install dir.
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
 function Get-RemoteFile {
@@ -39,50 +43,50 @@ function Get-RemoteFile {
 }
 
 if ($Release) {
-    # ---- 从 GitHub Releases 下载预编译二进制 ----
+    # ---- Download prebuilt binary from GitHub Releases ----
     $Url = if ($Release -eq "latest") {
         "https://github.com/$Repo/releases/latest/download/simple-connect-windows-amd64.exe"
     } else {
         "https://github.com/$Repo/releases/download/$Release/simple-connect-windows-amd64.exe"
     }
-    Write-Host "==> 下载预编译版本（$Release，windows/amd64）..."
+    Write-Host "==> Downloading prebuilt version ($Release, windows/amd64)..."
     Write-Host "    $Url"
     Get-RemoteFile -Url $Url -Out $OutExe
-    # 移除下载来源标记（MOTW），避免 SmartScreen 拦截
+    # Strip Mark-of-the-Web so SmartScreen does not block it.
     Unblock-File -Path $OutExe -ErrorAction SilentlyContinue
 } elseif ($UsePrebuilt) {
-    # ---- 使用 dist/ 预编译二进制 ----
+    # ---- Use prebuilt binary from dist/ ----
     $Prebuilt = Join-Path $ProjectRoot "dist\simple-connect-windows-amd64.exe"
     if (-not (Test-Path $Prebuilt)) {
-        Write-Host "错误：未找到预编译二进制 $Prebuilt 。" -ForegroundColor Red
-        Write-Host "请先构建：go build -o dist\simple-connect-windows-amd64.exe ." -ForegroundColor Red
+        Write-Host "ERROR: prebuilt binary not found: $Prebuilt" -ForegroundColor Red
+        Write-Host "Build it first: go build -o dist\simple-connect-windows-amd64.exe ." -ForegroundColor Red
         exit 1
     }
-    Write-Host "==> 使用预编译二进制 ..."
+    Write-Host "==> Using prebuilt binary ..."
     Copy-Item $Prebuilt $OutExe -Force
 } else {
-    # ---- 源码构建 ----
+    # ---- Build from source ----
     $go = Get-Command go -ErrorAction SilentlyContinue
     if (-not $go) {
-        Write-Host "错误：未找到 go 工具链，无法源码构建。" -ForegroundColor Red
+        Write-Host "ERROR: Go toolchain not found, cannot build from source." -ForegroundColor Red
         Write-Host ""
-        Write-Host "请改用两步式下载安装（避开 iex 单行命令，防 Defender 拦截）：" -ForegroundColor Yellow
+        Write-Host "Use the two-step install instead (avoids irm|iex, so Defender does not block it):" -ForegroundColor Yellow
         Write-Host '  Invoke-WebRequest -Uri "https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.ps1" -OutFile "$env:TEMP\simple-connect-install.ps1"' -ForegroundColor Cyan
         Write-Host '  Unblock-File "$env:TEMP\simple-connect-install.ps1"' -ForegroundColor Cyan
         Write-Host '  powershell -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" -Release v0.1.0' -ForegroundColor Cyan
         exit 1
     }
-    Write-Host "==> 从源码构建 simple-ssh.exe ..."
+    Write-Host "==> Building simple-ssh.exe from source ..."
     Push-Location $ProjectRoot
     try {
         & go build -o $OutExe .
-        if ($LASTEXITCODE -ne 0) { throw "go build 失败（退出码 $LASTEXITCODE）" }
+        if ($LASTEXITCODE -ne 0) { throw "go build failed (exit code $LASTEXITCODE)" }
     } finally {
         Pop-Location
     }
 }
 
-# 将安装目录加入用户 PATH（持久化）
+# Add install dir to user PATH (persisted).
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if ($userPath -notmatch [regex]::Escape($InstallDir)) {
     $newPath = if ([string]::IsNullOrWhiteSpace($userPath)) {
@@ -91,12 +95,12 @@ if ($userPath -notmatch [regex]::Escape($InstallDir)) {
         "$userPath;$InstallDir"
     }
     [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-    Write-Host "==> 已把 $InstallDir 加入用户 PATH。"
-    Write-Host "    新开的终端即可输入 simple-ssh 启动程序；当前终端可执行："
+    Write-Host "==> Added $InstallDir to user PATH."
+    Write-Host "    Open a new terminal and run simple-ssh; for this session run:"
     Write-Host "      `$env:Path = \"$InstallDir;`$env:Path\""
 } else {
-    Write-Host "==> $InstallDir 已在用户 PATH 中。"
+    Write-Host "==> $InstallDir already in user PATH."
 }
 
-Write-Host "==> 安装完成：$OutExe"
-Write-Host "    现在可以输入 simple-ssh 启动程序。"
+Write-Host "==> Installed: $OutExe"
+Write-Host "    Run simple-ssh to start."
