@@ -113,6 +113,66 @@ func TestTransferUploadDownload(t *testing.T) {
 	}
 }
 
+// TestLargeFileConcurrentUpload 大文件上传走并发分片路径（> maxPacket），
+// 校验内容往返与进度计数正确（UseConcurrentWrites + 大拷贝 buffer 的回归测试）。
+func TestLargeFileConcurrentUpload(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	conn := dialTest(t, env)
+	defer conn.Close()
+
+	// 4MB 确定性内容（覆盖多个 32KB 分片，触发并发写）
+	content := make([]byte, 4<<20)
+	for i := range content {
+		content[i] = byte(i * 31)
+	}
+	local := filepath.Join(t.TempDir(), "big.bin")
+	if err := os.WriteFile(local, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	remote := filepath.Join(env.Root, "big.bin")
+	tup := NewTransfer("big.bin", true)
+	Upload(conn.Client, tup, local, remote)
+	done, total, finished, err := tup.Snapshot()
+	if !finished || err != nil {
+		t.Fatalf("并发上传异常: finished=%v err=%v", finished, err)
+	}
+	if total != int64(len(content)) || done != int64(len(content)) {
+		t.Fatalf("上传进度 total=%d done=%d，期望 %d", total, done, len(content))
+	}
+
+	b, err := os.ReadFile(remote)
+	if err != nil {
+		t.Fatalf("读取远程文件失败: %v", err)
+	}
+	if len(b) != len(content) {
+		t.Fatalf("远程文件长度 %d，期望 %d", len(b), len(content))
+	}
+	// 逐块校验避免大切片比较的堆压力
+	for off := 0; off < len(b); off += 64 << 10 {
+		end := off + 64<<10
+		if end > len(b) {
+			end = len(b)
+		}
+		for i := off; i < end; i++ {
+			if b[i] != content[i] {
+				t.Fatalf("偏移 %d 内容不符: got %d want %d", i, b[i], content[i])
+			}
+		}
+	}
+
+	dst := filepath.Join(t.TempDir(), "big.bin")
+	td := NewTransfer("big.bin", false)
+	Download(conn.Client, td, remote, dst)
+	if _, _, finished, err := td.Snapshot(); !finished || err != nil {
+		t.Fatalf("下载异常: finished=%v err=%v", finished, err)
+	}
+	db, err := os.ReadFile(dst)
+	if err != nil || len(db) != len(content) {
+		t.Fatalf("下载文件校验失败: len=%d err=%v", len(db), err)
+	}
+}
+
 func TestTransferFailure(t *testing.T) {
 	env := testutil.StartSFTP(t)
 	conn := dialTest(t, env)
