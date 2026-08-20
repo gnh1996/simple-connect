@@ -33,7 +33,7 @@ simple-connect 定位为**单连接管理**工具：
 curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -- --release
 
 # 或指定版本
-curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -- --release v0.1.2
+curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -- --release v0.1.3
 
 # 自定义安装目录
 INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -- --release
@@ -50,9 +50,9 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/gnh1996/simple-connect/
 
 # ② 移除下载来源标记并执行（安装到 %LOCALAPPDATA%\simple-connect，自动加入用户 PATH）
 Unblock-File "$env:TEMP\simple-connect-install.ps1"
-powershell -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" -Release v0.1.2
+powershell -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" -Release v0.1.3
 # 若你使用 PowerShell 7，最后一行可换为：
-# pwsh -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" -Release v0.1.2
+# pwsh -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" -Release v0.1.3
 ```
 
 脚本会自动下载对应平台的预编译二进制并加入用户 PATH，安装后新开终端直接输入 `simple-ssh` 启动。
@@ -62,7 +62,7 @@ powershell -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" 
 ```powershell
 # 下载二进制
 New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\simple-connect" | Out-Null
-Invoke-WebRequest -Uri https://github.com/gnh1996/simple-connect/releases/download/v0.1.2/simple-connect-windows-amd64.exe `
+Invoke-WebRequest -Uri https://github.com/gnh1996/simple-connect/releases/download/v0.1.3/simple-connect-windows-amd64.exe `
   -OutFile "$env:LOCALAPPDATA\simple-connect\simple-ssh.exe"
 Unblock-File "$env:LOCALAPPDATA\simple-connect\simple-ssh.exe"
 
@@ -81,7 +81,7 @@ $env:Path += ";$dir"
 
 ```powershell
 Get-FileHash "$env:LOCALAPPDATA\simple-connect\simple-ssh.exe" -Algorithm SHA256
-# 将输出与 https://github.com/gnh1996/simple-connect/releases/download/v0.1.2/SHA256SUMS 比对
+# 将输出与 https://github.com/gnh1996/simple-connect/releases/download/v0.1.3/SHA256SUMS 比对
 ```
 
 **Defender 误报怎么办**
@@ -107,7 +107,7 @@ go build -o simple-ssh .
 ```bash
 ./scripts/install.sh                 # 源码构建（需 Go）
 ./scripts/install.sh --release       # 下载 GitHub 最新 Release
-./scripts/install.sh --release v0.1.2
+./scripts/install.sh --release v0.1.3
 INSTALL_DIR=/usr/local/bin ./scripts/install.sh   # 自定义安装目录
 ```
 
@@ -116,7 +116,7 @@ INSTALL_DIR=/usr/local/bin ./scripts/install.sh   # 自定义安装目录
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1                    # 源码构建（需 Go）
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release           # 下载 GitHub 最新 Release
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release v0.1.2    # 指定版本
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release v0.1.3    # 指定版本
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -UsePrebuilt       # 使用 dist/ 预编译二进制
 ```
 
