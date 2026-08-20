@@ -94,7 +94,7 @@ simple-connect 是开源的未签名工具，首次下载运行时 Defender 可�
 
 ### 源码构建
 
-需要 Go 1.21+：
+需要 Go 1.21+（`go.mod` 当前 `go 1.26.4`）：
 
 ```bash
 go build -o simple-ssh .
@@ -232,8 +232,6 @@ go test ./... -count=1
 ## 已知限制
 
 - **多实例并发编辑配置**：可在 tmux/多页签并行运行多个实例，增删改经文件锁（`hosts.lock` / `secrets.lock`）+ 写前重读 + 原子写安全合并（`go test -race` 覆盖）；同一主机被多实例同时修改时为后写整体覆盖（不做字段级合并）
-- **首次连接指纹确认（ask 模式）**：首次连接返回指纹待确认，终端提示 `y/N` 或 SFTP 页展示指纹确认态（`y` 信任并重连，`Esc/n` 取消），对齐 OpenSSH ask；`known_hosts` 解析失败显式报错不再静默降级
-- **keyboard-interactive 单提示盲答限制**：仅当单个提示且不回显时回填保存的密码；多提示（OTP/堡垒机二次验证）或回显提示一律中止，避免误用密码导致锁号
+- **keyboard-interactive OTP 限制**：仅当单个非回显提示时回填保存的密码；多提示（OTP/堡垒机二次验证）或回显提示一律中止，需改用密钥或手工输入
 - **Windows detach 吞键**：Windows 下 stdin 阻塞读取，detach 后残留的读取 goroutine 在下次按键时自行退出，可能吞掉一键
-- **会话输入**：unix 下基于 `poll(2)` + 自管道阻塞读（detach 时自管道唤醒干净退出），无 10ms 轮询延迟；粘贴吞吐不再受限
 - **SFTP 传输无断点续传**：单个传输失败即中止当前批次
