@@ -82,12 +82,42 @@ func List(cl *sftp.Client, path string) ([]os.FileInfo, error) {
 	return entries, nil
 }
 
-// Remove 删除远程文件或目录
-func Remove(cl *sftp.Client, path string, isDir bool) error {
-	if isDir {
-		return cl.RemoveDirectory(path)
+// Remove 删除远程文件或目录（目录递归删除，非空目录也可用）
+func Remove(cl *sftp.Client, p string, isDir bool) error {
+	if !isDir {
+		return cl.Remove(p)
 	}
-	return cl.Remove(path)
+	// 先尝试直接删空目录，成功则返回
+	if err := cl.RemoveDirectory(p); err == nil {
+		return nil
+	}
+	// 非空目录：递归删除（先删文件，再从深到浅删目录）
+	var dirs []string
+	walker := cl.Walk(p)
+	for walker.Step() {
+		if walker.Err() != nil {
+			return walker.Err()
+		}
+		wp := walker.Path()
+		// Walk 包含根目录本身，递归时跳过根（最后单独删除）
+		if wp == p {
+			continue
+		}
+		if walker.Stat().IsDir() {
+			dirs = append(dirs, wp)
+		} else {
+			if err := cl.Remove(wp); err != nil {
+				return err
+			}
+		}
+	}
+	// 目录按深度倒序删除（先删子目录）
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := cl.RemoveDirectory(dirs[i]); err != nil {
+			return err
+		}
+	}
+	return cl.RemoveDirectory(p)
 }
 
 // Transfer 传输进度跟踪器（并发安全）
@@ -334,14 +364,14 @@ func downloadItem(cl *sftp.Client, t *Transfer, remotePath, localPath string) {
 			return
 		}
 		p := walker.Path()
-		rel, err := filepath.Rel(filepath.FromSlash(remotePath), filepath.FromSlash(p))
+		rel, err := posixRel(remotePath, p)
 		if err != nil {
 			t.finish(err)
 			return
 		}
 		local := localPath
 		if rel != "." {
-			local = filepath.Join(localPath, rel)
+			local = filepath.Join(localPath, filepath.FromSlash(rel))
 		}
 		if walker.Stat().IsDir() {
 			if err := os.MkdirAll(local, 0o755); err != nil {
@@ -447,10 +477,47 @@ func (r countingReader) Read(p []byte) (int, error) {
 }
 
 func (r countingReader) Stat() (os.FileInfo, error) {
+	// 仅 *os.File 经过验证可在 sftp.File.ReadFrom 中触发并发分片（高吞吐）。
+	// 其他 Reader 退化为串行 32KB 写；未来若需包装 Reader，应在此扩展对
+	// interface{Stat() (os.FileInfo, error)} 的探测并确保返回有效大小，
+	// 否则上传会静默性能回退（详见 bufsize_bench_test.go）。
 	if f, ok := r.r.(*os.File); ok {
 		return f.Stat()
 	}
+	// 尝试通用 Stat 接口（如自定义包装仍暴露底层 FileInfo）
+	if st, ok := r.r.(interface{ Stat() (os.FileInfo, error) }); ok {
+		return st.Stat()
+	}
 	return nil, os.ErrInvalid
+}
+
+// posixRel 计算 POSIX 路径的相对路径（不依赖 OS 路径分隔符，Windows 下也正确）。
+// 语义对齐 path/filepath.Rel，但强制使用 "/" 分隔，避免 filepath 在 Windows 下按 "\" 切分。
+func posixRel(base, target string) (string, error) {
+	base = path.Clean(base)
+	target = path.Clean(target)
+	if base == target {
+		return ".", nil
+	}
+	if base == "." {
+		base = ""
+	}
+	if base == "/" {
+		if strings.HasPrefix(target, "/") {
+			return strings.TrimPrefix(target, "/"), nil
+		}
+		return target, nil
+	}
+	// 必须为目录前缀（base + "/"）才算子路径，避免 /foo 与 /foobar 误匹配
+	if strings.HasPrefix(target, base+"/") {
+		return strings.TrimPrefix(target, base+"/"), nil
+	}
+	// 非子路径（理论上 Walk 不会触发），兜底用 filepath.Rel
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return "", err
+	}
+	return filepath.ToSlash(rel), nil
 }
 
 // FormatSize 人类可读的文件大小

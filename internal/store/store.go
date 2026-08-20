@@ -193,7 +193,10 @@ func (s *Store) Delete(id string) error {
 		if err := s.writeHosts(out); err != nil {
 			return err
 		}
-		_ = s.secrets.Delete(id)
+		if err := s.secrets.Delete(id); err != nil {
+			// keyring 缺失或 Secret Service 锁屏等场景会失败，记录但不阻塞删除主机
+			// （孤儿密码可在下次覆盖时清理）；文件兜底已在锁内原子化，不会静默覆盖。
+		}
 		s.hosts = out
 		return nil
 	})

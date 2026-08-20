@@ -80,7 +80,7 @@ LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION
    - **bash**：定义 `_sc_cwd` 上报函数（检测 `$TMUX`，tmux 内用 passthrough 序列 `\ePtmux;\e\e]133;cwd=%s\007\e\\`），`export PROMPT_COMMAND="_sc_cwd; ${PROMPT_COMMAND}"`——**追加保留用户已有钩子**（powerline 等）；
    - **zsh**：`eval '_sc_cwd(){ ...; }; precmd_functions+=(_sc_cwd);'`——`precmd_functions` **追加不覆盖**（兼容 oh-my-zsh 等）；zsh 专属语法经 `eval` 包裹，避免 POSIX sh 解析报错；
    - **sh/dash**：`$BASH_VERSION`/`$ZSH_VERSION` 均未定义，两分支短路静默（POSIX 无提示符前钩子机制，降级不跟踪）。
-   - 仅发送一次（首次进入）；SFTP 恢复时不发（原样恢复）。**回显隐藏靠 PTY 层 ECHO=0**（见 `ssh.Client.NewTerminalSession`）：pty-req 时即关闭 ECHO，注入命令从第一条起**完全不回显、无任何引导行残留**；命令末尾 `stty echo` 恢复交互回显，随后 `clear` 清除注入命令处理时产生的空行（bash 在 ECHO=0 下处理输入行会输出 `\x1b[?2004l\r\r\n` 多一个换行），使提示符干净出现在屏幕顶部（与 run() 首次清屏行为一致，横幅本就不保留）。命令本体**不含清行/清屏控制序列**（会干扰 bash readline 导致光标错位/输入不可见）；残余副作用：history 记录一条命令。
+    - 仅发送一次（首次进入）；SFTP 恢复时不发（原样恢复）。**回显隐藏靠 PTY 层 ECHO=0**（见 `ssh.Client.NewTerminalSession`）：pty-req 时即关闭 ECHO，注入命令从第一条起**完全不回显、无任何引导行残留**；命令末尾 `stty echo` 恢复交互回显（`clear` 已移除：其 terminfo 序列会清 scrollback 丢弃横幅/motd，首次清屏已由 `Handle.run` 的 `fmt.Print("\x1b[2J\x1b[H")` 完成）。命令本体**不含清行/清屏控制序列**（会干扰 bash readline 导致光标错位/输入不可见）；残余副作用：history 记录一条命令。
 2. **env 注入兜底（宽松服务器场景）**：`Setenv("PROMPT_COMMAND", oscPromptCommand)` 仍保留——若服务器 `AcceptEnv` 恰好允许，直接生效且不产生 history 副作用；被拒绝则忽略错误（无阻塞）。
 
 **为什么**：不传 → 远程 shell 落到 C/POSIX locale：

@@ -90,6 +90,9 @@ func dialWithJumps(jumps []*model.Host, targetCfg *ssh.ClientConfig, opts []Opti
 	for _, j := range jumps {
 		jcfg, err := newConfig(j, password) // 跳板复用目标保存的密码与密钥
 		if err != nil {
+			if current != nil {
+				_ = current.Close()
+			}
 			return nil, err
 		}
 		for _, o := range opts {
@@ -103,6 +106,7 @@ func dialWithJumps(jumps []*model.Host, targetCfg *ssh.ClientConfig, opts []Opti
 			if err == nil {
 				cc, chans, reqs, e := ssh.NewClientConn(c, j.Addr(), jcfg)
 				if e != nil {
+					_ = c.Close()
 					err = e
 				} else {
 					current = ssh.NewClient(cc, chans, reqs)
@@ -110,6 +114,9 @@ func dialWithJumps(jumps []*model.Host, targetCfg *ssh.ClientConfig, opts []Opti
 			}
 		}
 		if err != nil {
+			if current != nil {
+				_ = current.Close()
+			}
 			return nil, fmt.Errorf("连接跳板 %s 失败: %w", j.Addr(), err)
 		}
 	}
@@ -119,10 +126,13 @@ func dialWithJumps(jumps []*model.Host, targetCfg *ssh.ClientConfig, opts []Opti
 	}
 	c, err := current.Dial("tcp", target.Addr())
 	if err != nil {
+		_ = current.Close()
 		return nil, fmt.Errorf("经跳板连接 %s 失败: %w", target.Addr(), err)
 	}
 	cc, chans, reqs, err := ssh.NewClientConn(c, target.Addr(), targetCfg)
 	if err != nil {
+		_ = c.Close()
+		_ = current.Close()
 		return nil, err
 	}
 	return ssh.NewClient(cc, chans, reqs), nil

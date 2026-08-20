@@ -56,7 +56,7 @@ func statusTick() tea.Cmd {
 	return tea.Tick(30*time.Second, func(time.Time) tea.Msg { return statusTickMsg{} })
 }
 
-// runStatusChecks 并发检测全部主机状态
+// runStatusChecks 并发检测全部主机状态（限流 10 避免 fd/限流风暴）
 func (m *listModel) runStatusChecks() tea.Cmd {
 	hosts := m.hosts
 	return func() tea.Msg {
@@ -66,10 +66,13 @@ func (m *listModel) runStatusChecks() tea.Cmd {
 		}
 		var wg sync.WaitGroup
 		var mu sync.Mutex
+		sem := make(chan struct{}, 10)
 		for _, h := range hosts {
 			wg.Add(1)
+			sem <- struct{}{}
 			go func(h *model.Host) {
 				defer wg.Done()
+				defer func() { <-sem }()
 				s := sshc.CheckStatus(h, 3*time.Second)
 				mu.Lock()
 				results[h.ID] = s
@@ -162,6 +165,7 @@ func connectHint(h *model.Host) string {
 }
 
 func (m *listModel) handleConfirm(msg tea.KeyPressMsg) (*listModel, tea.Cmd) {
+	m.err = ""
 	k := msg.Key()
 	switch {
 	case k.Code == tea.KeyEnter:
@@ -181,6 +185,7 @@ func (m *listModel) handleConfirm(msg tea.KeyPressMsg) (*listModel, tea.Cmd) {
 }
 
 func (m *listModel) handleFilter(msg tea.KeyPressMsg) (*listModel, tea.Cmd) {
+	m.err = ""
 	k := msg.Key()
 	switch k.Code {
 	case tea.KeyEsc:
@@ -196,7 +201,8 @@ func (m *listModel) handleFilter(msg tea.KeyPressMsg) (*listModel, tea.Cmd) {
 		return m, nil
 	case tea.KeyBackspace:
 		if len(m.filter) > 0 {
-			m.filter = m.filter[:len(m.filter)-1]
+			runes := []rune(m.filter)
+			m.filter = string(runes[:len(runes)-1])
 		}
 	default:
 		if k.Text != "" {
@@ -211,6 +217,7 @@ func (m *listModel) handleFilter(msg tea.KeyPressMsg) (*listModel, tea.Cmd) {
 }
 
 func (m *listModel) handleNav(msg tea.KeyPressMsg) (*listModel, tea.Cmd) {
+	m.err = ""
 	k := msg.Key()
 	n := len(m.filtered)
 	switch k.Code {
@@ -338,7 +345,6 @@ func (m *listModel) View() tea.View {
 		b.WriteString("\n" + styleInfo.Render(fmt.Sprintf("确认删除连接 %q？ (y/N)", name)) + "\n")
 	} else if m.err != "" {
 		b.WriteString("\n" + styleError.Render(m.err) + "\n")
-		m.err = ""
 	}
 
 	b.WriteString("\n" + renderListFooter())

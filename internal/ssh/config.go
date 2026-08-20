@@ -1,6 +1,7 @@
 package sshc
 
 import (
+	"net"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -118,7 +119,8 @@ func resolveSSHConfig(h *model.Host, get configGetter) (*model.Host, []*model.Ho
 	return &resolved, jumps
 }
 
-// parseProxyJump 解析 ProxyJump 链（user@host:port，逗号分隔）
+// parseProxyJump 解析 ProxyJump 链（user@host:port，逗号分隔，支持 IPv6 如 [::1]:2222）
+// host 部分支持：hostname、IPv4、IPv6（带 [] 或裸地址）、[host]:port
 func parseProxyJump(s string) []*model.Host {
 	var jumps []*model.Host
 	for _, part := range strings.Split(s, ",") {
@@ -131,13 +133,31 @@ func parseProxyJump(s string) []*model.Host {
 			j.User = part[:at]
 			part = part[at+1:]
 		}
-		hostPort := strings.Split(part, ":")
-		j.Host = hostPort[0]
-		if len(hostPort) > 1 {
-			if p, err := strconv.Atoi(hostPort[1]); err == nil {
-				j.Port = p
+		if strings.HasPrefix(part, "[") {
+			// 括号括起的 IPv6：[host] 或 [host]:port
+			if end := strings.LastIndex(part, "]"); end >= 0 {
+				j.Host = part[1:end]
+				rest := part[end+1:]
+				if strings.HasPrefix(rest, ":") {
+					if p, err := strconv.Atoi(rest[1:]); err == nil {
+						j.Port = p
+					}
+				}
+				jumps = append(jumps, j)
+				continue
 			}
 		}
+		// 尝试按 host:port 解析（含 IPv6 裸地址带端口的情况需区分）
+		if h, pStr, err := net.SplitHostPort(part); err == nil {
+			j.Host = h
+			if p, err := strconv.Atoi(pStr); err == nil {
+				j.Port = p
+			}
+			jumps = append(jumps, j)
+			continue
+		}
+		// 无端口或解析失败（裸 IPv6/普通主机名），整体作为 host
+		j.Host = part
 		jumps = append(jumps, j)
 	}
 	return jumps

@@ -239,6 +239,8 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 			m.err = fmt.Sprintf("读取目录失败: %v", msg.err)
 			return m, nil
 		}
+		// 成功刷新后清除旧错误提示（避免常驻遮挡），状态提示保留
+		m.err = ""
 		if msg.kind == paneRemote {
 			if msg.path == m.cwd {
 				m.entries = msg.entries
@@ -261,6 +263,7 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 	case sftpMsgText:
 		if msg.ok {
 			m.status = msg.text
+			m.err = ""
 		} else {
 			m.err = msg.text
 		}
@@ -363,10 +366,14 @@ func (m *sftpModel) ensureVisible(top *int, cursor int) {
 // + footer1 + 上下 padding2，必须恰为终端高度，footer 才能固定在最后一行。
 // 动态行（确认/输入/状态等）存在时列表区相应压缩。
 func (m *sftpModel) bodyHeight() int {
+	return m.bodyHeightWith(len(m.dynamicLines()))
+}
+
+func (m *sftpModel) bodyHeightWith(dynLen int) int {
 	if m.height <= 0 {
 		return 0 // 未知尺寸：显示全部
 	}
-	body := m.height - 6 - len(m.dynamicLines())
+	body := m.height - 6 - dynLen
 	if body < 1 {
 		body = 1
 	}
@@ -1257,6 +1264,7 @@ func (m *sftpModel) View() tea.View {
 	}
 
 	dyn := m.dynamicLines()
+	body := m.bodyHeightWith(len(dyn))
 
 	// 标题行：焦点栏高亮（对纯文本截断后再上色，避免 runewidth 破坏 ANSI 序列）。
 	// 宽度用 paneW+1 与列表行（含右侧滚动箭头位）对齐。
@@ -1267,9 +1275,9 @@ func (m *sftpModel) View() tea.View {
 
 	// 两栏列表：左右并排，各自滚动；行数补平（含箭头位 paneW+1）保证左右逐行对齐
 	sep := styleDim.Render(" │ ")
-	left := m.paneRows(paneLocal, paneW)
-	right := m.paneRows(paneRemote, paneW)
-	n := 2 + m.bodyHeight()
+	left := m.paneRowsWithBody(paneLocal, paneW, body)
+	right := m.paneRowsWithBody(paneRemote, paneW, body)
+	n := 2 + body
 	if len(left) > n {
 		n = len(left)
 	}
@@ -1291,12 +1299,13 @@ func (m *sftpModel) View() tea.View {
 	for _, l := range dyn {
 		b.WriteString(l + "\n")
 	}
-	if m.err != "" {
-		m.err = "" // 渲染后清空（dynamicLines 已包含错误行）
-	}
 	// 单行 footer（不用带边框的 styleFooter：边框渲染 3 行会打乱行数计算）
 	b.WriteString(styleDim.Render(renderSFTPFooter()))
-	return tea.NewView(lipgloss.NewStyle().Padding(1, 2).Render(b.String()))
+	v := tea.NewView(lipgloss.NewStyle().Padding(1, 2).Render(b.String()))
+	// View 不再直接 mutate 模型：错误行通过 dynamicLines 展示一次后，
+	// 由调用方在下一轮 Update 中通过 sftpMsgText/status 覆盖或显式清除。
+	// 保留 m.err 供下一次 View 仍能与 bodyHeight 计算一致，避免高度抖动。
+	return v
 }
 
 // dynamicLines 生成列表区与 footer 之间的动态区块行（删除确认/输入模式/多选/状态/错误等），
@@ -1417,6 +1426,10 @@ func computePaneLayout(width int) paneLayout {
 // 每行末尾追加 1 宽滚动箭头位：表头行在可向上滚动（top>0）时显示 ▴，
 // 最后可见行在可向下滚动（top+body<len(entries)）时显示 ▾。
 func (m *sftpModel) paneRows(kind, width int) []string {
+	return m.paneRowsWithBody(kind, width, m.bodyHeight())
+}
+
+func (m *sftpModel) paneRowsWithBody(kind, width, body int) []string {
 	var entries []fs.FileInfo
 	var cursor, top int
 	if kind == paneLocal {
@@ -1444,7 +1457,6 @@ func (m *sftpModel) paneRows(kind, width int) []string {
 	rows = append(rows, header+scrollArrow(top > 0, "▴"))
 	rows = append(rows, styleDim.Render(strings.Repeat("─", width))+" ")
 
-	body := m.bodyHeight()
 	start, end := 0, len(entries)
 	if body > 0 && end > body {
 		start, end = top, top+body

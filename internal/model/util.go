@@ -1,7 +1,10 @@
 package model
 
-import "strconv"
+import (
+	"net"
+	"strconv"
+)
 
 func joinHostPort(host string, port int) string {
-	return host + ":" + strconv.Itoa(port)
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }

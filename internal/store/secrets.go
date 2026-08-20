@@ -42,12 +42,36 @@ func (s keyringSecrets) Delete(key string) error {
 
 // fileSecrets 本地文件兜底后端（权限 0600），在无系统 keyring 时使用。
 // 每次 Get/Set/Delete 均从磁盘重读最新内容（不做内存缓存），
-// 配合 store 层文件锁与原子写，保证多实例并发安全。
+// 配合独立文件锁（secrets.lock）与原子写，保证多实例并发安全。
 type fileSecrets struct {
-	path string
+	path     string
+	lockPath string
+}
+
+func (s *fileSecrets) lockPathOrDefault() string {
+	if s.lockPath != "" {
+		return s.lockPath
+	}
+	if s.path != "" {
+		return s.path + ".lock"
+	}
+	return ""
 }
 
 func (s *fileSecrets) Get(key string) (string, bool, error) {
+	if lp := s.lockPathOrDefault(); lp != "" {
+		l, err := acquireLock(lp, true)
+		if err != nil {
+			return "", false, err
+		}
+		defer l.release()
+		data, err := s.load()
+		if err != nil {
+			return "", false, err
+		}
+		v, ok := data[key]
+		return v, ok, nil
+	}
 	data, err := s.load()
 	if err != nil {
 		return "", false, err
@@ -57,6 +81,19 @@ func (s *fileSecrets) Get(key string) (string, bool, error) {
 }
 
 func (s *fileSecrets) Set(key, value string) error {
+	if lp := s.lockPathOrDefault(); lp != "" {
+		l, err := acquireLock(lp, false)
+		if err != nil {
+			return err
+		}
+		defer l.release()
+		data, err := s.load()
+		if err != nil {
+			return err
+		}
+		data[key] = value
+		return s.save(data)
+	}
 	data, err := s.load()
 	if err != nil {
 		return err
@@ -66,6 +103,19 @@ func (s *fileSecrets) Set(key, value string) error {
 }
 
 func (s *fileSecrets) Delete(key string) error {
+	if lp := s.lockPathOrDefault(); lp != "" {
+		l, err := acquireLock(lp, false)
+		if err != nil {
+			return err
+		}
+		defer l.release()
+		data, err := s.load()
+		if err != nil {
+			return err
+		}
+		delete(data, key)
+		return s.save(data)
+	}
 	data, err := s.load()
 	if err != nil {
 		return err
@@ -109,7 +159,7 @@ func (s *fileSecrets) save(data map[string]string) error {
 // newSecrets 探测系统 keyring 是否可用，不可用则降级为本地文件
 func newSecrets(dir string) Secrets {
 	if _, err := keyring.Get(keyringService, "__probe__"); err != nil && !errors.Is(err, keyring.ErrNotFound) {
-		return &fileSecrets{path: filepath.Join(dir, "secrets.json")}
+		return &fileSecrets{path: filepath.Join(dir, "secrets.json"), lockPath: filepath.Join(dir, "secrets.lock")}
 	}
 	return keyringSecrets{}
 }
