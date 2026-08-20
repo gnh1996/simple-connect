@@ -30,13 +30,13 @@ simple-connect 定位为**单连接管理**工具：
 
 ```bash
 # 从 GitHub Releases 下载预编译二进制（无需 Go 工具链）
-curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -- --release
+curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -s -- --release
 
 # 或指定版本
-curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -- --release v0.1.3
+curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -s -- --release v0.1.3
 
 # 自定义安装目录
-INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -- --release
+INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -s -- --release
 ```
 
 **Windows**（PowerShell）
