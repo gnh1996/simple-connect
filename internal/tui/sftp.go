@@ -317,13 +317,15 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 		return m, nil
 
 	case sftpOverwriteCheckMsg:
+		if msg.pending == nil || msg.pending.seq != m.overwriteSeq {
+			// 过期结果（用户已取消或发起了新的检测）：丢弃，不执行任何传输，
+			// 也不得触碰当前状态（可能有新一轮检测仍在途，误清 busy/checkingOverwrite
+			// 会解除输入屏蔽并丢失"正在检测"提示）
+			return m, nil
+		}
 		m.checkingOverwrite = false
 		m.busy = false
 		m.status = ""
-		if msg.pending == nil || msg.pending.seq != m.overwriteSeq {
-			// 过期结果（用户已取消或发起了新的检测）：丢弃，不执行任何传输
-			return m, nil
-		}
 		if msg.err != nil {
 			m.err = fmt.Sprintf("检测覆盖失败: %v", msg.err)
 			return m, nil

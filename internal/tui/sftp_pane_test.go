@@ -1017,6 +1017,80 @@ func TestSFTPOverwriteCancelStaleMsg(t *testing.T) {
 	}
 }
 
+// TestSFTPOverwriteStaleMsgKeepsNewCheck 过期检测结果不得误清新一轮检测的状态：
+// 取消 A 后立即发起 B，A 的迟到消息到达时 B 仍应处于"检测中"（busy/checking 保持，
+// 提示不消失），B 的真实结果随后正常生效。
+func TestSFTPOverwriteStaleMsgKeepsNewCheck(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+	m.cwd = env.Root
+	m.focus = paneLocal
+
+	// 本地两个文件
+	for _, name := range []string{"a.txt", "b.txt"} {
+		if err := os.WriteFile(filepath.Join(m.localCwd, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lm := m.loadLocal()
+	next, _ := m.Update(lm())
+	setCursorTo := func(mm *sftpModel, name string) {
+		for i, e := range mm.localEntries {
+			if e.Name() == name {
+				mm.localCursor = i
+			}
+		}
+	}
+
+	// 发起 A 的覆盖检测
+	setCursorTo(next, "a.txt")
+	next, cmdA := next.enterCurrent()
+	if cmdA == nil {
+		t.Fatal("应触发 A 的覆盖检测命令")
+	}
+	// 检测期间 Esc 取消（seq 自增）
+	next, _ = next.handleKey(pressKey(tea.KeyEsc).(tea.KeyPressMsg))
+	// 立即发起 B 的覆盖检测（seq 再自增）
+	setCursorTo(next, "b.txt")
+	next, cmdB := next.enterCurrent()
+	if cmdB == nil {
+		t.Fatal("应触发 B 的覆盖检测命令")
+	}
+	if !next.checkingOverwrite || !next.busy {
+		t.Fatal("B 检测期间应处于 busy/checking 状态")
+	}
+
+	// A 的迟到结果到达：必须整体丢弃，不得触碰 B 的状态
+	owA := cmdA().(sftpOverwriteCheckMsg)
+	next, _ = next.Update(owA)
+	if !next.checkingOverwrite || !next.busy {
+		t.Fatal("过期消息不得清除新一轮检测的 busy/checking 状态")
+	}
+	if next.confirmOverwrite || next.transfer != nil {
+		t.Fatal("过期消息不得进入确认态或启动传输")
+	}
+
+	// B 的真实结果正常生效
+	owB := cmdB().(sftpOverwriteCheckMsg)
+	if owB.err != nil {
+		t.Fatalf("B 覆盖检测失败: %v", owB.err)
+	}
+	var start tea.Cmd
+	next, start = next.Update(owB)
+	if next.checkingOverwrite {
+		t.Fatal("收到匹配结果后应退出检测中状态")
+	}
+	if start == nil {
+		t.Fatal("无冲突时 B 应直接启动传输")
+	}
+	next = driveProgress(t, next, start)
+	if b, err := os.ReadFile(filepath.Join(env.Root, "b.txt")); err != nil || string(b) != "b.txt" {
+		t.Fatalf("b.txt 应上传成功，实际 %q err=%v", string(b), err)
+	}
+}
+
 // TestSFTPOverwriteNoPrompt 无冲突时不提示直接传输
 func TestSFTPOverwriteNoPrompt(t *testing.T) {
 	env := testutil.StartSFTP(t)
