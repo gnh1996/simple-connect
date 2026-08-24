@@ -74,6 +74,22 @@ type sftpGotoJumpMsg struct {
 	err     error
 }
 
+// sftpOverwriteCheckMsg 覆盖检测结果
+type sftpOverwriteCheckMsg struct {
+	conflicts []string
+	pending   *pendingTransfer
+	err       error
+}
+
+// pendingTransfer 待执行的传输（覆盖确认后执行）
+type pendingTransfer struct {
+	up    bool
+	src   string
+	dst   string
+	items []sftpc.BatchItem
+	seq   int // 发起时的检测代数号，收到结果时比对，不匹配则丢弃
+}
+
 // sftpModel 双栏（本地 | 远程）文件浏览/传输模型。
 // 远程栏：cwd/entries/cursor/confirmID（字段名向后兼容测试）；
 // 本地栏：localCwd/localEntries/localCursor/localConfirmID。
@@ -135,6 +151,16 @@ type sftpModel struct {
 	status   string
 	err      string
 	busy     bool
+
+	// 覆盖确认
+	confirmOverwrite   bool
+	overwriteConflicts []string
+	pendingOverwrite   *pendingTransfer
+	checkingOverwrite  bool
+
+	// overwriteSeq 覆盖检测代数号：取消或发起新检测时自增，
+	// 迟到的旧检测结果（seq 不匹配）直接丢弃，防止「Esc 取消后仍触发传输」。
+	overwriteSeq int
 
 	width  int // 终端尺寸（WindowSizeMsg）
 	height int
@@ -288,6 +314,28 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 		m.busy = false
 		m.mode = modeBrowse
 		m.clearGotoCandidates()
+		return m, nil
+
+	case sftpOverwriteCheckMsg:
+		m.checkingOverwrite = false
+		m.busy = false
+		m.status = ""
+		if msg.pending == nil || msg.pending.seq != m.overwriteSeq {
+			// 过期结果（用户已取消或发起了新的检测）：丢弃，不执行任何传输
+			return m, nil
+		}
+		if msg.err != nil {
+			m.err = fmt.Sprintf("检测覆盖失败: %v", msg.err)
+			return m, nil
+		}
+		if len(msg.conflicts) == 0 {
+			// 无冲突，直接执行
+			return m, m.executePendingTransfer(msg.pending)
+		}
+		// 有冲突，进入确认态
+		m.confirmOverwrite = true
+		m.overwriteConflicts = msg.conflicts
+		m.pendingOverwrite = msg.pending
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -496,15 +544,15 @@ func (m *sftpModel) mkdir(name string) tea.Cmd {
 	}
 }
 
-// uploadEntry 上传本地文件到远程栏当前目录
+// uploadEntry 上传本地文件到远程栏当前目录（带覆盖检测）
 func (m *sftpModel) uploadEntry(localPath string) tea.Cmd {
 	remote := path.Join(m.cwd, filepath.Base(localPath))
-	return m.startTransfer(localPath, remote, true)
+	return m.requestTransfer(localPath, remote, true)
 }
 
-// downloadEntry 下载远程条目到本地栏当前目录（目录递归）
+// downloadEntry 下载远程条目到本地栏当前目录（目录递归，带覆盖检测）
 func (m *sftpModel) downloadEntry(e fs.FileInfo) (*sftpModel, tea.Cmd) {
-	if m.busy {
+	if m.busy || m.checkingOverwrite {
 		return m, nil
 	}
 	if err := os.MkdirAll(m.localCwd, 0o755); err != nil {
@@ -513,42 +561,11 @@ func (m *sftpModel) downloadEntry(e fs.FileInfo) (*sftpModel, tea.Cmd) {
 	}
 	remote := path.Join(m.cwd, e.Name())
 	local := filepath.Join(m.localCwd, e.Name())
-	if e.IsDir() {
-		return m, m.startPathTransfer(remote, local, false)
-	}
-	return m, m.startTransfer(remote, local, false)
+	return m, m.requestTransfer(remote, local, false)
 }
 
-func (m *sftpModel) startUpload(localPath string) tea.Cmd {
-	remote := path.Join(m.cwd, filepath.Base(localPath))
-	return m.startTransfer(localPath, remote, true)
-}
-
-// startUploadPath 上传本地文件或目录（目录递归）到远程栏当前目录
-func (m *sftpModel) startUploadPath(localPath string) tea.Cmd {
-	remote := path.Join(m.cwd, filepath.Base(localPath))
-	return m.startPathTransfer(localPath, remote, true)
-}
-
-// startBatch 批量传输：有选中项时本地栏=上传、远程栏=下载（文件夹递归）
-func (m *sftpModel) startBatch(up bool) (*sftpModel, tea.Cmd) {
-	items := m.collectBatchItems(up)
-	if len(items) == 0 {
-		return m, nil
-	}
-	t := sftpc.NewTransfer(fmt.Sprintf("%d 项", len(items)), up)
-	m.transfer = t
-	m.busy = true
-	m.status = ""
-	m.confirmBatch = false
-	m.clearSel()
-
-	cl := m.conn.Client
-	go sftpc.BatchTransfer(cl, t, up, items)
-	return m, tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
-		return sftpProgressMsg{}
-	})
-}
+// startUpload / startUploadPath / startBatch 已移除：
+// 上传/下载统一经 requestTransfer/requestBatch 做覆盖检测后由 executePendingTransfer 执行。
 
 // collectBatchItems 收集焦点栏全部选中条目为批量传输项
 func (m *sftpModel) collectBatchItems(up bool) []sftpc.BatchItem {
@@ -701,41 +718,8 @@ func (m *sftpModel) doBatchDelete() (*sftpModel, tea.Cmd) {
 	})
 }
 
-// startPathTransfer 异步传输单个文件或目录（递归），进度走同一轮询
-func (m *sftpModel) startPathTransfer(src, dst string, up bool) tea.Cmd {
-	t := sftpc.NewTransfer(filepath.Base(src), up)
-	m.transfer = t
-	m.busy = true
-	m.status = ""
-
-	cl := m.conn.Client
-	if up {
-		go sftpc.UploadPath(cl, t, src, dst)
-	} else {
-		go sftpc.DownloadPath(cl, t, src, dst)
-	}
-	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
-		return sftpProgressMsg{}
-	})
-}
-
-// startTransfer 异步执行传输并返回进度命令
-func (m *sftpModel) startTransfer(src, dst string, up bool) tea.Cmd {
-	t := sftpc.NewTransfer(filepath.Base(dst), up)
-	m.transfer = t
-	m.busy = true
-	m.status = ""
-
-	cl := m.conn.Client
-	if up {
-		go sftpc.Upload(cl, t, src, dst)
-	} else {
-		go sftpc.Download(cl, t, src, dst)
-	}
-	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
-		return sftpProgressMsg{}
-	})
-}
+// startPathTransfer / startTransfer 已移除：传输统一走 requestTransfer（覆盖检测）
+// → executePendingTransfer 路径，避免绕过检测的旧入口。
 
 func (m *sftpModel) handleProgress() (*sftpModel, tea.Cmd) {
 	if m.transfer == nil {
@@ -767,6 +751,127 @@ func transferName(up bool) string {
 		return "上传"
 	}
 	return "下载"
+}
+
+// ---- 覆盖检测与确认 ----
+
+func (m *sftpModel) checkOverwriteCmd(pending *pendingTransfer) tea.Cmd {
+	cl := m.conn.Client
+	// 无连接时直接报错（理论上不会触发）
+	if cl == nil {
+		return func() tea.Msg {
+			return sftpOverwriteCheckMsg{pending: pending, err: fmt.Errorf("未连接")}
+		}
+	}
+	return func() tea.Msg {
+		var conflicts []string
+		var err error
+		if len(pending.items) > 0 {
+			conflicts, err = sftpc.BatchConflicts(cl, pending.up, pending.items)
+		} else if pending.up {
+			conflicts, err = sftpc.UploadConflicts(cl, pending.src, pending.dst)
+		} else {
+			conflicts, err = sftpc.DownloadConflicts(cl, pending.src, pending.dst)
+		}
+		return sftpOverwriteCheckMsg{conflicts: conflicts, pending: pending, err: err}
+	}
+}
+
+func (m *sftpModel) executePendingTransfer(pending *pendingTransfer) tea.Cmd {
+	if pending == nil {
+		return nil
+	}
+	if len(pending.items) > 0 {
+		t := sftpc.NewTransfer(fmt.Sprintf("%d 项", len(pending.items)), pending.up)
+		m.transfer = t
+		m.busy = true
+		m.status = ""
+		m.confirmBatch = false
+		m.clearSel()
+		cl := m.conn.Client
+		go sftpc.BatchTransfer(cl, t, pending.up, pending.items)
+		return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+			return sftpProgressMsg{}
+		})
+	}
+	// 单个路径：统一走 Path 变体（兼容文件与目录，自动判断 IsDir）
+	t := sftpc.NewTransfer(filepath.Base(pending.src), pending.up)
+	m.transfer = t
+	m.busy = true
+	m.status = ""
+	cl := m.conn.Client
+	if pending.up {
+		go sftpc.UploadPath(cl, t, pending.src, pending.dst)
+	} else {
+		go sftpc.DownloadPath(cl, t, pending.src, pending.dst)
+	}
+	return tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+		return sftpProgressMsg{}
+	})
+}
+
+func (m *sftpModel) requestTransfer(src, dst string, up bool) tea.Cmd {
+	if m.busy || m.checkingOverwrite {
+		return nil
+	}
+	m.overwriteSeq++
+	m.checkingOverwrite = true
+	m.busy = true
+	m.status = ""
+	m.err = ""
+	pending := &pendingTransfer{up: up, src: src, dst: dst, seq: m.overwriteSeq}
+	return m.checkOverwriteCmd(pending)
+}
+
+func (m *sftpModel) requestBatch(up bool) (*sftpModel, tea.Cmd) {
+	if m.busy || m.checkingOverwrite {
+		return m, nil
+	}
+	items := m.collectBatchItems(up)
+	if len(items) == 0 {
+		return m, nil
+	}
+	m.overwriteSeq++
+	m.checkingOverwrite = true
+	m.busy = true
+	m.status = ""
+	m.err = ""
+	pending := &pendingTransfer{up: up, items: items, seq: m.overwriteSeq}
+	return m, m.checkOverwriteCmd(pending)
+}
+
+func (m *sftpModel) overwritePrompt() string {
+	n := len(m.overwriteConflicts)
+	if n == 0 {
+		return ""
+	}
+	// 展示前 3 个冲突路径，其余用"等"概括
+	show := n
+	if show > 3 {
+		show = 3
+	}
+	names := make([]string, 0, show)
+	for i := 0; i < show; i++ {
+		names = append(names, conflictBase(m.overwriteConflicts[i], m.pendingOverwrite != nil && m.pendingOverwrite.up))
+	}
+	list := strings.Join(names, "、")
+	if n > 3 {
+		list += fmt.Sprintf(" 等 %d 项", n)
+	}
+	action := "下载"
+	if m.pendingOverwrite != nil && m.pendingOverwrite.up {
+		action = "上传"
+	}
+	return fmt.Sprintf("目标已存在 %s，%s将覆盖 %s，是否继续？ (y/N)", list, action, list)
+}
+
+// conflictBase 按传输方向取冲突路径的文件名：
+// 上传的冲突是远程路径（/ 分隔用 path.Base），下载的冲突是本地路径（平台分隔符用 filepath.Base）。
+func conflictBase(p string, up bool) string {
+	if up {
+		return path.Base(p)
+	}
+	return filepath.Base(p)
 }
 
 func (m *sftpModel) doDelete() (*sftpModel, tea.Cmd) {
@@ -844,6 +949,42 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 		return m, nil
 	}
 
+	// 覆盖确认（上传/下载目标已存在）
+	if m.confirmOverwrite {
+		switch {
+		case k.Code == tea.KeyEnter:
+			fallthrough
+		case k.Text == "y" || k.Text == "Y":
+			pending := m.pendingOverwrite
+			m.confirmOverwrite = false
+			m.overwriteConflicts = nil
+			m.pendingOverwrite = nil
+			m.busy = false
+			m.checkingOverwrite = false
+			return m, m.executePendingTransfer(pending)
+		case k.Code == tea.KeyEsc || k.Text == "n" || k.Text == "N" || k.Text == "q":
+			m.confirmOverwrite = false
+			m.overwriteConflicts = nil
+			m.pendingOverwrite = nil
+			m.busy = false
+			m.checkingOverwrite = false
+			m.status = "已取消"
+			return m, nil
+		}
+		return m, nil
+	}
+	if m.checkingOverwrite {
+		// 检测期间忽略除 Esc 取消外的输入
+		if k.Code == tea.KeyEsc {
+			m.overwriteSeq++ // 使在途检测结果作废（迟到消息将被丢弃）
+			m.checkingOverwrite = false
+			m.busy = false
+			m.status = "已取消"
+			return m, nil
+		}
+		return m, nil
+	}
+
 	// 确认删除（当前焦点栏，单个或批量）
 	singleConfirm := (m.focus == paneLocal && m.localConfirmID >= 0) ||
 		(m.focus == paneRemote && m.confirmID >= 0)
@@ -885,10 +1026,12 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 				return m, nil
 			} else if !st.IsDir() {
 				m.mode = modeBrowse
-				return m, m.startUpload(abs)
+				remote := path.Join(m.cwd, filepath.Base(abs))
+				return m, m.requestTransfer(abs, remote, true)
 			} else {
 				m.mode = modeBrowse
-				return m, m.startUploadPath(abs)
+				remote := path.Join(m.cwd, filepath.Base(abs))
+				return m, m.requestTransfer(abs, remote, true)
 			}
 		}
 		in, cmd := m.uploadIn.Update(msg)
@@ -967,7 +1110,7 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 		}
 	case tea.KeyEnter:
 		if m.hasSel() {
-			return m.startBatch(m.focus == paneLocal)
+			return m.requestBatch(m.focus == paneLocal)
 		}
 		return m.enterCurrent()
 	case tea.KeyBackspace:
@@ -1318,6 +1461,13 @@ func (m *sftpModel) dynamicLines() []string {
 		lines = append(lines, styleInfo.Render(fmt.Sprintf(
 			"首次连接 %s，指纹 %s 未确认，信任并继续？ (y/N)",
 			m.pendingKey.Hostname, m.pendingKey.Fingerprint)))
+	}
+
+	// 覆盖确认（上传/下载目标已存在）
+	if m.confirmOverwrite {
+		lines = append(lines, styleInfo.Render(m.overwritePrompt()))
+	} else if m.checkingOverwrite {
+		lines = append(lines, styleInfo.Render("正在检测是否覆盖..."))
 	}
 
 	// 删除确认（单个或批量）

@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -518,6 +519,144 @@ func posixRel(base, target string) (string, error) {
 		return "", err
 	}
 	return filepath.ToSlash(rel), nil
+}
+
+// UploadConflicts 检测上传本地路径到远程路径是否会覆盖已存在文件。
+// 若 localPath 为文件：检查 remotePath 是否已存在；
+// 若为目录：递归检查目录内每个普通文件对应的远程路径是否已存在（目录本身已存在不算冲突，仅文件覆盖算）。
+// 返回冲突的远程路径列表（可能为空），异常时返回 error。
+func UploadConflicts(cl *sftp.Client, localPath, remotePath string) ([]string, error) {
+	st, err := os.Stat(localPath)
+	if err != nil {
+		return nil, err
+	}
+	if !st.IsDir() {
+		if _, err := cl.Stat(remotePath); err == nil {
+			return []string{remotePath}, nil
+		} else if !isNotExist(err) {
+			return nil, err
+		}
+		return nil, nil
+	}
+	// 目录：检查目标类型冲突（远程已存在且为文件）
+	if rst, err := cl.Stat(remotePath); err == nil {
+		if !rst.IsDir() {
+			return []string{remotePath}, nil
+		}
+	} else if !isNotExist(err) {
+		return nil, err
+	}
+	var conflicts []string
+	err = filepath.WalkDir(localPath, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		rel, err := filepath.Rel(localPath, p)
+		if err != nil {
+			return err
+		}
+		remote := path.Join(remotePath, filepath.ToSlash(rel))
+		if _, err := cl.Stat(remote); err == nil {
+			conflicts = append(conflicts, remote)
+		} else if !isNotExist(err) {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return conflicts, nil
+}
+
+// DownloadConflicts 检测下载远程路径到本地路径是否会覆盖已存在文件。
+func DownloadConflicts(cl *sftp.Client, remotePath, localPath string) ([]string, error) {
+	st, err := cl.Stat(remotePath)
+	if err != nil {
+		return nil, err
+	}
+	if !st.IsDir() {
+		if _, err := os.Stat(localPath); err == nil {
+			return []string{localPath}, nil
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
+		return nil, nil
+	}
+	// 目录：检查目标类型冲突（本地已存在且为文件）
+	if lst, err := os.Stat(localPath); err == nil {
+		if !lst.IsDir() {
+			return []string{localPath}, nil
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	var conflicts []string
+	walker := cl.Walk(remotePath)
+	for walker.Step() {
+		if walker.Err() != nil {
+			return nil, walker.Err()
+		}
+		if walker.Stat().IsDir() {
+			continue
+		}
+		p := walker.Path()
+		rel, err := posixRel(remotePath, p)
+		if err != nil {
+			return nil, err
+		}
+		local := localPath
+		if rel != "." {
+			local = filepath.Join(localPath, filepath.FromSlash(rel))
+		}
+		if _, err := os.Stat(local); err == nil {
+			conflicts = append(conflicts, local)
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
+	return conflicts, nil
+}
+
+// BatchConflicts 批量检测覆盖冲突（up=true 为上传，false 为下载）
+func BatchConflicts(cl *sftp.Client, up bool, items []BatchItem) ([]string, error) {
+	var all []string
+	for _, it := range items {
+		var cur []string
+		var err error
+		if up {
+			cur, err = UploadConflicts(cl, it.Src, it.Dst)
+		} else {
+			cur, err = DownloadConflicts(cl, it.Src, it.Dst)
+		}
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, cur...)
+	}
+	return all, nil
+}
+
+func isNotExist(err error) bool {
+	if err == nil {
+		return false
+	}
+	if os.IsNotExist(err) {
+		return true
+	}
+	// pkg/sftp 返回 *StatusError，按 SFTP 状态码（SSH_FX_NO_SUCH_FILE）结构化判断，
+	// 不依赖错误文案匹配（服务端实现/版本差异会导致文案不稳定）
+	var se *sftp.StatusError
+	if errors.As(err, &se) {
+		return se.FxCode() == sftp.ErrSSHFxNoSuchFile
+	}
+	return false
 }
 
 // FormatSize 人类可读的文件大小

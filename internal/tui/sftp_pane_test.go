@@ -93,6 +93,31 @@ func TestSFTPLocalNavigation(t *testing.T) {
 	}
 }
 
+// driveWithOverwriteCheck 处理带覆盖检测的传输命令：先执行覆盖检测，
+// 无冲突时自动进入传输进度，返回完成后的模型
+func driveWithOverwriteCheck(t *testing.T, m *sftpModel, cmd tea.Cmd) *sftpModel {
+	t.Helper()
+	if cmd == nil {
+		t.Fatal("传输命令不应为 nil")
+	}
+	msg := cmd()
+	if ow, ok := msg.(sftpOverwriteCheckMsg); ok {
+		if ow.err != nil {
+			t.Fatalf("覆盖检测失败: %v", ow.err)
+		}
+		if len(ow.conflicts) != 0 {
+			t.Fatalf("不应有覆盖冲突，实际 %v", ow.conflicts)
+		}
+		m2, start := m.Update(ow)
+		if start == nil {
+			t.Fatal("无冲突时应直接启动传输")
+		}
+		return driveProgress(t, m2, start)
+	}
+	// 兼容直接返回进度命令的路径（无覆盖检测的旧式调用）
+	return driveProgress(t, m, cmd)
+}
+
 // TestSFTPLocalEnterUpload 焦点本地栏对文件 Enter → 上传到远程栏当前目录
 func TestSFTPLocalEnterUpload(t *testing.T) {
 	env := testutil.StartSFTP(t)
@@ -124,7 +149,7 @@ func TestSFTPLocalEnterUpload(t *testing.T) {
 	if start == nil {
 		t.Fatal("本地栏对文件 Enter 应触发上传命令")
 	}
-	m = driveProgress(t, next, start)
+	m = driveWithOverwriteCheck(t, next, start)
 
 	// 校验远程出现文件
 	if b, err := os.ReadFile(filepath.Join(env.Root, "pane-src.bin")); err != nil || string(b) != string(content) {
@@ -226,7 +251,7 @@ func TestSFTPRemoteEnterDownload(t *testing.T) {
 	if start == nil {
 		t.Fatal("远程栏对文件 Enter 应触发下载命令")
 	}
-	m = driveProgress(t, next, start)
+	m = driveWithOverwriteCheck(t, next, start)
 
 	if b, err := os.ReadFile(filepath.Join(m.localCwd, "dl.bin")); err != nil || string(b) != "download-me" {
 		t.Fatalf("下载校验失败: %v", err)
@@ -460,11 +485,11 @@ func TestSFTPMultiSelectBatchUpload(t *testing.T) {
 		t.Fatalf("应选中 2 项，实际 %d", next.selCount())
 	}
 
-	next, start := next.startBatch(true)
+	next, start := next.requestBatch(true)
 	if start == nil {
-		t.Fatal("批量上传应产生进度命令")
+		t.Fatal("批量上传应产生覆盖检测命令")
 	}
-	next = driveProgress(t, next, start)
+	next = driveWithOverwriteCheck(t, next, start)
 	if next.err != "" {
 		t.Fatalf("批量上传失败: %s", next.err)
 	}
@@ -495,11 +520,11 @@ func TestSFTPMultiSelectBatchDownload(t *testing.T) {
 	next.selRemote[indexOfName(next.entries, "r1.txt")] = struct{}{}
 	next.selRemote[indexOfName(next.entries, "rdir")] = struct{}{}
 
-	next, start := next.startBatch(false)
+	next, start := next.requestBatch(false)
 	if start == nil {
-		t.Fatal("批量下载应产生进度命令")
+		t.Fatal("批量下载应产生覆盖检测命令")
 	}
-	next = driveProgress(t, next, start)
+	next = driveWithOverwriteCheck(t, next, start)
 	if next.err != "" {
 		t.Fatalf("批量下载失败: %s", next.err)
 	}
@@ -710,5 +735,322 @@ func checkDisk(t *testing.T, p, want string) {
 	b, err := os.ReadFile(p)
 	if err != nil || string(b) != want {
 		t.Fatalf("文件 %s 校验失败: err=%v", p, err)
+	}
+}
+
+// TestSFTPOverwriteUpload 单文件上传覆盖检测：目标已存在时进入确认态，y 覆盖、n/esc 取消
+func TestSFTPOverwriteUpload(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+	m.cwd = env.Root
+	m.focus = paneLocal
+
+	// 远程已存在同名文件
+	if err := os.WriteFile(filepath.Join(env.Root, "dup.txt"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 本地新内容
+	src := filepath.Join(m.localCwd, "dup.txt")
+	if err := os.WriteFile(src, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 本地栏刷新选中 dup.txt，Enter 上传应触发覆盖检测而非直接传输
+	lm := m.loadLocal()
+	next, _ := m.Update(lm())
+	for i, e := range next.localEntries {
+		if e.Name() == "dup.txt" {
+			next.localCursor = i
+		}
+	}
+	next, cmd := next.enterCurrent()
+	if cmd == nil {
+		t.Fatal("应触发覆盖检测命令")
+	}
+	ow := cmd().(sftpOverwriteCheckMsg)
+	if ow.err != nil {
+		t.Fatalf("覆盖检测失败: %v", ow.err)
+	}
+	if len(ow.conflicts) == 0 {
+		t.Fatal("应检测到覆盖冲突")
+	}
+	next, _ = next.Update(ow)
+	if !next.confirmOverwrite {
+		t.Fatal("应进入覆盖确认态")
+	}
+	if !strings.Contains(next.View().Content, "目标已存在") {
+		t.Fatalf("应显示覆盖提示，实际 %q", next.View().Content)
+	}
+	// y 确认覆盖
+	next, start := next.handleKey(press("y").(tea.KeyPressMsg))
+	if start == nil {
+		t.Fatal("确认后应启动传输")
+	}
+	next = driveProgress(t, next, start)
+	if b, err := os.ReadFile(filepath.Join(env.Root, "dup.txt")); err != nil || string(b) != "new" {
+		t.Fatalf("覆盖后远程内容应为 new，实际 %q err=%v", string(b), err)
+	}
+}
+
+// TestSFTPOverwriteUploadCancel 上传覆盖取消：n 应取消，不覆盖
+func TestSFTPOverwriteUploadCancel(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+	m.cwd = env.Root
+	m.focus = paneLocal
+
+	if err := os.WriteFile(filepath.Join(env.Root, "keep.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(m.localCwd, "keep.txt")
+	if err := os.WriteFile(src, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lm := m.loadLocal()
+	next, _ := m.Update(lm())
+	for i, e := range next.localEntries {
+		if e.Name() == "keep.txt" {
+			next.localCursor = i
+		}
+	}
+	next, cmd := next.enterCurrent()
+	ow := cmd().(sftpOverwriteCheckMsg)
+	next, _ = next.Update(ow)
+	// n 取消
+	next, _ = next.handleKey(press("n").(tea.KeyPressMsg))
+	if next.confirmOverwrite {
+		t.Fatal("取消后应退出覆盖确认态")
+	}
+	if next.transfer != nil {
+		t.Fatal("取消后不应启动传输")
+	}
+	if b, err := os.ReadFile(filepath.Join(env.Root, "keep.txt")); err != nil || string(b) != "keep" {
+		t.Fatalf("取消后远程应保持原内容 keep，实际 %q", string(b))
+	}
+	// Esc 同理取消（再次触发覆盖）
+	next, cmd = next.enterCurrent()
+	ow = cmd().(sftpOverwriteCheckMsg)
+	next, _ = next.Update(ow)
+	next, _ = next.handleKey(pressKey(tea.KeyEsc).(tea.KeyPressMsg))
+	if next.confirmOverwrite {
+		t.Fatal("Esc 后应退出覆盖确认态")
+	}
+}
+
+// TestSFTPOverwriteDownload 下载覆盖检测
+func TestSFTPOverwriteDownload(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+	m.cwd = env.Root
+
+	// 远程文件
+	if err := os.WriteFile(filepath.Join(env.Root, "down.txt"), []byte("remote"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 本地已存在同名文件
+	if err := os.WriteFile(filepath.Join(m.localCwd, "down.txt"), []byte("local"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 刷新远程列表并 Enter 下载
+	m.entries = nil
+	rl := m.loadList()
+	next, _ := m.Update(rl())
+	for i, e := range next.entries {
+		if e.Name() == "down.txt" {
+			next.cursor = i
+		}
+	}
+	next, cmd := next.enterCurrent()
+	if cmd == nil {
+		t.Fatal("应触发下载覆盖检测")
+	}
+	ow := cmd().(sftpOverwriteCheckMsg)
+	if len(ow.conflicts) == 0 {
+		t.Fatal("应检测到本地覆盖冲突")
+	}
+	next, _ = next.Update(ow)
+	// y 确认覆盖
+	next, start := next.handleKey(press("y").(tea.KeyPressMsg))
+	if start == nil {
+		t.Fatal("确认后应启动下载")
+	}
+	next = driveProgress(t, next, start)
+	if b, err := os.ReadFile(filepath.Join(m.localCwd, "down.txt")); err != nil || string(b) != "remote" {
+		t.Fatalf("下载覆盖后本地应为 remote，实际 %q", string(b))
+	}
+}
+
+// TestSFTPOverwriteBatchUpload 批量上传覆盖检测（多文件）
+func TestSFTPOverwriteBatchUpload(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+	m.cwd = env.Root
+	m.focus = paneLocal
+
+	// 远程已存在 a.txt
+	if err := os.WriteFile(filepath.Join(env.Root, "a.txt"), []byte("old-a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 本地 a.txt + b.txt（b.txt 远程不存在）
+	if err := os.WriteFile(filepath.Join(m.localCwd, "a.txt"), []byte("new-a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(m.localCwd, "b.txt"), []byte("b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lm := m.loadLocal()
+	next, _ := m.Update(lm())
+	next.selLocal[indexOfName(next.localEntries, "a.txt")] = struct{}{}
+	next.selLocal[indexOfName(next.localEntries, "b.txt")] = struct{}{}
+	next, cmd := next.requestBatch(true)
+	if cmd == nil {
+		t.Fatal("批量上传应触发覆盖检测")
+	}
+	ow := cmd().(sftpOverwriteCheckMsg)
+	if len(ow.conflicts) != 1 || !strings.Contains(ow.conflicts[0], "a.txt") {
+		t.Fatalf("应仅 a.txt 冲突，实际 %v", ow.conflicts)
+	}
+	next, _ = next.Update(ow)
+	next, start := next.handleKey(press("y").(tea.KeyPressMsg))
+	if start == nil {
+		t.Fatal("批量确认后应启动传输")
+	}
+	next = driveProgress(t, next, start)
+	if b, _ := os.ReadFile(filepath.Join(env.Root, "a.txt")); string(b) != "new-a" {
+		t.Fatalf("a.txt 应被覆盖为 new-a，实际 %q", string(b))
+	}
+	if b, _ := os.ReadFile(filepath.Join(env.Root, "b.txt")); string(b) != "b" {
+		t.Fatalf("b.txt 应上传为 b，实际 %q", string(b))
+	}
+}
+
+// TestSFTPOverwriteBatchDownload 批量下载覆盖检测
+func TestSFTPOverwriteBatchDownload(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+	m.cwd = env.Root
+
+	if err := os.WriteFile(filepath.Join(env.Root, "x.txt"), []byte("rx"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(env.Root, "y.txt"), []byte("ry"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(m.localCwd, "x.txt"), []byte("lx"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.entries = nil
+	rl := m.loadList()
+	next, _ := m.Update(rl())
+	next.selRemote[indexOfName(next.entries, "x.txt")] = struct{}{}
+	next.selRemote[indexOfName(next.entries, "y.txt")] = struct{}{}
+	next, cmd := next.requestBatch(false)
+	ow := cmd().(sftpOverwriteCheckMsg)
+	if len(ow.conflicts) != 1 {
+		t.Fatalf("应仅 x.txt 冲突，实际 %v", ow.conflicts)
+	}
+	next, _ = next.Update(ow)
+	// Esc 取消，不下载
+	next, _ = next.handleKey(pressKey(tea.KeyEsc).(tea.KeyPressMsg))
+	if next.transfer != nil {
+		t.Fatal("取消后不应启动传输")
+	}
+	if b, _ := os.ReadFile(filepath.Join(m.localCwd, "y.txt")); b != nil {
+		t.Fatal("取消后 y.txt 不应被下载")
+	}
+}
+
+// TestSFTPOverwriteCancelStaleMsg 检测期间 Esc 取消后，迟到的检测结果必须被丢弃：
+// 即使检测无冲突，也不得启动传输（回归：取消后仍触发传输的竞态）。
+func TestSFTPOverwriteCancelStaleMsg(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+	m.cwd = env.Root
+	m.focus = paneLocal
+
+	src := filepath.Join(m.localCwd, "late.txt")
+	if err := os.WriteFile(src, []byte("late"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lm := m.loadLocal()
+	next, _ := m.Update(lm())
+	for i, e := range next.localEntries {
+		if e.Name() == "late.txt" {
+			next.localCursor = i
+		}
+	}
+	// 触发覆盖检测（命令先不执行）
+	next, cmd := next.enterCurrent()
+	if cmd == nil {
+		t.Fatal("应触发覆盖检测命令")
+	}
+	if !next.checkingOverwrite {
+		t.Fatal("应处于检测中状态")
+	}
+	// 检测期间按 Esc 取消
+	next, _ = next.handleKey(pressKey(tea.KeyEsc).(tea.KeyPressMsg))
+	if next.checkingOverwrite {
+		t.Fatal("Esc 后应退出检测中状态")
+	}
+	// 迟到的检测结果到达（无冲突）——必须被丢弃
+	ow := cmd().(sftpOverwriteCheckMsg)
+	if ow.err != nil {
+		t.Fatalf("覆盖检测失败: %v", ow.err)
+	}
+	next, _ = next.Update(ow)
+	if next.transfer != nil || next.busy {
+		t.Fatal("取消后迟到的检测结果不得启动传输")
+	}
+	if _, err := os.Stat(filepath.Join(env.Root, "late.txt")); !os.IsNotExist(err) {
+		t.Fatal("取消后文件不应被上传")
+	}
+}
+
+// TestSFTPOverwriteNoPrompt 无冲突时不提示直接传输
+func TestSFTPOverwriteNoPrompt(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	connect(t, m)
+	defer m.close()
+	m.cwd = env.Root
+	m.focus = paneLocal
+
+	src := filepath.Join(m.localCwd, "fresh.txt")
+	if err := os.WriteFile(src, []byte("fresh"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lm := m.loadLocal()
+	next, _ := m.Update(lm())
+	for i, e := range next.localEntries {
+		if e.Name() == "fresh.txt" {
+			next.localCursor = i
+		}
+	}
+	next, cmd := next.enterCurrent()
+	ow := cmd().(sftpOverwriteCheckMsg)
+	if len(ow.conflicts) != 0 {
+		t.Fatalf("fresh.txt 远程不存在，不应有冲突，实际 %v", ow.conflicts)
+	}
+	next, start := next.Update(ow)
+	if next.confirmOverwrite {
+		t.Fatal("无冲突不应进入确认态")
+	}
+	if start == nil {
+		t.Fatal("无冲突应直接启动传输")
+	}
+	next = driveProgress(t, next, start)
+	if b, _ := os.ReadFile(filepath.Join(env.Root, "fresh.txt")); string(b) != "fresh" {
+		t.Fatalf("fresh.txt 应上传成功，实际 %q", string(b))
 	}
 }

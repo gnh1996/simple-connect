@@ -316,6 +316,141 @@ func checkLocalFile(t *testing.T, p, want string) {
 	}
 }
 
+func TestUploadConflictsSingleFile(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	conn := dialTest(t, env)
+	defer conn.Close()
+	local := filepath.Join(t.TempDir(), "local.txt")
+	if err := os.WriteFile(local, []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	remote := filepath.Join(env.Root, "remote.txt")
+	// 无冲突
+	if c, err := UploadConflicts(conn.Client, local, remote); err != nil || len(c) != 0 {
+		t.Fatalf("无冲突时期望0，实际 %v err=%v", c, err)
+	}
+	// 创建远程文件后应检测到冲突
+	if err := os.WriteFile(remote, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := UploadConflicts(conn.Client, local, remote); err != nil || len(c) != 1 {
+		t.Fatalf("应检测到1冲突，实际 %v err=%v", c, err)
+	}
+}
+
+func TestUploadConflictsDirectory(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	conn := dialTest(t, env)
+	defer conn.Close()
+	local := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(local, "sub"), 0o755)
+	_ = os.WriteFile(filepath.Join(local, "a.txt"), []byte("a"), 0o644)
+	_ = os.WriteFile(filepath.Join(local, "sub", "b.txt"), []byte("b"), 0o644)
+	remote := filepath.Join(env.Root, "proj")
+	// 远程空目录，无冲突
+	_ = os.MkdirAll(filepath.Join(env.Root, "proj"), 0o755)
+	if c, err := UploadConflicts(conn.Client, local, remote); err != nil || len(c) != 0 {
+		t.Fatalf("空远程目录不应有冲突，实际 %v err=%v", c, err)
+	}
+	// 远程已有 a.txt
+	if err := os.WriteFile(filepath.Join(env.Root, "proj", "a.txt"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := UploadConflicts(conn.Client, local, remote); err != nil || len(c) != 1 {
+		t.Fatalf("应检测到 a.txt 冲突，实际 %v err=%v", c, err)
+	}
+	// 远程已有 sub/b.txt
+	if err := os.MkdirAll(filepath.Join(env.Root, "proj", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(env.Root, "proj", "sub", "b.txt"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := UploadConflicts(conn.Client, local, remote); err != nil || len(c) != 2 {
+		t.Fatalf("应检测到2冲突，实际 %v err=%v", c, err)
+	}
+}
+
+func TestDownloadConflictsSingleFile(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	conn := dialTest(t, env)
+	defer conn.Close()
+	remote := filepath.Join(env.Root, "r.txt")
+	if err := os.WriteFile(remote, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	local := filepath.Join(t.TempDir(), "l.txt")
+	// 无冲突
+	if c, err := DownloadConflicts(conn.Client, remote, local); err != nil || len(c) != 0 {
+		t.Fatalf("无冲突时期望0，实际 %v err=%v", c, err)
+	}
+	if err := os.WriteFile(local, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := DownloadConflicts(conn.Client, remote, local); err != nil || len(c) != 1 {
+		t.Fatalf("应检测到1冲突，实际 %v err=%v", c, err)
+	}
+}
+
+func TestBatchConflicts(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	conn := dialTest(t, env)
+	defer conn.Close()
+	local := t.TempDir()
+	_ = os.WriteFile(filepath.Join(local, "f1.txt"), []byte("a"), 0o644)
+	_ = os.WriteFile(filepath.Join(local, "f2.txt"), []byte("b"), 0o644)
+	remoteBase := filepath.Join(env.Root, "batch")
+	_ = os.MkdirAll(remoteBase, 0o755)
+	if err := os.WriteFile(filepath.Join(remoteBase, "f1.txt"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	items := []BatchItem{
+		{Src: filepath.Join(local, "f1.txt"), Dst: filepath.Join(remoteBase, "f1.txt")},
+		{Src: filepath.Join(local, "f2.txt"), Dst: filepath.Join(remoteBase, "f2.txt")},
+	}
+	if c, err := BatchConflicts(conn.Client, true, items); err != nil || len(c) != 1 {
+		t.Fatalf("批量上传应仅 f1.txt 冲突，实际 %v err=%v", c, err)
+	}
+}
+
+// TestSFTPOverwriteTypeConflict 目录与同名目标文件类型冲突也应视为冲突
+func TestSFTPOverwriteTypeConflict(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	conn := dialTest(t, env)
+	defer conn.Close()
+
+	// 上传：本地目录 vs 远程同名普通文件
+	localDir := filepath.Join(t.TempDir(), "thing")
+	if err := os.MkdirAll(filepath.Join(localDir, "inner.txt"), 0o755); err == nil {
+		_ = os.WriteFile(filepath.Join(localDir, "inner.txt"), []byte("x"), 0o644)
+	}
+	remoteFile := filepath.Join(env.Root, "thing")
+	if err := os.WriteFile(remoteFile, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := UploadConflicts(conn.Client, localDir, remoteFile)
+	if err != nil || len(c) != 1 {
+		t.Fatalf("目录上传到已存在的远程文件应报1冲突，实际 %v err=%v", c, err)
+	}
+
+	// 下载：远程目录 vs 本地同名普通文件
+	remoteDir := filepath.Join(env.Root, "rdir")
+	if err := os.MkdirAll(remoteDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(remoteDir, "f.txt"), []byte("rf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	localFile := filepath.Join(t.TempDir(), "rdir")
+	if err := os.WriteFile(localFile, []byte("lf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err = DownloadConflicts(conn.Client, remoteDir, localFile)
+	if err != nil || len(c) != 1 {
+		t.Fatalf("目录下载到已存在的本地文件应报1冲突，实际 %v err=%v", c, err)
+	}
+}
+
 func dialTest(t *testing.T, env testutil.SFTPEnv) *Conn {
 	t.Helper()
 	h, p := testutil.SplitHostPort(env.Addr)

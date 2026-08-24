@@ -140,9 +140,10 @@ func TestSFTPUploadDownloadDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 上传
-	up := m.startUpload(src)
-	m = driveProgress(t, m, up)
+	// 上传（经覆盖检测，无冲突直接传输）
+	remote := path.Join(m.cwd, filepath.Base(src))
+	up := m.requestTransfer(src, remote, true)
+	m = driveWithOverwriteCheck(t, m, up)
 	if m.err != "" {
 		t.Fatalf("上传失败: %s", m.err)
 	}
@@ -151,10 +152,10 @@ func TestSFTPUploadDownloadDelete(t *testing.T) {
 		t.Fatalf("远程文件校验失败: %v", err)
 	}
 
-	// 下载
+	// 下载（经覆盖检测）
 	dst := filepath.Join(m.localCwd, "dst.bin")
-	dl := m.startTransfer(path.Join(env.Root, "src.bin"), dst, false)
-	m = driveProgress(t, m, dl)
+	dl := m.requestTransfer(path.Join(env.Root, "src.bin"), dst, false)
+	m = driveWithOverwriteCheck(t, m, dl)
 	if m.err != "" {
 		t.Fatalf("下载失败: %s", m.err)
 	}
