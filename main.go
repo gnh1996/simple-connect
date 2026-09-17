@@ -9,6 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/lipgloss"
 
+	"simple-connect/internal/applog"
 	"simple-connect/internal/exec"
 	"simple-connect/internal/model"
 	"simple-connect/internal/session"
@@ -18,10 +19,21 @@ import (
 )
 
 func main() {
+	applog.Init()
+	code := 0
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, styleError("错误: "+err.Error()))
-		os.Exit(1)
+		reportErr("错误", err)
+		code = 1
 	}
+	applog.Close()
+	os.Exit(code)
+}
+
+// reportErr 统一错误出口：终端高亮提示 + 落盘日志（供事后诊断）。
+func reportErr(prefix string, err error) {
+	msg := prefix + ": " + err.Error()
+	fmt.Fprintln(os.Stderr, styleError(msg))
+	applog.Errorf("%s", msg)
 }
 
 func run() error {
@@ -60,17 +72,17 @@ func run() error {
 				// 会话中按 Ctrl+X f 挂起会话唤起 SFTP（SSH 连接保持，目录/进程不变），
 				// SFTP 页结束后自动恢复同一会话
 				if rerr := sftpLoop(s, h, sess); rerr != nil {
-					fmt.Fprintln(os.Stderr, styleError("SFTP 页面异常: "+rerr.Error()))
+					reportErr("SFTP 页面异常", rerr)
 				}
 				continue
 			}
-			fmt.Fprintln(os.Stderr, styleError("连接失败: "+err.Error()))
+			reportErr("连接失败", err)
 			fmt.Print("是否降级使用系统 ssh 连接？(y/N): ")
 			var ans string
 			_, _ = fmt.Scanln(&ans)
 			if strings.EqualFold(strings.TrimSpace(ans), "y") {
 				if err := exec.RunSSH(h); err != nil {
-					fmt.Fprintln(os.Stderr, styleError("系统 ssh 失败: "+err.Error()))
+					reportErr("系统 ssh 失败", err)
 				}
 			}
 		default:
@@ -102,8 +114,7 @@ func sftpLoop(s *store.Store, h *model.Host, sess *session.Handle) error {
 			continue // 再次挂起唤起 SFTP
 		}
 		if err != nil {
-			fmt.Fprintln(os.Stderr, styleError("恢复会话失败: "+err.Error()))
-			return nil
+			return fmt.Errorf("恢复会话失败: %w", err)
 		}
 		return nil // 会话正常结束
 	}

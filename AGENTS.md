@@ -11,7 +11,7 @@ simple-connect 是一个使用 Go 开发的 SSH/SFTP 连接管理 TUI 应用：
 
 | 模块 | 依赖 | 版本 |
 |---|---|---|
-| TUI 框架 | `charm.land/bubbletea/v2` | v2.0.8 |
+| TUI 框架 | `charm.land/bubbletea/v2` | v2.0.9 |
 | 组件 | `charm.land/bubbles/v2`（textinput 等） | 最新 |
 | 样式 | `github.com/charmbracelet/lipgloss` | 最新 |
 | 终端 | `github.com/charmbracelet/x/term` | 最新 |
@@ -31,6 +31,7 @@ internal/
   sftp/                  # SFTP 传输与浏览逻辑：Dial/List/Remove/Transfer/Upload/Download
   session/               # 自建交互会话：raw 模式 + PTY 透传 + resize（unix SIGWINCH / windows 轮询）
   exec/                  # 调用系统 ssh/sftp（跨平台，后备降级用）
+  applog/                # 轻量错误日志落盘（用户缓存目录，0600）
   tui/                   # Bubble Tea 界面（root/list/form/sftp 页面）
   testutil/              # 测试辅助：内存 SSH/SFTP 服务器（含 shell/keyboard-interactive）
 ```
@@ -49,7 +50,7 @@ internal/
 
 ## 开发规范
 
-- **依赖固定**：bubbletea 必须使用 `charm.land/bubbletea/v2@v2.0.8`，禁止引入 v1（`github.com/charmbracelet/bubbletea`）。
+- **依赖固定**：bubbletea 必须使用 `charm.land/bubbletea/v2@v2.0.9`，禁止引入 v1（`github.com/charmbracelet/bubbletea`）。
 - **Bubble Tea v2 API 约定**（与 v1 差异大，务必遵守）：
   - `View()` 返回 `tea.View`（用 `tea.NewView()` 构造，整页模式设置 `v.AltScreen = true`）。
   - `Init()` 只返回 `tea.Cmd`；`Update(Msg) (Model, Cmd)`。
