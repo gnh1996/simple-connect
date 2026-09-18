@@ -28,7 +28,8 @@ type sftpMode int
 
 const (
 	modeBrowse sftpMode = iota
-	modeUpload
+	// modePath：p 输入路径传输（方向按焦点栏）
+	modePath
 	modeNewDir
 	modeGoto
 )
@@ -60,11 +61,13 @@ type sftpMsgText struct {
 	ok   bool
 }
 
-// sftpGotoCompleteMsg Tab 路径补全结果（input 为计算时的输入快照）
+// sftpGotoCompleteMsg Tab 路径补全结果（input 为计算时的输入快照；
+// target 区分 g 跳转与 p 路径传输两处补全，缺省 modeGoto 兼容旧调用）
 type sftpGotoCompleteMsg struct {
-	input string
-	cands []string
-	err   error
+	target sftpMode
+	input  string
+	cands  []string
+	err    error
 }
 
 // sftpGotoJumpMsg 远程路径跳转结果
@@ -136,11 +139,16 @@ type sftpModel struct {
 	remoteCwd string // 会话内跟踪到的远程工作目录（热键唤起定位用，空串=默认）
 
 	mode     sftpMode
-	uploadIn *textinput.Model
+	pathIn   *textinput.Model
 	newDirIn *textinput.Model
 	gotoIn   *textinput.Model
 
-	// 路径跳转 Tab 补全状态
+	// 路径传输（p）Tab 补全状态
+	pathCandidates []string // 候选完整路径（当前输入快照下的匹配项）
+	pathLastSet    string   // 最近一次写入输入框的值（用于 Tab 循环切换判断）
+	pathSel        int
+
+	// 路径跳转（g）Tab 补全状态
 	gotoCandidates []string // 候选完整路径（当前输入快照下的匹配项）
 	gotoLastSet    string   // 最近一次写入输入框的值（用于 Tab 循环切换判断）
 	gotoSel        int
@@ -167,18 +175,18 @@ type sftpModel struct {
 }
 
 func newSFTPModel(s *store.Store, h *model.Host, remoteCwd string, sshCl *sshc.Client) *sftpModel {
-	up := textInput("", "本地文件/目录路径，可直接拖拽文件到终端")
+	pt := textInput("", "路径（Tab 补全）")
 	nw := textInput("", "新目录名")
 	gt := textInput("", "路径（Tab 补全）")
 	m := &sftpModel{
 		store: s, host: h,
 		sshClient: sshCl,
-		uploadIn:  &up, newDirIn: &nw, gotoIn: &gt,
+		pathIn:    &pt, newDirIn: &nw, gotoIn: &gt,
 		confirmID: -1, localConfirmID: -1,
-		selLocal:  map[int]struct{}{},
-		selRemote: map[int]struct{}{},
-		focus:     paneRemote,
-		remoteCwd: remoteCwd,
+		selLocal:     map[int]struct{}{},
+		selRemote:    map[int]struct{}{},
+		focus:        paneRemote,
+		remoteCwd:    remoteCwd,
 		trustHostKey: sshc.TrustHostKey,
 	}
 	if h.LocalDir != "" {
@@ -296,7 +304,7 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 		return m, nil
 
 	case sftpGotoCompleteMsg:
-		return m.handleGotoComplete(msg)
+		return m.handleComplete(msg)
 
 	case sftpGotoJumpMsg:
 		if msg.err != nil {
@@ -1010,34 +1018,23 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 		return m, nil
 	}
 
-	// 上传路径输入
-	if m.mode == modeUpload {
+	// 路径传输输入（p）：方向按焦点栏——本地=上传、远程=下载
+	if m.mode == modePath {
 		switch k.Code {
 		case tea.KeyEsc:
 			m.mode = modeBrowse
+			m.clearPathCandidates()
 			return m, nil
 		case tea.KeyEnter:
-			p := strings.TrimSpace(m.uploadIn.Value())
-			if p == "" {
-				m.mode = modeBrowse
-				return m, nil
-			}
-			abs := sshc.ExpandPath(p)
-			if st, err := os.Stat(abs); err != nil {
-				m.err = "本地路径不存在"
-				return m, nil
-			} else if !st.IsDir() {
-				m.mode = modeBrowse
-				remote := path.Join(m.cwd, filepath.Base(abs))
-				return m, m.requestTransfer(abs, remote, true)
-			} else {
-				m.mode = modeBrowse
-				remote := path.Join(m.cwd, filepath.Base(abs))
-				return m, m.requestTransfer(abs, remote, true)
-			}
+			return m.pathJump()
+		case tea.KeyTab:
+			return m.pathComplete()
 		}
-		in, cmd := m.uploadIn.Update(msg)
-		*m.uploadIn = in
+		in, cmd := m.pathIn.Update(msg)
+		if in.Value() != m.pathLastSet {
+			m.clearPathCandidates()
+		}
+		*m.pathIn = in
 		return m, cmd
 	}
 
@@ -1120,13 +1117,26 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 	default:
 		if k.Text != "" {
 			switch k.Text {
-			case "u":
+			case "t":
 				if m.busy {
 					return m, nil
 				}
-				m.mode = modeUpload
-				m.uploadIn.Focus()
-				return m, nil
+				if m.hasSel() {
+					return m.requestBatch(m.focus == paneLocal)
+				}
+				e := m.currentEntry()
+				if e == nil {
+					return m, nil
+				}
+				if m.focus == paneLocal {
+					return m, m.uploadEntry(filepath.Join(m.localCwd, e.Name()))
+				}
+				return m.downloadEntry(e)
+			case "p":
+				if m.busy {
+					return m, nil
+				}
+				return m.openPath()
 			case "g":
 				if m.busy {
 					return m, nil
@@ -1139,12 +1149,6 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 				m.mode = modeNewDir
 				m.newDirIn.Focus()
 				return m, nil
-			case "d":
-				if m.focus == paneRemote && !m.hasSel() {
-					if e := m.currentEntry(); e != nil {
-						return m.downloadEntry(e)
-					}
-				}
 			case "x":
 				if m.busy {
 					return m, nil
@@ -1228,9 +1232,18 @@ func (m *sftpModel) setCursor(idx int) {
 // ---- 路径跳转与 Tab 补全 ----
 
 func (m *sftpModel) clearGotoCandidates() {
-	m.gotoCandidates = nil
-	m.gotoLastSet = ""
-	m.gotoSel = 0
+	clearComplete(&m.gotoCandidates, &m.gotoLastSet, &m.gotoSel)
+}
+
+func (m *sftpModel) clearPathCandidates() {
+	clearComplete(&m.pathCandidates, &m.pathLastSet, &m.pathSel)
+}
+
+// clearComplete 重置一组补全状态（候选 / 最近写入值 / 当前下标）
+func clearComplete(cands *[]string, lastSet *string, sel *int) {
+	*cands = nil
+	*lastSet = ""
+	*sel = 0
 }
 
 func (m *sftpModel) openGoto() (*sftpModel, tea.Cmd) {
@@ -1246,10 +1259,25 @@ func (m *sftpModel) openGoto() (*sftpModel, tea.Cmd) {
 	return m, nil
 }
 
-// gotoSplit 拆分输入为「目录部分 + 基础名」；无分隔符时 dir 返回空串。
-// 本地兼容 / 与 \ 分隔符，远程按 / 拆分。
-func (m *sftpModel) gotoSplit(v string) (dir, base string) {
+// openPath 打开路径传输输入（p）。方向按焦点栏：本地栏=上传，远程栏=下载。
+// 不预填路径，避免直接 Enter 误传整个当前目录；Tab 补全基准取焦点栏 cwd。
+func (m *sftpModel) openPath() (*sftpModel, tea.Cmd) {
+	m.mode = modePath
+	m.clearPathCandidates()
+	m.pathIn.SetValue("")
 	if m.focus == paneLocal {
+		m.pathIn.Placeholder = "本地路径，Enter 上传"
+	} else {
+		m.pathIn.Placeholder = "远程路径，Enter 下载"
+	}
+	m.pathIn.Focus()
+	return m, nil
+}
+
+// splitPathInput 按本地/远程规则拆分输入。本地兼容 / 与 \ 分隔符，远程按 / 拆分；
+// 无分隔符时 dir 返回空串（补全时回落到当前栏 cwd）。
+func splitPathInput(v string, local bool) (dir, base string) {
+	if local {
 		if strings.HasSuffix(v, "/") || strings.HasSuffix(v, string(os.PathSeparator)) {
 			return v, ""
 		}
@@ -1305,39 +1333,85 @@ func (m *sftpModel) gotoJump() (*sftpModel, tea.Cmd) {
 	})
 }
 
-// gotoComplete Tab 补全：有新鲜候选时循环切换，否则异步读取目录计算候选
-func (m *sftpModel) gotoComplete() (*sftpModel, tea.Cmd) {
-	v := m.gotoIn.Value()
-	if len(m.gotoCandidates) > 0 && v == m.gotoLastSet {
-		m.gotoSel = (m.gotoSel + 1) % len(m.gotoCandidates)
-		next := m.gotoCandidates[m.gotoSel]
-		m.gotoIn.SetValue(next)
-		m.gotoIn.CursorEnd() // 循环切换后光标落到末尾便于继续输入
-		m.gotoLastSet = next
+// pathJump 校验并执行路径传输（p）：本地栏上传本地路径，远程栏下载远程路径。
+// 远程路径的存在性由覆盖检测的 DownloadConflicts 异步校验。
+func (m *sftpModel) pathJump() (*sftpModel, tea.Cmd) {
+	v := strings.TrimSpace(m.pathIn.Value())
+	m.clearPathCandidates()
+	if v == "" {
+		m.mode = modeBrowse
 		return m, nil
 	}
-	m.clearGotoCandidates()
-	dir, base := m.gotoSplit(v)
+	if m.focus == paneLocal {
+		p := sshc.ExpandPath(v)
+		if _, err := os.Stat(p); err != nil {
+			m.err = "本地路径不存在"
+			return m, nil // 保留输入态便于修正
+		}
+		m.mode = modeBrowse
+		remote := path.Join(m.cwd, filepath.Base(p))
+		return m, m.requestTransfer(p, remote, true)
+	}
+	if m.conn == nil {
+		m.err = "未连接"
+		return m, nil
+	}
+	if err := os.MkdirAll(m.localCwd, 0o755); err != nil {
+		m.err = err.Error()
+		return m, nil
+	}
+	m.mode = modeBrowse
+	local := filepath.Join(m.localCwd, path.Base(v))
+	return m, m.requestTransfer(v, local, false)
+}
+
+// gotoComplete / pathComplete Tab 补全入口，共用 completeCycle。
+func (m *sftpModel) gotoComplete() (*sftpModel, tea.Cmd) {
+	return m.completeCycle(m.gotoIn, &m.gotoCandidates, &m.gotoLastSet, &m.gotoSel, modeGoto)
+}
+
+func (m *sftpModel) pathComplete() (*sftpModel, tea.Cmd) {
+	return m.completeCycle(m.pathIn, &m.pathCandidates, &m.pathLastSet, &m.pathSel, modePath)
+}
+
+// completeCycle Tab 补全通用处理：有新鲜候选时循环切换，否则异步读取目录计算候选。
+func (m *sftpModel) completeCycle(in *textinput.Model, cands *[]string, lastSet *string, sel *int, target sftpMode) (*sftpModel, tea.Cmd) {
+	v := in.Value()
+	if len(*cands) > 0 && v == *lastSet {
+		*sel = (*sel + 1) % len(*cands)
+		next := (*cands)[*sel]
+		in.SetValue(next)
+		in.CursorEnd() // 循环切换后光标落到末尾便于继续输入
+		*lastSet = next
+		return m, nil
+	}
+	clearComplete(cands, lastSet, sel)
+	return m, m.completeCandidates(v, target)
+}
+
+// completeCandidates 异步计算补全候选：按焦点栏决定本地/远程，空基准取当前栏 cwd。
+func (m *sftpModel) completeCandidates(v string, target sftpMode) tea.Cmd {
+	local := m.focus == paneLocal
+	dir, base := splitPathInput(v, local)
 	if dir == "" {
-		if m.focus == paneLocal {
+		if local {
 			dir = m.localCwd
 		} else {
 			dir = m.cwd
 		}
-	} else if m.focus == paneLocal {
+	} else if local {
 		dir = sshc.ExpandPath(dir)
 	}
-	kind := m.focus
 	var cl *sftp.Client
-	if kind == paneRemote && m.conn != nil {
+	if !local && m.conn != nil {
 		cl = m.conn.Client
 	}
-	return m, tea.Cmd(func() tea.Msg {
+	return tea.Cmd(func() tea.Msg {
 		var names []string
-		if kind == paneLocal {
+		if local {
 			entries, err := os.ReadDir(dir)
 			if err != nil {
-				return sftpGotoCompleteMsg{input: v, err: err}
+				return sftpGotoCompleteMsg{target: target, input: v, err: err}
 			}
 			for _, e := range entries {
 				names = append(names, e.Name())
@@ -1345,7 +1419,7 @@ func (m *sftpModel) gotoComplete() (*sftpModel, tea.Cmd) {
 		} else {
 			entries, err := sftpc.List(cl, dir)
 			if err != nil {
-				return sftpGotoCompleteMsg{input: v, err: err}
+				return sftpGotoCompleteMsg{target: target, input: v, err: err}
 			}
 			for _, e := range entries {
 				names = append(names, e.Name())
@@ -1357,34 +1431,44 @@ func (m *sftpModel) gotoComplete() (*sftpModel, tea.Cmd) {
 				continue
 			}
 			if base == "" || strings.HasPrefix(strings.ToLower(n), strings.ToLower(base)) {
-				cands = append(cands, joinGoto(dir, n, kind == paneLocal))
+				cands = append(cands, joinGoto(dir, n, local))
 			}
 		}
-		return sftpGotoCompleteMsg{input: v, cands: cands}
+		return sftpGotoCompleteMsg{target: target, input: v, cands: cands}
 	})
 }
 
-func (m *sftpModel) handleGotoComplete(msg sftpGotoCompleteMsg) (*sftpModel, tea.Cmd) {
-	if msg.input != m.gotoIn.Value() {
+// handleComplete 应用补全结果：按 target 写入 g/p 对应的补全状态。
+func (m *sftpModel) handleComplete(msg sftpGotoCompleteMsg) (*sftpModel, tea.Cmd) {
+	in, cands, lastSet, sel := m.completeState(msg.target)
+	if in == nil || msg.input != in.Value() {
 		return m, nil // 输入已变化，丢弃陈旧结果
 	}
 	if msg.err != nil {
 		m.err = fmt.Sprintf("补全失败: %v", msg.err)
-		m.clearGotoCandidates()
+		clearComplete(cands, lastSet, sel)
 		return m, nil
 	}
 	if len(msg.cands) == 0 {
-		m.clearGotoCandidates()
+		clearComplete(cands, lastSet, sel)
 		m.status = "无匹配项"
 		return m, nil
 	}
-	m.gotoCandidates = msg.cands
-	m.gotoSel = 0
+	*cands = msg.cands
+	*sel = 0
 	next := msg.cands[0]
-	m.gotoIn.SetValue(next)
-	m.gotoIn.CursorEnd() // 首次补全后光标落到末尾便于继续输入
-	m.gotoLastSet = next
+	in.SetValue(next)
+	in.CursorEnd() // 首次补全后光标落到末尾便于继续输入
+	*lastSet = next
 	return m, nil
+}
+
+// completeState 返回指定来源（g/p）的输入框与补全状态指针。
+func (m *sftpModel) completeState(target sftpMode) (*textinput.Model, *[]string, *string, *int) {
+	if target == modePath {
+		return m.pathIn, &m.pathCandidates, &m.pathLastSet, &m.pathSel
+	}
+	return m.gotoIn, &m.gotoCandidates, &m.gotoLastSet, &m.gotoSel
 }
 
 func joinGoto(dir, name string, local bool) string {
@@ -1483,27 +1567,21 @@ func (m *sftpModel) dynamicLines() []string {
 
 	// 输入模式
 	switch m.mode {
-	case modeUpload:
-		lines = append(lines, styleCursor.Render("上传 ")+"本地路径(可拖拽文件/目录): "+m.uploadIn.View())
+	case modeBrowse:
+		// 浏览模式无输入行
+	case modePath:
+		if m.focus == paneLocal {
+			lines = append(lines, styleCursor.Render("上传 ")+"本地路径(Tab 补全): "+m.pathIn.View())
+		} else {
+			lines = append(lines, styleCursor.Render("下载 ")+"远程路径(Tab 补全): "+m.pathIn.View())
+		}
+		lines = append(lines, completionLines(m.pathCandidates, m.pathSel)...)
+		lines = append(lines, styleHint.Render("Tab 补全  Enter 传输  Esc 取消"))
 	case modeNewDir:
 		lines = append(lines, styleCursor.Render("新建目录: ")+m.newDirIn.View())
 	case modeGoto:
 		lines = append(lines, styleCursor.Render("跳转路径: ")+m.gotoIn.View())
-		max := len(m.gotoCandidates)
-		if max > 6 {
-			max = 6
-		}
-		for i := 0; i < max; i++ {
-			mark := "  "
-			if i == m.gotoSel {
-				mark = "▸ "
-			}
-			line := mark + m.gotoCandidates[i]
-			if i == m.gotoSel {
-				line = styleSelected.Render(line)
-			}
-			lines = append(lines, line)
-		}
+		lines = append(lines, completionLines(m.gotoCandidates, m.gotoSel)...)
 		lines = append(lines, styleHint.Render("Tab 补全  Enter 跳转  Esc 取消"))
 	}
 
@@ -1672,6 +1750,27 @@ func (m *sftpModel) renderEntry(e fs.FileInfo, idx, cursor int, lay paneLayout, 
 	return b.String()
 }
 
+// completionLines 渲染补全候选（最多 6 个，高亮当前项），供 g/p 输入模式共用。
+func completionLines(cands []string, sel int) []string {
+	limit := len(cands)
+	if limit > 6 {
+		limit = 6
+	}
+	var lines []string
+	for i := 0; i < limit; i++ {
+		mark := "  "
+		if i == sel {
+			mark = "▸ "
+		}
+		line := mark + cands[i]
+		if i == sel {
+			line = styleSelected.Render(line)
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
 func renderProgress(name string, done, total int64) string {
 	if total <= 0 {
 		return fmt.Sprintf("正在传输 %s ... %s", name, sftpc.FormatSize(done))
@@ -1684,5 +1783,5 @@ func renderProgress(name string, done, total int64) string {
 }
 
 func renderSFTPFooter() string {
-	return "Tab 切换栏  Enter 进入/传输(本地↑/远程↓)  Space 多选  g 跳转路径  ↑/↓ 移动  Backspace 上级  u 路径上传  n 新建目录  d 下载  x 删除  r 刷新  q 返回"
+	return "Tab 切换栏  Enter 进入/传输文件  t 传输(本地↑/远程↓)  p 路径传输  Space 多选  g 跳转  ↑/↓ 移动  Backspace 上级  n 新建目录  x 删除  r 刷新  q 返回"
 }
