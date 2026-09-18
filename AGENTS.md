@@ -60,6 +60,7 @@ internal/
 - **文本输入框**：统一使用 `textInput()` 工厂函数创建，需调用 `SetStyles` 禁用光标闪烁（否则每个按键会触发 530ms tick 阻塞测试与渲染）。
 - **分层约定**：SFTP 传输与浏览逻辑必须放 `internal/sftp` 包（`Dial`/`List`/`Remove`/`Transfer`/`Upload`/`Download`/`FormatSize`），该包不依赖 bubbletea；TUI 层只负责调度（`tea.Tick` 进度轮询）与渲染。
 - **异步操作**：SFTP 上传/下载必须通过 `sftpc.Upload`/`sftpc.Download` 在 goroutine 中执行，进度写入带 mutex 的 `sftpc.Transfer`，TUI 层用 `tea.Tick` 轮询回传，禁止阻塞 Update 循环。
+- **传输取消与原子写入**：传输**不支持离页后台继续，也不支持再次进入恢复进度**（`Transfer` 绑定 SFTP 页模型，离页即关闭连接）。上传/下载统一写 `<目标>.part` 临时文件，成功后改名为最终目标（远程优先 `PosixRename`），取消/失败时删除临时文件，避免半截目标文件。`Transfer.Cancel()` 为协作式取消（读写前检查 ctx，`Canceled()` 区分用户取消与真实错误）；TUI 传输中 `q`/`Ctrl+C` 先弹退出确认，确认后请求取消并轮询等待，取消完成（临时文件已清理）才回列表，超时约 5s 兜底强制离开。
 - **并发安全**：跨 goroutine 共享状态（传输进度等）必须加锁，禁止在 Cmd 闭包内直接修改 UI 模型字段（存在数据竞争）。
 - **关联匹配优先数据库/服务端处理**：SFTP 目录读取、删除等一律走 `pkg/sftp` 原生接口，禁止本地缓存后拼接。
 - **凭据安全**：密码不落明文配置（hosts.json），经 `store.Secrets` 接口存入系统 keyring，无 keyring 时兜底文件（0600），并在 UI 显示"密码明文存储"警告。

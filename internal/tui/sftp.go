@@ -160,6 +160,12 @@ type sftpModel struct {
 	err      string
 	busy     bool
 
+	// 传输中退出确认（q / Ctrl+C）：confirmExit 显示确认提示；
+	// exiting 表示已确认退出、正在等待取消完成（此后屏蔽输入，done 后回列表）。
+	confirmExit bool
+	exiting     bool
+	exitTicks   int // exiting 期间轮询次数，超阈值强制离开（兜底阻塞的远端读取）
+
 	// 覆盖确认
 	confirmOverwrite   bool
 	overwriteConflicts []string
@@ -739,8 +745,19 @@ func (m *sftpModel) handleProgress() (*sftpModel, tea.Cmd) {
 	if finished {
 		up := m.transfer.Up
 		done, _, _, _ := m.transfer.Snapshot()
+		canceled := m.transfer.Canceled()
 		m.transfer = nil
 		m.busy = false
+		m.confirmExit = false // 传输已结束：撤销可能仍显示的退出确认
+		// 已确认退出：取消完成（临时文件已清理）后离开页面，不再提示完成/错误
+		if m.exiting {
+			m.exiting = false
+			return m, tea.Cmd(func() tea.Msg { return backToListMsg{} })
+		}
+		if canceled {
+			m.status = transferName(up) + "已取消"
+			return m, tea.Batch(m.loadList(), m.loadLocal())
+		}
 		if err != nil {
 			m.err = fmt.Sprintf("%s失败: %v", transferName(up), err)
 			return m, nil
@@ -750,7 +767,43 @@ func (m *sftpModel) handleProgress() (*sftpModel, tea.Cmd) {
 		// 传输后刷新两侧列表（远程大小/时间可能变化；本地目录不变刷新无害）
 		return m, tea.Batch(m.loadList(), m.loadLocal())
 	}
+	// 已确认退出但传输迟迟未结束（如远端读取阻塞）：等待约 5 秒后强制离开。
+	// 此时由上层关闭连接中断底层 I/O，可能残留 .part 临时文件，属兜底路径。
+	if m.exiting {
+		m.exitTicks++
+		if m.exitTicks >= 50 {
+			m.exiting = false
+			return m, tea.Cmd(func() tea.Msg { return backToListMsg{} })
+		}
+	}
 	// 继续轮询
+	return m, tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+		return sftpProgressMsg{}
+	})
+}
+
+// requestExit 处理离开页面请求（q / Ctrl+C）：
+// 传输中先进入确认态，避免用户无提示地中止传输；否则直接返回列表。
+func (m *sftpModel) requestExit() (*sftpModel, tea.Cmd) {
+	if m.transfer != nil {
+		m.confirmExit = true
+		return m, nil
+	}
+	return m, tea.Cmd(func() tea.Msg { return backToListMsg{} })
+}
+
+// confirmExitNow 用户确认退出：请求取消传输并继续轮询，待取消完成（临时文件已清理）
+// 后再返回列表，避免在传输仍持有连接时关闭连接导致竞态与残留文件。
+func (m *sftpModel) confirmExitNow() (*sftpModel, tea.Cmd) {
+	m.confirmExit = false
+	if m.transfer == nil {
+		return m, tea.Cmd(func() tea.Msg { return backToListMsg{} })
+	}
+	m.exiting = true
+	m.exitTicks = 0
+	m.err = ""
+	m.status = "正在取消传输…"
+	m.transfer.Cancel()
 	return m, tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
 		return sftpProgressMsg{}
 	})
@@ -936,6 +989,31 @@ func (m *sftpModel) doDelete() (*sftpModel, tea.Cmd) {
 
 func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 	k := msg.Key()
+
+	// 传输中退出确认态：仅响应确认/取消，其余按键忽略，防止误触
+	if m.confirmExit {
+		switch {
+		case k.Code == tea.KeyEnter:
+			fallthrough
+		case k.Text == "y" || k.Text == "Y":
+			return m.confirmExitNow()
+		case k.Code == tea.KeyEsc || k.Text == "n" || k.Text == "N" || k.Text == "q",
+			k.Mod.Contains(tea.ModCtrl) && k.Code == 'c':
+			m.confirmExit = false
+			return m, nil
+		}
+		return m, nil
+	}
+
+	// 已确认退出：等待取消完成期间屏蔽全部输入（避免再次触发传输/删除等）
+	if m.exiting {
+		return m, nil
+	}
+
+	// Ctrl+C 与 q 同义：传输中进入退出确认，否则离开页面
+	if k.Mod.Contains(tea.ModCtrl) && k.Code == 'c' {
+		return m.requestExit()
+	}
 
 	// 首次连接指纹确认态：y/Enter 信任并重连，Esc/n/q 取消
 	if m.pendingKey != nil {
@@ -1176,7 +1254,7 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 				}
 				return m, m.loadList()
 			case "q":
-				return m, tea.Cmd(func() tea.Msg { return backToListMsg{} })
+				return m.requestExit()
 			}
 		}
 	}
@@ -1547,6 +1625,14 @@ func (m *sftpModel) dynamicLines() []string {
 		lines = append(lines, styleInfo.Render(fmt.Sprintf(
 			"首次连接 %s，指纹 %s 未确认，信任并继续？ (y/N)",
 			m.pendingKey.Hostname, m.pendingKey.Fingerprint)))
+	}
+
+	// 传输中退出确认
+	if m.confirmExit {
+		lines = append(lines, styleError.Render(
+			"传输进行中，退出将中止传输并删除未完成的临时文件，确定退出？ (y/N)"))
+	} else if m.exiting {
+		lines = append(lines, styleInfo.Render("正在取消传输…"))
 	}
 
 	// 覆盖确认（上传/下载目标已存在）

@@ -173,6 +173,93 @@ func TestLargeFileConcurrentUpload(t *testing.T) {
 	}
 }
 
+// TestTransferCancelCleansUp 取消后的传输应中止，且不残留目标文件/临时 .part 文件。
+// 在传输开始前调用 Cancel，使首次读取即返回取消错误，结果确定、不依赖传输耗时。
+func TestTransferCancelCleansUp(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	conn := dialTest(t, env)
+	defer conn.Close()
+
+	content := bytes.Repeat([]byte{0x5}, 8192)
+	remoteSrc := filepath.Join(env.Root, "cancel-src.bin")
+	if err := os.WriteFile(remoteSrc, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 下载取消
+	dst := filepath.Join(t.TempDir(), "cancel-dst.bin")
+	td := NewTransfer("cancel-dst.bin", false)
+	td.Cancel()
+	Download(conn.Client, td, remoteSrc, dst)
+	if _, _, finished, err := td.Snapshot(); !finished || err == nil {
+		t.Fatalf("取消后下载应 finished 且返回错误: finished=%v err=%v", finished, err)
+	}
+	if !td.Canceled() {
+		t.Fatal("Transfer.Canceled() 应为 true")
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatal("取消后不应留下目标文件")
+	}
+	if _, err := os.Stat(dst + partSuffix); !os.IsNotExist(err) {
+		t.Fatal("取消后不应留下临时文件")
+	}
+
+	// 上传取消
+	local := filepath.Join(t.TempDir(), "cancel-up.bin")
+	if err := os.WriteFile(local, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	remoteDst := filepath.Join(env.Root, "cancel-up.bin")
+	tu := NewTransfer("cancel-up.bin", true)
+	tu.Cancel()
+	Upload(conn.Client, tu, local, remoteDst)
+	if _, _, finished, err := tu.Snapshot(); !finished || err == nil {
+		t.Fatalf("取消后上传应 finished 且返回错误: finished=%v err=%v", finished, err)
+	}
+	if !tu.Canceled() {
+		t.Fatal("Transfer.Canceled() 应为 true")
+	}
+	if _, err := conn.Client.Stat(remoteDst); err == nil {
+		t.Fatal("取消后不应留下远程目标文件")
+	}
+	if _, err := conn.Client.Stat(remoteDst + partSuffix); err == nil {
+		t.Fatal("取消后不应留下远程临时文件")
+	}
+}
+
+// TestTransferAtomicNoPartLeftover 正常传输完成后仅保留最终文件，不残留 .part 临时文件。
+func TestTransferAtomicNoPartLeftover(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	conn := dialTest(t, env)
+	defer conn.Close()
+
+	content := bytes.Repeat([]byte{0x7}, 4096)
+	local := filepath.Join(t.TempDir(), "atomic.bin")
+	if err := os.WriteFile(local, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	remote := filepath.Join(env.Root, "atomic.bin")
+	tup := NewTransfer("atomic.bin", true)
+	Upload(conn.Client, tup, local, remote)
+	if _, _, finished, err := tup.Snapshot(); !finished || err != nil {
+		t.Fatalf("上传异常: finished=%v err=%v", finished, err)
+	}
+	if _, err := conn.Client.Stat(remote + partSuffix); err == nil {
+		t.Fatal("上传完成后不应残留远程 .part 文件")
+	}
+
+	dst := filepath.Join(t.TempDir(), "atomic-dl.bin")
+	td := NewTransfer("atomic-dl.bin", false)
+	Download(conn.Client, td, remote, dst)
+	if _, _, finished, err := td.Snapshot(); !finished || err != nil {
+		t.Fatalf("下载异常: finished=%v err=%v", finished, err)
+	}
+	if _, err := os.Stat(dst + partSuffix); !os.IsNotExist(err) {
+		t.Fatal("下载完成后不应残留本地 .part 文件")
+	}
+	checkLocalFile(t, dst, string(content))
+}
+
 func TestTransferFailure(t *testing.T) {
 	env := testutil.StartSFTP(t)
 	conn := dialTest(t, env)
@@ -301,7 +388,7 @@ func checkRemoteFile(t *testing.T, cl *sftp.Client, p, want string) {
 	if err != nil {
 		t.Fatalf("远程文件 %s 打开失败: %v", p, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	b, err := io.ReadAll(f)
 	if err != nil || string(b) != want {
 		t.Fatalf("远程文件 %s 校验失败: err=%v", p, err)

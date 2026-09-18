@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -130,11 +131,50 @@ type Transfer struct {
 	total    int64
 	finished bool
 	err      error
+
+	// ctx/cancel 支持协作式取消：上层请求取消后，读写循环在下一块读取前退出，
+	// 便于界面「退出时妥善终止」（不必只靠关闭连接硬中断），并让上层区分
+	// 「用户取消」与「真实错误」。
+	ctx      context.Context
+	cancel   context.CancelFunc
+	canceled bool
 }
 
 // NewTransfer 创建传输进度跟踪器
 func NewTransfer(name string, up bool) *Transfer {
-	return &Transfer{Name: name, Up: up}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Transfer{Name: name, Up: up, ctx: ctx, cancel: cancel}
+}
+
+// Cancel 请求取消传输（协作式，幂等）。已完成或未启动的传输调用无副作用。
+func (t *Transfer) Cancel() {
+	t.mu.Lock()
+	t.canceled = true
+	cancel := t.cancel
+	t.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// Canceled 返回传输是否被用户取消过。
+func (t *Transfer) Canceled() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.canceled
+}
+
+// ctxErr 返回取消状态对应的错误（未取消时返回 nil）。
+func (t *Transfer) ctxErr() error {
+	if t.ctx == nil {
+		return nil
+	}
+	select {
+	case <-t.ctx.Done():
+		return t.ctx.Err()
+	default:
+		return nil
+	}
 }
 
 // Snapshot 返回当前进度快照
@@ -183,9 +223,11 @@ func uploadFile(cl *sftp.Client, t *Transfer, localPath, remotePath string) {
 		t.finish(err)
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }() // 只读源文件，关闭错误不影响传输结果
 
-	rf, err := cl.Create(remotePath)
+	// 原子写入：先写临时文件，成功后再改名为目标，避免取消/失败留下半截目标文件。
+	tmpPath := remotePath + partSuffix
+	rf, err := cl.Create(tmpPath)
 	if err != nil {
 		t.finish(err)
 		return
@@ -194,15 +236,34 @@ func uploadFile(cl *sftp.Client, t *Transfer, localPath, remotePath string) {
 	// io.CopyBuffer 会直接调用 f.WriteTo 并忽略传入的 buffer（历史 bug：1MB 并发分片
 	// 从未生效，落到 32KB 串行写，上传吞吐仅约下载的 1/4，详见 bufsize_bench_test.go）。
 	// 改用 sftp.File.ReadFrom：其经 reader.Stat 推断文件大小后走并发分片写（需 UseConcurrentWrites）。
-	// countingReader 透传 Stat() 给 ReadFrom 的并发判定，同时从源侧计数进度。
+	// countingReader 透传 Stat() 给 ReadFrom 的并发判定，同时从源侧计数进度并响应取消。
 	_, err = rf.ReadFrom(countingReader{r: f, t: t})
 	cerr := rf.Close()
 	if err == nil {
 		err = cerr
 	}
 	if err != nil {
+		_ = cl.Remove(tmpPath) // 清理临时文件（忽略清理失败）
+		t.finish(err)
+		return
+	}
+	if err := renameRemote(cl, tmpPath, remotePath); err != nil {
+		_ = cl.Remove(tmpPath)
 		t.finish(err)
 	}
+}
+
+// partSuffix 传输临时文件后缀：写入完成后改名为目标，取消/失败时删除。
+const partSuffix = ".part"
+
+// renameRemote 将远程临时文件改名为目标路径，覆盖已存在目标。
+// 优先用 posix-rename 扩展（OpenSSH 均支持，明确覆盖语义）；服务端不支持时
+// 回退普通 Rename。回退失败时保留原目标与临时文件，交由上层报错，避免丢数据。
+func renameRemote(cl *sftp.Client, oldPath, newPath string) error {
+	if err := cl.PosixRename(oldPath, newPath); err == nil {
+		return nil
+	}
+	return cl.Rename(oldPath, newPath)
 }
 
 // Download 将远程文件异步下载到本地路径（在调用方 goroutine 中执行）
@@ -218,19 +279,27 @@ func downloadFile(cl *sftp.Client, t *Transfer, remotePath, localPath string) {
 		t.finish(err)
 		return
 	}
-	defer rf.Close()
+	defer func() { _ = rf.Close() }() // 只读远程源文件，关闭错误不影响传输结果
 
-	f, err := os.Create(localPath)
+	// 原子写入：先写临时文件，成功后再改名为目标，避免取消/失败留下半截目标文件。
+	tmpPath := localPath + partSuffix
+	f, err := os.Create(tmpPath)
 	if err != nil {
 		t.finish(err)
 		return
 	}
-	_, err = io.Copy(io.MultiWriter(f, countingWriter{t}), rf)
+	_, err = io.Copy(io.MultiWriter(f, countingWriter{t}), cancelReader{r: rf, t: t})
 	cerr := f.Close()
 	if err == nil {
 		err = cerr
 	}
 	if err != nil {
+		_ = os.Remove(tmpPath)
+		t.finish(err)
+		return
+	}
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		_ = os.Remove(tmpPath)
 		t.finish(err)
 	}
 }
@@ -461,6 +530,19 @@ func (w countingWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// cancelReader 包裹读取端，在每次读取前检查取消状态，使下载可协作式取消。
+type cancelReader struct {
+	r io.Reader
+	t *Transfer
+}
+
+func (c cancelReader) Read(p []byte) (int, error) {
+	if err := c.t.ctxErr(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
 // countingReader 从源读取侧计数进度（供 uploadFile 的 ReadFrom 使用）。
 // 必须透传 Stat()：sftp.File.ReadFrom 依赖 reader 的大小推断并发分片数，
 // 若包装成普通 Reader 会丢失该信息，退化为串行 32KB 写（上传性能回退）。
@@ -470,6 +552,10 @@ type countingReader struct {
 }
 
 func (r countingReader) Read(p []byte) (int, error) {
+	// 取消检查：返回错误让 sftp.File.ReadFrom 的并发写循环尽快收敛。
+	if err := r.t.ctxErr(); err != nil {
+		return 0, err
+	}
 	n, err := r.r.Read(p)
 	if n > 0 {
 		r.t.add(n)
