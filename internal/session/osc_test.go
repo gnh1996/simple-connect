@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -369,14 +370,20 @@ func TestSessionCwdHookInjected(t *testing.T) {
 	// 应包含 bash/zsh/tmux passthrough/恢复 echo 各分支，且无清屏/清行控制序列。
 	waitContains(t, out, "_sc_cwd(){")
 	for _, frag := range []string{
-		"_sc_cwd(){",                      // bash 函数定义
-		"precmd_functions+=(_sc_cwd)",     // zsh precmd 追加
-		`\ePtmux;\e\e]133;cwd=%s\007\e\\`, // tmux passthrough
-		"; stty echo",                     // 恢复 ECHO
+		"_sc_cwd(){",                           // bash/zsh 共用上报函数定义
+		"precmd_functions+=(_sc_cwd)",          // zsh precmd 追加
+		`\ePtmux;\e\e]133;cwd=%s\007\e\\`,      // tmux passthrough
+		`${PROMPT_COMMAND:+; $PROMPT_COMMAND}`, // set -u 安全的自定义钩子保留
+		"stty echo",                            // 恢复 ECHO
 	} {
 		if !out.Contains(frag) {
 			t.Fatalf("注入命令应包含 %q，实际: %q", frag, out.String())
 		}
+	}
+	// stty echo 必须与钩子命令分行发送：非 POSIX shell 解析失败时同行会被一并丢弃
+	// → ECHO 永久关闭（盲打）。断言两条写入按「钩子行 \r stty echo 行」原样到达。
+	if !out.Contains(cwdHookCommand + "\rstty echo\r") {
+		t.Fatalf("stty echo 应与钩子命令分行发送（独立命令行）: %q", out.String())
 	}
 	if out.Contains("2J") || out.Contains("1A") {
 		t.Fatalf("注入命令不应包含清屏/清行控制序列（干扰 readline），实际: %q", out.String())
@@ -393,6 +400,78 @@ func TestSessionCwdHookInjected(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("detach 未在期限内返回")
+	}
+}
+
+// TestCwdHookCommandNounsetSafe 回归：cwd 钩子命令必须能在 `set -u`（nounset）
+// 且 PROMPT_COMMAND/TMUX 未设置时正常安装并调用——所有变量引用用 `${VAR:-}` / `:+`
+// 展开，否则用户 dotfiles 里的 `set -u` 会让钩子安装失败、cwd 跟踪静默失效。
+func TestCwdHookCommandNounsetSafe(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("未安装 bash，跳过 nounset 钩子回归")
+	}
+	// 在 nounset + 干净环境下安装钩子并调用一次，最后打印 PROMPT_COMMAND。
+	script := "set -u; unset PROMPT_COMMAND TMUX; " + cwdHookCommand +
+		`; _sc_cwd; printf 'PROMPT_COMMAND=%s' "$PROMPT_COMMAND"`
+	out, err := exec.Command(bash, "-c", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("set -u 下钩子安装/调用失败: %v，输出: %q", err, out)
+	}
+	if !strings.Contains(string(out), "PROMPT_COMMAND=_sc_cwd") {
+		t.Fatalf("set -u 下 PROMPT_COMMAND 未安装钩子，输出: %q", out)
+	}
+	if !strings.Contains(string(out), "\x1b]133;cwd=") {
+		t.Fatalf("_sc_cwd 应输出 OSC 133;cwd 标记，输出: %q", out)
+	}
+}
+
+// TestCwdHookCommandZsh 回归 zsh 分支：`precmd_functions+=(_sc_cwd)` 必须在 set -u
+// 且数组未设置时可用，且追加不覆盖用户已有 precmd_functions（兼容 oh-my-zsh 等）。
+func TestCwdHookCommandZsh(t *testing.T) {
+	zsh, err := exec.LookPath("zsh")
+	if err != nil {
+		t.Skip("未安装 zsh，跳过 zsh 钩子回归")
+	}
+	// 数组未设置 + nounset：钩子仍可安装并调用。
+	script := "set -u; unset PROMPT_COMMAND TMUX; unset precmd_functions; " + cwdHookCommand +
+		`; _sc_cwd; printf 'PF=%s' "${precmd_functions[*]}"`
+	out, err := exec.Command(zsh, "-c", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("set -u 下 zsh 钩子安装/调用失败: %v，输出: %q", err, out)
+	}
+	if !strings.Contains(string(out), "PF=_sc_cwd") {
+		t.Fatalf("zsh precmd_functions 未追加钩子，输出: %q", out)
+	}
+	if !strings.Contains(string(out), "\x1b]133;cwd=") {
+		t.Fatalf("_sc_cwd 应输出 OSC 133;cwd 标记，输出: %q", out)
+	}
+
+	// 追加不覆盖：已有 precmd_functions 必须保留且钩子追加在后。
+	script = "set -u; unset PROMPT_COMMAND TMUX; precmd_functions=(mystyle); " + cwdHookCommand +
+		`; printf 'PF=%s' "${precmd_functions[*]}"`
+	out, err = exec.Command(zsh, "-c", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("zsh 追加已有 precmd_functions 失败: %v，输出: %q", err, out)
+	}
+	if !strings.Contains(string(out), "PF=mystyle _sc_cwd") {
+		t.Fatalf("zsh 应保留已有 precmd_functions 并追加钩子，输出: %q", out)
+	}
+}
+
+// errWriter 始终返回写错误，用于覆盖注入/回显恢复的失败路径。
+type errWriter struct{}
+
+func (errWriter) Write(p []byte) (int, error) { return 0, errors.New("write failed") }
+
+// TestInjectCwdHookWriteFailure 回归：钩子与回显恢复两条写各自独立判定成败，
+// 失败时返回 false，调用方可只重试失败项（避免已成功字节重发导致 PROMPT_COMMAND 重复）。
+func TestInjectCwdHookWriteFailure(t *testing.T) {
+	if injectCwdHook(errWriter{}) {
+		t.Fatal("钩子写入失败时应返回 false（调用方据此保留 hookInjected=false 以重试）")
+	}
+	if restoreRemoteEcho(errWriter{}) {
+		t.Fatal("回显恢复写入失败时应返回 false（调用方据此保留 echoRestored=false 以重试）")
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/x/term"
 	"golang.org/x/crypto/ssh"
 
+	"simple-connect/internal/applog"
 	sshc "simple-connect/internal/ssh"
 )
 
@@ -26,17 +27,24 @@ const oscPromptCommand = `printf '\033]133;cwd=%s\007' "$PWD"`
 
 // cwdHookCommand 首次进入会话时注入远程 shell 的 cwd 追踪钩子（经 stdin 发送，绕开
 // sshd 默认 AcceptEnv 仅接受 LANG/LC_* 而拒绝 PROMPT_COMMAND 的限制）：
-//   - bash：定义 _sc_cwd 上报函数并追加 PROMPT_COMMAND（保留用户已有钩子）；
-//   - zsh：precmd_functions 追加（不覆盖，兼容 oh-my-zsh 等）；zsh 专属语法经 eval
-//     包裹，避免 POSIX sh 解析时报语法错误；
-//   - sh/dash：两个条件均短路，静默降级（POSIX 无提示符前钩子机制）。
+//   - 先无条件定义上报函数 _sc_cwd（if/printf 均为 POSIX 语法，bash/zsh/dash 均可解析）；
+//   - bash：追加 PROMPT_COMMAND，保留用户已有钩子；`${PROMPT_COMMAND:+...}` 展开，
+//     兼容 `set -u` 下 PROMPT_COMMAND 未设置的情况；
+//   - zsh：`eval` 包裹 precmd_functions 追加（zsh 专属数组语法不能裸写，否则 POSIX
+//     sh 解析整行失败；eval 让 dash 把它当字符串，追加不覆盖，兼容 oh-my-zsh 等）；
+//   - sh/dash：两个条件分支均短路，静默降级（POSIX 无提示符前钩子机制）。
+//
+// 所有变量引用均为 nounset（set -u）安全：条件变量用 `${VAR:-}`、追加用 `:+`——
+// 否则 `set -u` 用户会因未定义变量报错而装不上钩子（cwd 跟踪静默失效）。
 //
 // 上报经 OSC 133;cwd；远程 tmux 内用 passthrough 序列（\ePtmux;...）穿透。
 // **本命令不含任何终端控制序列**（清行/清屏会干扰 bash readline，导致光标错位、
-// 输入不可见）；明文回显由 Handle.run 用 `stty -echo` 包裹隐藏（ECHO 关闭期间
-// 发送，命令不回显，随后恢复 ECHO），仅残留一行 `stty -echo`。
+// 输入不可见）。回显隐藏靠 pty-req 的 ECHO=0（见 ssh.Client.NewTerminalSession）：
+// bash 的 readline 在 tty ECHO=0 时会关闭自身回显，注入命令不可见；zsh 的 ZLE
+// 始终重绘输入行，注入命令会在首屏被显示一次（纯观感，不影响功能）。
+// 恢复交互回显由 restoreRemoteEcho 单独发送 `stty echo` 完成。
 // 仅影响提示符前的一次 OSC 输出，不改目录、不执行远程可执行负载。
-const cwdHookCommand = `[ -n "$BASH_VERSION" ] && { _sc_cwd(){ if [ -n "$TMUX" ]; then printf '\ePtmux;\e\e]133;cwd=%s\007\e\\' "$PWD"; else printf '\e]133;cwd=%s\007' "$PWD"; fi; }; export PROMPT_COMMAND="_sc_cwd; ${PROMPT_COMMAND}"; }; [ -n "$ZSH_VERSION" ] && { eval '_sc_cwd(){ if [ -n "$TMUX" ]; then printf '\''\ePtmux;\e\e]133;cwd=%s\007\e\\'\'' "$PWD"; else printf '\''\e]133;cwd=%s\007'\'' "$PWD"; fi; }; precmd_functions+=(_sc_cwd);'; }`
+const cwdHookCommand = `_sc_cwd(){ if [ -n "${TMUX:-}" ]; then printf '\ePtmux;\e\e]133;cwd=%s\007\e\\' "$PWD"; else printf '\e]133;cwd=%s\007' "$PWD"; fi; }; [ -n "${BASH_VERSION:-}" ] && export PROMPT_COMMAND="_sc_cwd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"; [ -n "${ZSH_VERSION:-}" ] && eval 'precmd_functions+=(_sc_cwd)'`
 
 // localeEnvKeys 透传到远程会话的环境变量（对齐 OpenSSH 客户端默认 SendEnv LANG LC_*）。
 // 不传时远程落到 C/POSIX locale：readline 按字节处理输入，中文/非 ASCII 输入后
@@ -317,7 +325,12 @@ type Handle struct {
 	waitDone chan error
 	rows     int
 	cols     int
-	started  bool // 是否已进行首次透传（首次进入清屏 + 注入 cwd 钩子；恢复时原样不动）
+
+	// 首次进入的三个动作各自独立记状态：失败时下次 Resume 只重试失败项（恢复时不
+	// 重发已成功的字节），且清屏只发生一次，不受注入结果影响。
+	cleared      bool // 是否已首次清屏（仅真实终端）
+	hookInjected bool // cwd 钩子是否已成功写入
+	echoRestored bool // 远程回显（stty echo）是否已成功写入
 
 	// 测试注入：非 nil 时绕过真实终端（raw/清屏/输入源），使用注入的 IO
 	testIn              io.Reader
@@ -356,6 +369,32 @@ func newTestHandle(cl *sshc.Client, in io.Reader, out io.Writer, rows, cols int)
 	return h, nil
 }
 
+// injectCwdHook 首次进入会话时注入 cwd 钩子命令，返回是否写入成功。
+// 失败时调用方不置 hookInjected，下次 Resume 只重试本项（不会重复发送回显恢复）。
+//
+// 钩子命令与 `stty echo` **分两条独立命令行**发送（见 restoreRemoteEcho）：钩子含
+// `{ }`/`export`/`eval` 等语法，fish/csh 等非 POSIX 登录 shell 可能整行解析失败而
+// 丢弃该行；若 `stty echo` 与之同行会被一并丢弃，pty-req 设置的 ECHO=0 将永久生效
+// → 用户输入完全不可见（盲打）。独立一行则不受前一行解析结果影响。
+func injectCwdHook(w io.Writer) bool {
+	if _, err := io.WriteString(w, cwdHookCommand+"\r"); err != nil {
+		applog.Errorf("注入 cwd 钩子失败: %v", err)
+		return false
+	}
+	return true
+}
+
+// restoreRemoteEcho 单独一行发送 `stty echo` 恢复远程回显，返回是否写入成功。
+// 与 injectCwdHook 分开记录状态：钩子已注入但本行写失败时，Resume 只需补发本行，
+// 不必重发钩子（避免 PROMPT_COMMAND 重复追加）。
+func restoreRemoteEcho(w io.Writer) bool {
+	if _, err := io.WriteString(w, "stty echo\r"); err != nil {
+		applog.Errorf("恢复远程回显失败: %v", err)
+		return false
+	}
+	return true
+}
+
 // run 执行一次透传：置 raw、启动输入源与尺寸监听；首次进入时清屏并注入 cwd 钩子，
 // 恢复（Resume）时原样恢复（不清屏、不发任何字节，画面保持 detach 时状态）。
 // detach 时挂起返回 ErrDetach。
@@ -385,19 +424,21 @@ func (h *Handle) run() error {
 		}
 		_ = h.s.WindowChange(h.rows, h.cols)
 
-		if !h.started {
-			fmt.Print("\x1b[2J\x1b[H") // 仅首次进入清屏
+		if !h.cleared {
+			fmt.Print("\x1b[2J\x1b[H") // 仅首次进入清屏一次
+			h.cleared = true
 		}
 	}
-	// 仅首次进入：注入 cwd 追踪钩子（shell 在提示符前自动上报目录）。
-	// pty-req 已设 ECHO=0（见 ssh.Client.NewTerminalSession），注入命令从第一条起
-	// 就不回显、无 stty -echo 引导行残留；命令末尾 `stty echo` 恢复交互回显
-	// （`clear` 已移除：`clear` 的 terminfo 序列会清 scrollback 丢弃横幅/motd，
-	// 首次进入的清屏已由 run() 的 `fmt.Print("\x1b[2J\x1b[H")` 完成）。
-	// 从 SFTP 恢复时不发任何字节（原样恢复）。
-	if !h.started {
-		_, _ = h.inPipe.Write([]byte(cwdHookCommand + "; stty echo\r"))
-		h.started = true
+	// 仅首次进入：注入 cwd 追踪钩子（shell 在提示符前自动上报目录），随后单独一行
+	// 恢复远程回显。两项各自记状态：任一项失败时下次 Resume 只补发失败项，已成功的
+	// 字节不重发（恢复时保持原样）。pty-req 已设 ECHO=0（见 ssh.Client.NewTerminalSession），
+	// bash 下注入命令从第一条起就不回显；恢复回显不依赖复杂命令能否被远程 shell 解析
+	// （详见 injectCwdHook / restoreRemoteEcho）。
+	if !h.hookInjected {
+		h.hookInjected = injectCwdHook(h.inPipe)
+	}
+	if !h.echoRestored {
+		h.echoRestored = restoreRemoteEcho(h.inPipe)
 	}
 
 	_, detached, err := runOnce(h.s, in, h.tracker, h.inPipe, h.waitDone)

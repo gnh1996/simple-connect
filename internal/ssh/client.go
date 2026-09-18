@@ -149,8 +149,10 @@ func (c *Client) NewTerminalSession(term string, rows, cols int) (*ssh.Session, 
 	// 可能关闭 IUTF8/IMAXBEL 等关键项，导致退格吃半个 UTF-8 字符、光标错位）；
 	// 控制字符（VINTR/VERASE/VSUSP 等）不发送，保留服务器配置。
 	// ECHO=0：会话建立即关闭回显——首条 cwd 钩子注入命令从第一条起就不回显
-	//（无 stty -echo 引导行残留，见 internal/session）；注入末尾 `stty echo`
+	//（无 stty -echo 引导行残留，见 internal/session）；随后单独一行 `stty echo`
 	// 恢复交互回显，之后与 OpenSSH（ECHO=1）表现一致。
+	// 注意：仅 bash 的 readline 会在 tty ECHO=0 时关闭自身回显、隐藏注入命令；
+	// zsh 的 ZLE 始终重绘输入行，注入命令会在首屏显示一次（观感问题，不影响功能）。
 	modes := ssh.TerminalModes{
 		ssh.ECHO:          0,
 		ssh.ECHOE:         1,
@@ -270,7 +272,7 @@ func (e *UnknownHostKeyError) Error() string {
 }
 
 // TrustHostKey 将 UnknownHostKeyError 携带的主机指纹追加到 known_hosts
-//（用户确认信任后调用）。返回错误表示追加失败。
+// （用户确认信任后调用）。返回错误表示追加失败。
 func TrustHostKey(e *UnknownHostKeyError) error {
 	return trustHostKeyPath(e, defaultKnownHostsPath())
 }
