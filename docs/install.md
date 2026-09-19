@@ -1,6 +1,6 @@
 # 安装指南
 
-> **版本说明**：README 描述 `main` 分支行为；当前最新 Release `v0.2.0` 尚未包含后续改动（如 SFTP `t`/`p` 统一传输，该版本键位为旧的 `u` 路径上传 / `d` 下载），安装后行为可能与 README 不一致。建议关注新版本发布，或直接源码构建。
+> **版本说明**：本指南与 README 描述 `main` 分支行为，自 `v0.2.1` 起的 Release 与之一致；安装更早版本（如 `v0.2.0`）时 SFTP 键位为旧的 `u` 路径上传 / `d` 下载。
 
 ## Linux / macOS
 
@@ -13,7 +13,7 @@
 curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -s -- --release
 
 # 指定版本（可用版本见 https://github.com/gnh1996/simple-connect/releases）
-curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -s -- --release v0.2.0
+curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -s -- --release v0.2.1
 
 # 自定义安装目录（默认 ~/.local/bin）
 INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -s -- --release
@@ -66,7 +66,7 @@ powershell -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" 
 ```powershell
 # 下载二进制
 New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\simple-connect" | Out-Null
-Invoke-WebRequest -Uri https://github.com/gnh1996/simple-connect/releases/download/v0.2.0/simple-connect-windows-amd64.exe `
+Invoke-WebRequest -Uri https://github.com/gnh1996/simple-connect/releases/download/v0.2.1/simple-connect-windows-amd64.exe `
   -OutFile "$env:LOCALAPPDATA\simple-connect\simple-ssh.exe"
 Unblock-File "$env:LOCALAPPDATA\simple-connect\simple-ssh.exe"
 
@@ -93,7 +93,7 @@ simple-connect 是开源的未签名工具，首次下载运行时 Defender 可�
 
 ```powershell
 Get-FileHash "$env:LOCALAPPDATA\simple-connect\simple-ssh.exe" -Algorithm SHA256
-# 将输出与 https://github.com/gnh1996/simple-connect/releases/download/v0.2.0/SHA256SUMS 比对
+# 将输出与 https://github.com/gnh1996/simple-connect/releases/download/v0.2.1/SHA256SUMS 比对
 ```
 
 ## 源码构建
@@ -111,7 +111,7 @@ go build -o simple-ssh .
 ```bash
 ./scripts/install.sh                 # 源码构建（需 Go）
 ./scripts/install.sh --release       # 下载 GitHub 最新 Release
-./scripts/install.sh --release v0.2.0
+./scripts/install.sh --release v0.2.1
 INSTALL_DIR=/usr/local/bin ./scripts/install.sh   # 自定义安装目录
 ```
 
@@ -120,6 +120,6 @@ INSTALL_DIR=/usr/local/bin ./scripts/install.sh   # 自定义安装目录
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1                    # 源码构建（需 Go）
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release latest    # 下载 GitHub 最新 Release
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release v0.2.0    # 指定版本
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release v0.2.1    # 指定版本
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -UsePrebuilt       # 使用 dist/ 预编译二进制
 ```

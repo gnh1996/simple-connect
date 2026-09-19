@@ -5,7 +5,7 @@
 # 用法：
 #   ./scripts/install.sh                         # 从源码构建（需 Go 工具链）
 #   ./scripts/install.sh --release               # 下载 GitHub 最新 Release 预编译二进制
-#   ./scripts/install.sh --release v0.1.0        # 下载指定版本（如 v0.1.0）
+#   ./scripts/install.sh --release v0.2.1        # 下载指定版本（如 v0.2.1）
 #   INSTALL_DIR=/usr/local/bin ./scripts/install.sh   # 自定义安装目录
 #
 # 说明：默认从源码构建；--release 时从 GitHub Releases 拉取对应平台的预编译二进制，

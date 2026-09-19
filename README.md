@@ -37,7 +37,7 @@ powershell -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" 
 go build -o simple-ssh .
 ```
 
-> 指定版本、手动安装、`SHA256SUMS` 校验、Defender 误报处理等见 [docs/install.md](docs/install.md)。本 README 描述 `main` 分支行为；与最新 Release 的差异（含 SFTP 键位）见该文档顶部的版本说明。
+> 指定版本、手动安装、`SHA256SUMS` 校验、Defender 误报处理等见 [docs/install.md](docs/install.md)。
 
 ## 使用
 

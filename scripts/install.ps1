@@ -4,7 +4,7 @@
 # Usage (PowerShell):
 #   powershell -ExecutionPolicy Bypass -File scripts\install.ps1                # build from source (needs Go)
 #   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release       # download latest GitHub Release
-#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release v0.1.0
+#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release v0.2.1
 #   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -UsePrebuilt   # use prebuilt binary in dist/
 #   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -InstallDir D:\tools\simple-ssh
 #
@@ -73,7 +73,7 @@ if ($Release) {
         Write-Host "Use the two-step install instead (avoids irm|iex, so Defender does not block it):" -ForegroundColor Yellow
         Write-Host '  Invoke-WebRequest -Uri "https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.ps1" -OutFile "$env:TEMP\simple-connect-install.ps1"' -ForegroundColor Cyan
         Write-Host '  Unblock-File "$env:TEMP\simple-connect-install.ps1"' -ForegroundColor Cyan
-        Write-Host '  powershell -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" -Release v0.1.0' -ForegroundColor Cyan
+        Write-Host '  powershell -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" -Release v0.2.1' -ForegroundColor Cyan
         exit 1
     }
     Write-Host "==> Building simple-ssh.exe from source ..."
