@@ -61,6 +61,11 @@ internal/
 - **分层约定**：SFTP 传输与浏览逻辑必须放 `internal/sftp` 包（`Dial`/`List`/`Remove`/`Transfer`/`Upload`/`Download`/`FormatSize`），该包不依赖 bubbletea；TUI 层只负责调度（`tea.Tick` 进度轮询）与渲染。
 - **异步操作**：SFTP 上传/下载必须通过 `sftpc.Upload`/`sftpc.Download` 在 goroutine 中执行，进度写入带 mutex 的 `sftpc.Transfer`，TUI 层用 `tea.Tick` 轮询回传，禁止阻塞 Update 循环。
 - **传输取消与原子写入**：传输**不支持离页后台继续，也不支持再次进入恢复进度**（`Transfer` 绑定 SFTP 页模型，离页即关闭连接）。上传/下载统一写 `<目标>.part` 临时文件，成功后改名为最终目标（远程优先 `PosixRename`），取消/失败时删除临时文件，避免半截目标文件。`Transfer.Cancel()` 为协作式取消（读写前检查 ctx，`Canceled()` 区分用户取消与真实错误）；TUI 传输中 `q`/`Ctrl+C` 先弹退出确认，确认后请求取消并轮询等待，取消完成（临时文件已清理）才回列表，超时约 5s 兜底强制离开。
+- **传输前扫描（覆盖冲突 + 总量）**：`sftpc.ScanUpload`/`ScanDownload`/`BatchScan` 一次扫描同时产出冲突列表与总字节数，TUI 存入 `pendingTransfer.total` 并用 `Transfer.SetTotal` 预设，传输函数（`UploadPath`/`DownloadPath`/`BatchTransfer`）检测到已预设则跳过开传前的目录统计。上传目录的冲突检测改为「一次远程 Walk 建已存在文件集合 + 一次本地 Walk 比对」（旧实现是逐文件远程 Stat 的 N 次往返）；远程 Walk 循环内须检查 `walker.Err()`。覆盖确认取消靠 `overwriteSeq` 作废迟到结果。
+- **下载并发读**：`downloadFile` 必须直接 `rf.WriteTo(progressWriter{w: f, t: t})`——进度计数与取消检查放在**写侧**。禁止把 `*sftp.File` 包成只暴露 `Read` 的 Reader（会挡住 `io.WriterTo`，退回 32KB 串行读，回归基准 `BenchmarkDownloadBufSize` 会暴露）；取消非瞬时（WriteTo 收敛在途读 goroutine），与上层约 5s 兜底一致。
+- **列表页状态与探测**：列表状态（过滤词/光标 ID/在线状态 map）通过 `ListState` 快照在 `main` 的 SSH 往返间保留（`NewRootWithListState`/`Root.ListState()`）；`reload` 按 host ID 恢复光标、保留 status，删除当前项落邻近位置。状态轮询用双世代号：`tickGen` 管续订链（Init/回列表自增并挂新 tick，过期 tick 丢弃——**禁止用 armed 布尔**）、`probeGen` 作废过期探测结果；探测每台主机一个 Cmd（`tea.Batch` 并发、信号量限流 10），探完即亮。列表滚动窗口与列宽按 `WindowSizeMsg` 计算，名称/目标列先 `runewidth.Truncate` 再 `padRight`。
+- **表单 View 只读**：`formModel.View()` 不得 mutate 模型（错误提示保留到用户下一次按键的 `Update` 才清）；密码/私钥字段按认证方式二选一显示，Tab/方向键导航只经过可见字段（字段下标常量见 `form.go`）。
+- **本地路径用 `filepath`、远程路径用 `path`**：SFTP 本地栏导航（`enterCurrent`/`goUp`/`mkdir`）一律 `filepath.Join`/`localParent`（filepath.Dir），Windows 盘符路径下 `path.Dir` 会直接坏；远程栏保持 POSIX `path`。
 - **并发安全**：跨 goroutine 共享状态（传输进度等）必须加锁，禁止在 Cmd 闭包内直接修改 UI 模型字段（存在数据竞争）。
 - **关联匹配优先数据库/服务端处理**：SFTP 目录读取、删除等一律走 `pkg/sftp` 原生接口，禁止本地缓存后拼接。
 - **凭据安全**：密码不落明文配置（hosts.json），经 `store.Secrets` 接口存入系统 keyring，无 keyring 时兜底文件（0600），并在 UI 显示"密码明文存储"警告。

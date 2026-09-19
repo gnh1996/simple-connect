@@ -129,6 +129,7 @@ type Transfer struct {
 	Up       bool
 	done     int64
 	total    int64
+	totalSet bool // total 已被调用方预设（预扫描），传输前不再重复统计
 	finished bool
 	err      error
 
@@ -188,6 +189,22 @@ func (t *Transfer) setTotal(n int64) {
 	t.mu.Lock()
 	t.total = n
 	t.mu.Unlock()
+}
+
+// SetTotal 预设传输总字节数（由预扫描得到，避免传输前再走一遍目录树）。
+// 与内部 setTotal 的区别：显式标记 total 已知，即使为 0 也不再重新统计。
+func (t *Transfer) SetTotal(n int64) {
+	t.mu.Lock()
+	t.total = n
+	t.totalSet = true
+	t.mu.Unlock()
+}
+
+// hasTotal 报告调用方是否已预设 total。
+func (t *Transfer) hasTotal() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.totalSet
 }
 
 // Err 返回传输结果错误（finished 前通常为 nil）
@@ -288,7 +305,13 @@ func downloadFile(cl *sftp.Client, t *Transfer, remotePath, localPath string) {
 		t.finish(err)
 		return
 	}
-	_, err = io.Copy(io.MultiWriter(f, countingWriter{t}), cancelReader{r: rf, t: t})
+	// 关键：不能再用 io.Copy(mw, cancelReader{rf}) 之类只暴露 Read 的包装——
+	// 那会挡住 *sftp.File 的 io.WriterTo，退回 32KB 串行读（下载比上传慢数倍）。
+	// 直接 rf.WriteTo(progressWriter)：pkg/sftp 对普通文件默认并发读（UseConcurrentReads
+	// 默认开启），进度计数与取消检查放在写侧——WriteTo 的 reduce 循环写为串行，
+	// Write 返回错误即停止分发（仍会等待在途读 goroutine 收敛，取消非瞬时，
+	// 与上层约 5s 兜底一致）。
+	_, err = rf.WriteTo(progressWriter{w: f, t: t})
 	cerr := f.Close()
 	if err == nil {
 		err = cerr
@@ -311,38 +334,47 @@ type BatchItem struct {
 }
 
 // UploadPath 传输单个本地路径（文件或目录递归，进度汇总到 t）。
+// 若调用方已通过 Transfer.SetTotal 预设总量（预扫描），则跳过开传前的目录统计。
 func UploadPath(cl *sftp.Client, t *Transfer, localPath, remotePath string) {
-	total, err := dirSizeLocal(localPath)
-	if err != nil {
-		t.finish(err)
-		return
+	if !t.hasTotal() {
+		total, err := dirSizeLocal(localPath)
+		if err != nil {
+			t.finish(err)
+			return
+		}
+		t.setTotal(total)
 	}
-	t.setTotal(total)
 	uploadItem(cl, t, localPath, remotePath)
 	t.finish(t.Err())
 }
 
 // DownloadPath 传输单个远程路径（文件或目录递归，进度汇总到 t）。
+// 若调用方已通过 Transfer.SetTotal 预设总量（预扫描），则跳过开传前的目录统计。
 func DownloadPath(cl *sftp.Client, t *Transfer, remotePath, localPath string) {
-	total, err := dirSizeRemote(cl, remotePath)
-	if err != nil {
-		t.finish(err)
-		return
+	if !t.hasTotal() {
+		total, err := dirSizeRemote(cl, remotePath)
+		if err != nil {
+			t.finish(err)
+			return
+		}
+		t.setTotal(total)
 	}
-	t.setTotal(total)
 	downloadItem(cl, t, remotePath, localPath)
 	t.finish(t.Err())
 }
 
 // BatchTransfer 批量传输（文件或目录递归，进度汇总到 t）。
 // 在调用方 goroutine 中执行；首个失败即中止。
+// 若调用方已通过 Transfer.SetTotal 预设总量（预扫描），则跳过开传前的汇总统计。
 func BatchTransfer(cl *sftp.Client, t *Transfer, up bool, items []BatchItem) {
-	total, err := batchTotal(cl, up, items)
-	if err != nil {
-		t.finish(err)
-		return
+	if !t.hasTotal() {
+		total, err := batchTotal(cl, up, items)
+		if err != nil {
+			t.finish(err)
+			return
+		}
+		t.setTotal(total)
 	}
-	t.setTotal(total)
 	for _, it := range items {
 		if up {
 			uploadItem(cl, t, it.Src, it.Dst)
@@ -530,17 +562,23 @@ func (w countingWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// cancelReader 包裹读取端，在每次读取前检查取消状态，使下载可协作式取消。
-type cancelReader struct {
-	r io.Reader
+// progressWriter 包装下载目标文件：在写侧计数进度并检查取消。
+// 不能包住源端 Reader（会丢失 io.WriterTo，退化为串行 32KB 读）；
+// sftp.File.WriteTo 的 reduce 阶段串行调用 Write，返回错误即停止分发。
+type progressWriter struct {
+	w io.Writer
 	t *Transfer
 }
 
-func (c cancelReader) Read(p []byte) (int, error) {
-	if err := c.t.ctxErr(); err != nil {
+func (p progressWriter) Write(b []byte) (int, error) {
+	if err := p.t.ctxErr(); err != nil {
 		return 0, err
 	}
-	return c.r.Read(p)
+	n, err := p.w.Write(b)
+	if n > 0 {
+		p.t.add(n)
+	}
+	return n, err
 }
 
 // countingReader 从源读取侧计数进度（供 uploadFile 的 ReadFrom 使用）。
@@ -607,124 +645,168 @@ func posixRel(base, target string) (string, error) {
 	return filepath.ToSlash(rel), nil
 }
 
-// UploadConflicts 检测上传本地路径到远程路径是否会覆盖已存在文件。
+// ScanResult 传输前扫描结果：源侧总字节数与目标侧冲突路径。
+// 冲突检测与总量统计合并为一次扫描，避免覆盖确认与传输各走一遍目录树。
+type ScanResult struct {
+	Total     int64
+	Conflicts []string
+}
+
+// ScanUpload 扫描上传：统计本地源将传输的字节数，并检测远程目标是否会被覆盖。
+// ctx 取消后远程/本地 Walk 尽快退出（避免 Esc 取消覆盖检测后仍走完整棵树）。
 // 若 localPath 为文件：检查 remotePath 是否已存在；
-// 若为目录：递归检查目录内每个普通文件对应的远程路径是否已存在（目录本身已存在不算冲突，仅文件覆盖算）。
-// 返回冲突的远程路径列表（可能为空），异常时返回 error。
-func UploadConflicts(cl *sftp.Client, localPath, remotePath string) ([]string, error) {
+// 若为目录：一次远程 Walk 建立目标已存在文件集合，再一次本地 Walk 比对
+// （把旧实现每文件一次远程 Stat 的 N 次往返压成 O(目录数) 次 readdir；目录本身
+// 已存在不算冲突，仅文件覆盖算）。目标已存在且为文件时整体视为冲突。
+// 注意：远程 Walk 用 Lstat 语义，不会递归进符号链接目录；上传写入时会跟随
+// 路径中的符号链接，此类边角场景不再逐一提示覆盖。
+func ScanUpload(ctx context.Context, cl *sftp.Client, localPath, remotePath string) (ScanResult, error) {
+	var res ScanResult
 	st, err := os.Stat(localPath)
 	if err != nil {
-		return nil, err
+		return res, err
 	}
 	if !st.IsDir() {
+		res.Total = st.Size()
 		if _, err := cl.Stat(remotePath); err == nil {
-			return []string{remotePath}, nil
+			res.Conflicts = []string{remotePath}
 		} else if !isNotExist(err) {
-			return nil, err
+			return ScanResult{}, err
 		}
-		return nil, nil
+		return res, nil
 	}
 	// 目录：检查目标类型冲突（远程已存在且为文件）
+	existing := map[string]struct{}{}
 	if rst, err := cl.Stat(remotePath); err == nil {
 		if !rst.IsDir() {
-			return []string{remotePath}, nil
+			res.Conflicts = append(res.Conflicts, remotePath)
+		} else {
+			walker := cl.Walk(remotePath)
+			for walker.Step() {
+				if err := ctx.Err(); err != nil {
+					return ScanResult{}, err
+				}
+				if walker.Err() != nil {
+					return ScanResult{}, walker.Err()
+				}
+				if !walker.Stat().IsDir() {
+					existing[walker.Path()] = struct{}{}
+				}
+			}
 		}
 	} else if !isNotExist(err) {
-		return nil, err
+		return ScanResult{}, err
 	}
-	var conflicts []string
 	err = filepath.WalkDir(localPath, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if d.IsDir() {
-			return nil
-		}
-		if !d.Type().IsRegular() {
-			return nil
-		}
-		rel, err := filepath.Rel(localPath, p)
-		if err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if d.IsDir() || !d.Type().IsRegular() {
+			return nil // 仅统计/传输普通文件（uploadItem 同口径）
+		}
+		if info, ierr := d.Info(); ierr == nil {
+			res.Total += info.Size()
+		}
+		rel, rerr := filepath.Rel(localPath, p)
+		if rerr != nil {
+			return rerr
 		}
 		remote := path.Join(remotePath, filepath.ToSlash(rel))
-		if _, err := cl.Stat(remote); err == nil {
-			conflicts = append(conflicts, remote)
-		} else if !isNotExist(err) {
-			return err
+		if _, ok := existing[remote]; ok {
+			res.Conflicts = append(res.Conflicts, remote)
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return ScanResult{}, err
 	}
-	return conflicts, nil
+	return res, nil
 }
 
-// DownloadConflicts 检测下载远程路径到本地路径是否会覆盖已存在文件。
-func DownloadConflicts(cl *sftp.Client, remotePath, localPath string) ([]string, error) {
+// ScanDownload 扫描下载：一次远程 Walk 同时统计总字节数并检测本地是否会被覆盖。
+// ctx 取消后远程 Walk 尽快退出（同 ScanUpload）。
+// 若 remotePath 为文件：总字节数为文件大小，检查 localPath 是否已存在；
+// 若为目录：检查本地目标类型冲突（本地已存在且为文件），并逐条比对本地同名路径。
+func ScanDownload(ctx context.Context, cl *sftp.Client, remotePath, localPath string) (ScanResult, error) {
+	var res ScanResult
 	st, err := cl.Stat(remotePath)
 	if err != nil {
-		return nil, err
+		return res, err
 	}
 	if !st.IsDir() {
+		res.Total = st.Size()
 		if _, err := os.Stat(localPath); err == nil {
-			return []string{localPath}, nil
+			res.Conflicts = []string{localPath}
 		} else if !os.IsNotExist(err) {
-			return nil, err
+			return ScanResult{}, err
 		}
-		return nil, nil
+		return res, nil
 	}
 	// 目录：检查目标类型冲突（本地已存在且为文件）
+	localIsFile := false
 	if lst, err := os.Stat(localPath); err == nil {
 		if !lst.IsDir() {
-			return []string{localPath}, nil
+			res.Conflicts = append(res.Conflicts, localPath)
+			localIsFile = true // 目标为文件：不再逐条比对子路径（路径拼接会 ENOTDIR）
 		}
 	} else if !os.IsNotExist(err) {
-		return nil, err
+		return ScanResult{}, err
 	}
-	var conflicts []string
 	walker := cl.Walk(remotePath)
 	for walker.Step() {
+		if err := ctx.Err(); err != nil {
+			return ScanResult{}, err
+		}
 		if walker.Err() != nil {
-			return nil, walker.Err()
+			return ScanResult{}, walker.Err()
 		}
 		if walker.Stat().IsDir() {
+			continue
+		}
+		res.Total += walker.Stat().Size()
+		if localIsFile {
 			continue
 		}
 		p := walker.Path()
 		rel, err := posixRel(remotePath, p)
 		if err != nil {
-			return nil, err
+			return ScanResult{}, err
 		}
 		local := localPath
 		if rel != "." {
 			local = filepath.Join(localPath, filepath.FromSlash(rel))
 		}
 		if _, err := os.Stat(local); err == nil {
-			conflicts = append(conflicts, local)
+			res.Conflicts = append(res.Conflicts, local)
 		} else if !os.IsNotExist(err) {
-			return nil, err
+			return ScanResult{}, err
 		}
 	}
-	return conflicts, nil
+	return res, nil
 }
 
-// BatchConflicts 批量检测覆盖冲突（up=true 为上传，false 为下载）
-func BatchConflicts(cl *sftp.Client, up bool, items []BatchItem) ([]string, error) {
-	var all []string
+// BatchScan 批量扫描覆盖冲突与总量（up=true 为上传，false 为下载）
+func BatchScan(ctx context.Context, cl *sftp.Client, up bool, items []BatchItem) (ScanResult, error) {
+	var all ScanResult
 	for _, it := range items {
-		var cur []string
+		if err := ctx.Err(); err != nil {
+			return ScanResult{}, err
+		}
+		var cur ScanResult
 		var err error
 		if up {
-			cur, err = UploadConflicts(cl, it.Src, it.Dst)
+			cur, err = ScanUpload(ctx, cl, it.Src, it.Dst)
 		} else {
-			cur, err = DownloadConflicts(cl, it.Src, it.Dst)
+			cur, err = ScanDownload(ctx, cl, it.Src, it.Dst)
 		}
 		if err != nil {
-			return nil, err
+			return ScanResult{}, err
 		}
-		all = append(all, cur...)
+		all.Total += cur.Total
+		all.Conflicts = append(all.Conflicts, cur.Conflicts...)
 	}
 	return all, nil
 }

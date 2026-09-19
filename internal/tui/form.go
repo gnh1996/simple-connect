@@ -21,6 +21,13 @@ type formField struct {
 	choice *choiceField
 }
 
+// 表单字段固定下标（save 按位置取值，勿调整顺序）
+const (
+	fieldAuthIdx     = 4
+	fieldPasswordIdx = 5
+	fieldKeyIdx      = 6
+)
+
 // choiceField 单选字段
 type choiceField struct {
 	options []string
@@ -98,6 +105,27 @@ func textInput(value, placeholder string) textinput.Model {
 	return ti
 }
 
+// visible 字段是否在当前认证方式下显示（密码/私钥二选一，避免过无关字段）
+func (m *formModel) visible(idx int) bool {
+	switch idx {
+	case fieldPasswordIdx:
+		return m.fields[fieldAuthIdx].choice.index == 0
+	case fieldKeyIdx:
+		return m.fields[fieldAuthIdx].choice.index == 1
+	}
+	return true
+}
+
+// lastVisible 最后一个可见字段下标
+func (m *formModel) lastVisible() int {
+	for i := len(m.fields) - 1; i >= 0; i-- {
+		if m.visible(i) {
+			return i
+		}
+	}
+	return len(m.fields) - 1
+}
+
 func (m *formModel) Init() tea.Cmd {
 	m.focus(0)
 	return nil
@@ -108,7 +136,7 @@ func (m *formModel) focus(idx int) {
 		if f.input == nil {
 			continue
 		}
-		if i == idx {
+		if i == idx && m.visible(i) {
 			f.input.Focus()
 		} else {
 			f.input.Blur()
@@ -119,6 +147,16 @@ func (m *formModel) focus(idx int) {
 func (m *formModel) Update(msg tea.Msg) (*formModel, tea.Cmd) {
 	if m.cursor >= len(m.fields) {
 		m.cursor = len(m.fields) - 1
+	}
+	if _, ok := msg.(tea.KeyPressMsg); ok {
+		// 用户继续操作时清除上次错误提示（View 只读，不在渲染时清模型）；
+		// 窗口尺寸等非按键消息保留错误，避免提示一闪而过。
+		m.err = ""
+	}
+	if !m.visible(m.cursor) {
+		// 当前字段被认证方式切换隐藏：回落到认证方式字段，不操作不可见字段
+		m.cursor = fieldAuthIdx
+		m.focus(m.cursor)
 	}
 	f := m.fields[m.cursor]
 
@@ -132,12 +170,12 @@ func (m *formModel) Update(msg tea.Msg) (*formModel, tea.Cmd) {
 			if k.Mod == tea.ModShift {
 				return m.prev(), nil
 			}
-			if m.cursor == len(m.fields)-1 {
+			if m.cursor == m.lastVisible() {
 				return m.save()
 			}
 			return m.next(), nil
 		case tea.KeyDown, tea.KeyEnter:
-			if m.cursor == len(m.fields)-1 {
+			if m.cursor == m.lastVisible() {
 				return m.save()
 			}
 			return m.next(), nil
@@ -166,15 +204,27 @@ func (m *formModel) Update(msg tea.Msg) (*formModel, tea.Cmd) {
 }
 
 func (m *formModel) next() *formModel {
-	m.cursor = (m.cursor + 1) % len(m.fields)
+	m.cursor = m.nextVisible(m.cursor, 1)
 	m.focus(m.cursor)
 	return m
 }
 
 func (m *formModel) prev() *formModel {
-	m.cursor = (m.cursor - 1 + len(m.fields)) % len(m.fields)
+	m.cursor = m.nextVisible(m.cursor, -1)
 	m.focus(m.cursor)
 	return m
+}
+
+// nextVisible 从 from 起沿 dir 方向找下一个可见字段下标（找不到返回 from）。
+func (m *formModel) nextVisible(from, dir int) int {
+	n := len(m.fields)
+	for step := 1; step <= n; step++ {
+		i := ((from+dir*step)%n + n) % n
+		if m.visible(i) {
+			return i
+		}
+	}
+	return from
 }
 
 func (m *formModel) save() (*formModel, tea.Cmd) {
@@ -260,6 +310,9 @@ func (m *formModel) View() tea.View {
 	}
 
 	for i, f := range m.fields {
+		if !m.visible(i) {
+			continue
+		}
 		cursorMark := "  "
 		if i == m.cursor {
 			cursorMark = styleCursor.Render("▸ ")
@@ -285,8 +338,9 @@ func (m *formModel) View() tea.View {
 	}
 
 	if m.err != "" {
+		// View 只读：不在渲染时清 m.err（否则下一条任意 Msg 就会让错误消失，
+		// 用户容易以为已提交）。清除由 Update 在下次按键时负责。
 		b.WriteString("\n" + styleError.Render(m.err) + "\n")
-		m.err = ""
 	}
 
 	b.WriteString("\n" + styleFooter.Render(styleDim.Render("Enter 保存  Tab/↓ 下一个  ↑ 上一个  Esc 取消")) + "\n")

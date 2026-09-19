@@ -2,6 +2,7 @@ package sftp
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -164,8 +165,12 @@ func TestLargeFileConcurrentUpload(t *testing.T) {
 	dst := filepath.Join(t.TempDir(), "big.bin")
 	td := NewTransfer("big.bin", false)
 	Download(conn.Client, td, remote, dst)
-	if _, _, finished, err := td.Snapshot(); !finished || err != nil {
+	done, total, finished, err = td.Snapshot()
+	if !finished || err != nil {
 		t.Fatalf("下载异常: finished=%v err=%v", finished, err)
+	}
+	if total != int64(len(content)) || done != int64(len(content)) {
+		t.Fatalf("下载进度 total=%d done=%d，期望 %d", total, done, len(content))
 	}
 	db, err := os.ReadFile(dst)
 	if err != nil || len(db) != len(content) {
@@ -403,48 +408,85 @@ func checkLocalFile(t *testing.T, p, want string) {
 	}
 }
 
-func TestUploadConflictsSingleFile(t *testing.T) {
+// scanUploadTest / scanDownloadTest / batchScanTest 测试辅助：
+// 扫描失败直接 Fatal，返回结果供断言（避免在 err != nil 时读取结果字段）。
+func scanUploadTest(t *testing.T, conn *Conn, local, remote string) ScanResult {
+	t.Helper()
+	res, err := ScanUpload(context.Background(), conn.Client, local, remote)
+	if err != nil {
+		t.Fatalf("ScanUpload 失败: %v", err)
+	}
+	return res
+}
+
+func scanDownloadTest(t *testing.T, conn *Conn, remote, local string) ScanResult {
+	t.Helper()
+	res, err := ScanDownload(context.Background(), conn.Client, remote, local)
+	if err != nil {
+		t.Fatalf("ScanDownload 失败: %v", err)
+	}
+	return res
+}
+
+func batchScanTest(t *testing.T, conn *Conn, up bool, items []BatchItem) ScanResult {
+	t.Helper()
+	res, err := BatchScan(context.Background(), conn.Client, up, items)
+	if err != nil {
+		t.Fatalf("BatchScan 失败: %v", err)
+	}
+	return res
+}
+
+func TestScanUploadSingleFile(t *testing.T) {
 	env := testutil.StartSFTP(t)
 	conn := dialTest(t, env)
 	defer conn.Close()
 	local := filepath.Join(t.TempDir(), "local.txt")
-	if err := os.WriteFile(local, []byte("a"), 0o644); err != nil {
+	if err := os.WriteFile(local, []byte("abc"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	remote := filepath.Join(env.Root, "remote.txt")
-	// 无冲突
-	if c, err := UploadConflicts(conn.Client, local, remote); err != nil || len(c) != 0 {
-		t.Fatalf("无冲突时期望0，实际 %v err=%v", c, err)
+	// 无冲突：总量应为源文件大小
+	res := scanUploadTest(t, conn, local, remote)
+	if len(res.Conflicts) != 0 {
+		t.Fatalf("无冲突时期望0，实际 %v", res.Conflicts)
+	}
+	if res.Total != 3 {
+		t.Fatalf("扫描总量应为 3，实际 %d", res.Total)
 	}
 	// 创建远程文件后应检测到冲突
 	if err := os.WriteFile(remote, []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if c, err := UploadConflicts(conn.Client, local, remote); err != nil || len(c) != 1 {
-		t.Fatalf("应检测到1冲突，实际 %v err=%v", c, err)
+	if res := scanUploadTest(t, conn, local, remote); len(res.Conflicts) != 1 {
+		t.Fatalf("应检测到1冲突，实际 %v", res.Conflicts)
 	}
 }
 
-func TestUploadConflictsDirectory(t *testing.T) {
+func TestScanUploadDirectory(t *testing.T) {
 	env := testutil.StartSFTP(t)
 	conn := dialTest(t, env)
 	defer conn.Close()
 	local := t.TempDir()
 	_ = os.MkdirAll(filepath.Join(local, "sub"), 0o755)
 	_ = os.WriteFile(filepath.Join(local, "a.txt"), []byte("a"), 0o644)
-	_ = os.WriteFile(filepath.Join(local, "sub", "b.txt"), []byte("b"), 0o644)
+	_ = os.WriteFile(filepath.Join(local, "sub", "b.txt"), []byte("bb"), 0o644)
 	remote := filepath.Join(env.Root, "proj")
-	// 远程空目录，无冲突
+	// 远程空目录，无冲突；总量为目录内普通文件大小之和
 	_ = os.MkdirAll(filepath.Join(env.Root, "proj"), 0o755)
-	if c, err := UploadConflicts(conn.Client, local, remote); err != nil || len(c) != 0 {
-		t.Fatalf("空远程目录不应有冲突，实际 %v err=%v", c, err)
+	res := scanUploadTest(t, conn, local, remote)
+	if len(res.Conflicts) != 0 {
+		t.Fatalf("空远程目录不应有冲突，实际 %v", res.Conflicts)
+	}
+	if res.Total != 3 {
+		t.Fatalf("扫描总量应为 3，实际 %d", res.Total)
 	}
 	// 远程已有 a.txt
 	if err := os.WriteFile(filepath.Join(env.Root, "proj", "a.txt"), []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if c, err := UploadConflicts(conn.Client, local, remote); err != nil || len(c) != 1 {
-		t.Fatalf("应检测到 a.txt 冲突，实际 %v err=%v", c, err)
+	if res := scanUploadTest(t, conn, local, remote); len(res.Conflicts) != 1 {
+		t.Fatalf("应检测到 a.txt 冲突，实际 %v", res.Conflicts)
 	}
 	// 远程已有 sub/b.txt
 	if err := os.MkdirAll(filepath.Join(env.Root, "proj", "sub"), 0o755); err != nil {
@@ -453,39 +495,43 @@ func TestUploadConflictsDirectory(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(env.Root, "proj", "sub", "b.txt"), []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if c, err := UploadConflicts(conn.Client, local, remote); err != nil || len(c) != 2 {
-		t.Fatalf("应检测到2冲突，实际 %v err=%v", c, err)
+	if res := scanUploadTest(t, conn, local, remote); len(res.Conflicts) != 2 {
+		t.Fatalf("应检测到2冲突，实际 %v", res.Conflicts)
 	}
 }
 
-func TestDownloadConflictsSingleFile(t *testing.T) {
+func TestScanDownloadSingleFile(t *testing.T) {
 	env := testutil.StartSFTP(t)
 	conn := dialTest(t, env)
 	defer conn.Close()
 	remote := filepath.Join(env.Root, "r.txt")
-	if err := os.WriteFile(remote, []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(remote, []byte("xy"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	local := filepath.Join(t.TempDir(), "l.txt")
 	// 无冲突
-	if c, err := DownloadConflicts(conn.Client, remote, local); err != nil || len(c) != 0 {
-		t.Fatalf("无冲突时期望0，实际 %v err=%v", c, err)
+	res := scanDownloadTest(t, conn, remote, local)
+	if len(res.Conflicts) != 0 {
+		t.Fatalf("无冲突时期望0，实际 %v", res.Conflicts)
+	}
+	if res.Total != 2 {
+		t.Fatalf("扫描总量应为 2，实际 %d", res.Total)
 	}
 	if err := os.WriteFile(local, []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if c, err := DownloadConflicts(conn.Client, remote, local); err != nil || len(c) != 1 {
-		t.Fatalf("应检测到1冲突，实际 %v err=%v", c, err)
+	if res := scanDownloadTest(t, conn, remote, local); len(res.Conflicts) != 1 {
+		t.Fatalf("应检测到1冲突，实际 %v", res.Conflicts)
 	}
 }
 
-func TestBatchConflicts(t *testing.T) {
+func TestBatchScan(t *testing.T) {
 	env := testutil.StartSFTP(t)
 	conn := dialTest(t, env)
 	defer conn.Close()
 	local := t.TempDir()
 	_ = os.WriteFile(filepath.Join(local, "f1.txt"), []byte("a"), 0o644)
-	_ = os.WriteFile(filepath.Join(local, "f2.txt"), []byte("b"), 0o644)
+	_ = os.WriteFile(filepath.Join(local, "f2.txt"), []byte("bb"), 0o644)
 	remoteBase := filepath.Join(env.Root, "batch")
 	_ = os.MkdirAll(remoteBase, 0o755)
 	if err := os.WriteFile(filepath.Join(remoteBase, "f1.txt"), []byte("old"), 0o644); err != nil {
@@ -495,8 +541,43 @@ func TestBatchConflicts(t *testing.T) {
 		{Src: filepath.Join(local, "f1.txt"), Dst: filepath.Join(remoteBase, "f1.txt")},
 		{Src: filepath.Join(local, "f2.txt"), Dst: filepath.Join(remoteBase, "f2.txt")},
 	}
-	if c, err := BatchConflicts(conn.Client, true, items); err != nil || len(c) != 1 {
-		t.Fatalf("批量上传应仅 f1.txt 冲突，实际 %v err=%v", c, err)
+	res := batchScanTest(t, conn, true, items)
+	if len(res.Conflicts) != 1 {
+		t.Fatalf("批量上传应仅 f1.txt 冲突，实际 %v", res.Conflicts)
+	}
+	if res.Total != 3 {
+		t.Fatalf("批量扫描总量应为 3，实际 %d", res.Total)
+	}
+}
+
+// TestScanCancelledContext 取消上下文应中断扫描：Esc 取消覆盖检测后，
+// 不再等待大目录的整棵 Walk 走完。
+func TestScanCancelledContext(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	conn := dialTest(t, env)
+	defer conn.Close()
+
+	remoteDir := filepath.Join(env.Root, "big")
+	if err := os.MkdirAll(remoteDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"f1", "f2", "f3"} {
+		if err := os.WriteFile(filepath.Join(remoteDir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	localDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(localDir, "a"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := ScanDownload(ctx, conn.Client, remoteDir, filepath.Join(t.TempDir(), "dst")); err == nil {
+		t.Fatal("已取消上下文应中断远程 Walk")
+	}
+	if _, err := ScanUpload(ctx, conn.Client, localDir, filepath.Join(env.Root, "up-dst")); err == nil {
+		t.Fatal("已取消上下文应中断本地 Walk")
 	}
 }
 
@@ -515,9 +596,9 @@ func TestSFTPOverwriteTypeConflict(t *testing.T) {
 	if err := os.WriteFile(remoteFile, []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	c, err := UploadConflicts(conn.Client, localDir, remoteFile)
-	if err != nil || len(c) != 1 {
-		t.Fatalf("目录上传到已存在的远程文件应报1冲突，实际 %v err=%v", c, err)
+	res := scanUploadTest(t, conn, localDir, remoteFile)
+	if len(res.Conflicts) != 1 {
+		t.Fatalf("目录上传到已存在的远程文件应报1冲突，实际 %v", res.Conflicts)
 	}
 
 	// 下载：远程目录 vs 本地同名普通文件
@@ -532,9 +613,9 @@ func TestSFTPOverwriteTypeConflict(t *testing.T) {
 	if err := os.WriteFile(localFile, []byte("lf"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	c, err = DownloadConflicts(conn.Client, remoteDir, localFile)
-	if err != nil || len(c) != 1 {
-		t.Fatalf("目录下载到已存在的本地文件应报1冲突，实际 %v err=%v", c, err)
+	res = scanDownloadTest(t, conn, remoteDir, localFile)
+	if len(res.Conflicts) != 1 {
+		t.Fatalf("目录下载到已存在的本地文件应报1冲突，实际 %v", res.Conflicts)
 	}
 }
 

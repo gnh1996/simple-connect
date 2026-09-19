@@ -40,9 +40,13 @@ type formSavedMsg struct{}
 type connectMsg struct{ host *model.Host }
 type quitMsg struct{}
 
-// 状态检测
-type statusResultMsg struct{ results map[string]sshc.Status }
-type statusTickMsg struct{}
+// 状态检测（结带世代号，过期 tick/结果由 listModel 丢弃，见 docs/ux-perf-review.md 2.1/8.7）
+type statusResultMsg struct {
+	gen    int
+	id     string
+	status sshc.Status
+}
+type statusTickMsg struct{ gen int }
 
 // Root 主模型：持有各页面并负责路由
 type Root struct {
@@ -58,11 +62,34 @@ type Root struct {
 
 // NewRoot 创建根模型
 func NewRoot(s *store.Store) *Root {
+	return NewRootWithListState(s, nil)
+}
+
+// NewRootWithListState 创建根模型并注入列表页状态快照（nil 表示全新列表）。
+// main 在 SSH/SFTP 往返（tea.Program 重建）间保存状态，避免过滤词、光标与
+// 在线状态被重置。
+func NewRootWithListState(s *store.Store, st *ListState) *Root {
 	return &Root{
 		Store: s,
 		page:  pageList,
-		list:  newListModel(s),
+		list:  newListModelWithState(s, st),
 	}
+}
+
+// ListState 导出当前列表页的可保留状态快照（无列表页时返回 nil）。
+func (m *Root) ListState() *ListState {
+	if m.list == nil {
+		return nil
+	}
+	st := &ListState{
+		Filter:   m.list.filter,
+		CursorID: m.list.selectedID(),
+		Status:   make(map[string]sshc.Status, len(m.list.status)),
+	}
+	for id, s := range m.list.status {
+		st.Status[id] = s
+	}
+	return st
 }
 
 // NewSFTPRoot 创建直接进入 SFTP 页的根模型（会话中热键唤起用）。
@@ -85,6 +112,7 @@ func NewSFTPRoot(s *store.Store, h *model.Host, sess *session.Handle) *Root {
 }
 
 func (m *Root) Init() tea.Cmd {
+	// 三个页面各自显式处理，避免 switch over iota 常量漏 case 的告警
 	switch m.page {
 	case pageSFTP:
 		if m.sftp != nil {
@@ -94,9 +122,10 @@ func (m *Root) Init() tea.Cmd {
 		if m.form != nil {
 			return m.form.Init()
 		}
-	}
-	if m.list != nil {
-		return m.list.Init()
+	case pageList:
+		if m.list != nil {
+			return m.list.Init()
+		}
 	}
 	return nil
 }

@@ -32,7 +32,7 @@ func main() {
 // reportErr 统一错误出口：终端高亮提示 + 落盘日志（供事后诊断）。
 func reportErr(prefix string, err error) {
 	msg := prefix + ": " + err.Error()
-	fmt.Fprintln(os.Stderr, styleError(msg))
+	_, _ = fmt.Fprintln(os.Stderr, styleError(msg))
 	applog.Errorf("%s", msg)
 }
 
@@ -42,8 +42,11 @@ func run() error {
 		return err
 	}
 
+	// listState 跨 tea.Program 生命周期的列表页快照：SSH 会话必须退出 TUI 才能
+	// 接管终端，重建 Root 时注入快照，过滤词/光标/在线状态不再全部重置。
+	var listState *tui.ListState
 	for {
-		root := tui.NewRoot(s)
+		root := tui.NewRootWithListState(s, listState)
 		p := tea.NewProgram(root)
 		result, err := p.Run()
 		if err != nil {
@@ -64,6 +67,8 @@ func run() error {
 			if h == nil {
 				continue
 			}
+			listState = rm.ListState() // 进入会话前保存列表状态，会话/SFTP 往返后恢复
+			fmt.Printf("正在连接 %s@%s ...（会话中 Ctrl+X f 可唤起 SFTP）\n", h.User, h.Addr())
 			sess, err := startSSH(s, h)
 			if err == nil {
 				continue // 会话正常结束，回列表
@@ -124,25 +129,51 @@ func sftpLoop(s *store.Store, h *model.Host, sess *session.Handle) error {
 // detach（Ctrl+X f）时返回挂起的 *session.Handle 与 ErrDetach；会话正常结束返回 nil。
 func startSSH(s *store.Store, h *model.Host) (*session.Handle, error) {
 	pass, _ := s.Password(h)
-	cl, err := sshc.Connect(h, pass)
-	var uk *sshc.UnknownHostKeyError
-	if errors.As(err, &uk) {
-		// 首次连接：展示指纹并征得用户确认后信任，再重新连接（对齐 OpenSSH ask 模式）
-		if !confirmHostFingerprint(uk) {
-			return nil, errors.New("已拒绝信任主机指纹，取消连接")
+	// 连接所有权在本函数内已显式管理（defer + transferred）：成功/挂起由会话接管，
+	// 其余路径释放。静态检查无法跨函数推断 StartInteractive 的所有权转移，故抑制。
+	//noinspection GoResourceLeak
+	cl, err := connectWithFingerprintConfirm(h, pass)
+	// 连接所有权：仅「会话正常结束」（StartInteractive 内部已关）与「挂起」
+	// （ErrDetach，由 Handle 持有）算转移；其余任何返回路径都由 defer 兜底释放
+	//（重复关闭幂等）。
+	transferred := false
+	defer func() {
+		if !transferred && cl != nil {
+			_ = cl.Close()
 		}
-		if terr := sshc.TrustHostKey(uk); terr != nil {
-			return nil, terr
-		}
-		cl, err = sshc.Connect(h, pass)
-		if err != nil {
-			return nil, err
-		}
-	}
+	}()
 	if err != nil {
 		return nil, err
 	}
-	return session.StartInteractive(cl)
+	hnd, err := session.StartInteractive(cl)
+	if err == nil || errors.Is(err, session.ErrDetach) {
+		transferred = true
+	}
+	return hnd, err
+}
+
+// connectWithFingerprintConfirm 建立 SSH 连接；首次连接时展示指纹并征得确认、
+// 写入 known_hosts 后重连（对齐 OpenSSH ask 模式）。成功时连接所有权交给调用方。
+func connectWithFingerprintConfirm(h *model.Host, pass string) (*sshc.Client, error) {
+	cl, err := sshc.Connect(h, pass)
+	if err == nil {
+		return cl, nil // 所有权转移给调用方
+	}
+	if cl != nil {
+		_ = cl.Close() // 防御：Connect 契约是失败时不返回可用连接
+	}
+	var uk *sshc.UnknownHostKeyError
+	if !errors.As(err, &uk) {
+		return nil, err
+	}
+	// 首次连接：展示指纹并征得用户确认后信任，再重新连接
+	if !confirmHostFingerprint(uk) {
+		return nil, errors.New("已拒绝信任主机指纹，取消连接")
+	}
+	if terr := sshc.TrustHostKey(uk); terr != nil {
+		return nil, terr
+	}
+	return sshc.Connect(h, pass)
 }
 
 // confirmHostFingerprint 在终端展示主机指纹并请求确认（TUI 已退出、终端恢复非 raw 模式）。

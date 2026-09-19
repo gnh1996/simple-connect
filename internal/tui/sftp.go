@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -80,6 +81,7 @@ type sftpGotoJumpMsg struct {
 // sftpOverwriteCheckMsg 覆盖检测结果
 type sftpOverwriteCheckMsg struct {
 	conflicts []string
+	total     int64 // 扫描得到的传输总字节数
 	pending   *pendingTransfer
 	err       error
 }
@@ -90,7 +92,8 @@ type pendingTransfer struct {
 	src   string
 	dst   string
 	items []sftpc.BatchItem
-	seq   int // 发起时的检测代数号，收到结果时比对，不匹配则丢弃
+	seq   int   // 发起时的检测代数号，收到结果时比对，不匹配则丢弃
+	total int64 // 预扫描总量，执行时直接预设，避免再走一遍目录树
 }
 
 // sftpModel 双栏（本地 | 远程）文件浏览/传输模型。
@@ -175,6 +178,9 @@ type sftpModel struct {
 	// overwriteSeq 覆盖检测代数号：取消或发起新检测时自增，
 	// 迟到的旧检测结果（seq 不匹配）直接丢弃，防止「Esc 取消后仍触发传输」。
 	overwriteSeq int
+	// overwriteCancel 取消在途覆盖扫描：Esc 取消时立即中断远程/本地 Walk，
+	// 避免大目录下取消后仍走完整棵树（结果到达后释放）。
+	overwriteCancel context.CancelFunc
 
 	width  int // 终端尺寸（WindowSizeMsg）
 	height int
@@ -213,6 +219,14 @@ func (m *sftpModel) close() {
 }
 
 func (m *sftpModel) Init() tea.Cmd {
+	// 拨号期间给出明确反馈并置 busy；失败与指纹确认分支负责复位，
+	// 成功后由首条列表消息清除（Init 与 busy 复位必须同一处管理，见 docs/ux-perf-review.md 3.1）。
+	m.busy = true
+	if m.sshClient != nil {
+		m.status = "正在建立 SFTP 通道…"
+	} else {
+		m.status = "正在连接…"
+	}
 	return tea.Cmd(func() tea.Msg {
 		var conn *sftpc.Conn
 		var err error
@@ -236,7 +250,9 @@ func (m *sftpModel) Init() tea.Cmd {
 
 // redial 指纹确认信任后重新建立连接（列表页独立连接场景）
 func (m *sftpModel) redial() tea.Cmd {
-	return m.Init()
+	cmd := m.Init()
+	m.status = "已信任主机指纹，正在重连…" // Init 会先置"正在连接…"，此处覆盖为更具体的文案
+	return cmd
 }
 
 func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
@@ -246,6 +262,7 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 		return m, nil
 	case sftpConnMsg:
 		if msg.err != nil {
+			m.busy = false // 拨号失败：复位 busy，否则 t/p/x/r 全被挡住
 			var uk *sshc.UnknownHostKeyError
 			if errors.As(msg.err, &uk) {
 				// 首次连接：不静默信任，页面进入确认态展示指纹（对齐 OpenSSH ask）
@@ -253,10 +270,16 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 				m.status = fmt.Sprintf("首次连接 %s，指纹 %s 未确认", uk.Hostname, uk.Fingerprint)
 				return m, nil
 			}
+			if m.sshClient == nil {
+				// 列表页 f 进入走 ConnectRaw：不合并 ~/.ssh/config（有意为之），给跳板用户可操作的提示
+				m.err = fmt.Sprintf("连接失败: %v（提示：列表 SFTP 不合并 ~/.ssh/config，跳板/别名主机请先 Enter 连接，再按 Ctrl+X f）", msg.err)
+				return m, nil
+			}
 			m.err = fmt.Sprintf("连接失败: %v", msg.err)
 			return m, nil
 		}
 		m.conn = msg.conn
+		m.status = "" // 清除 Init 的"正在连接…"（下方会话目录提示会按需覆盖）
 		if cwd, err := m.conn.Client.Getwd(); err == nil {
 			m.cwd = cwd
 		} else {
@@ -337,6 +360,7 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 			// 会解除输入屏蔽并丢失"正在检测"提示）
 			return m, nil
 		}
+		m.releaseOverwriteCancel()
 		m.checkingOverwrite = false
 		m.busy = false
 		m.status = ""
@@ -344,6 +368,7 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 			m.err = fmt.Sprintf("检测覆盖失败: %v", msg.err)
 			return m, nil
 		}
+		msg.pending.total = msg.total // 预扫描总量随结果带回，执行时免重复统计
 		if len(msg.conflicts) == 0 {
 			// 无冲突，直接执行
 			return m, m.executePendingTransfer(msg.pending)
@@ -371,22 +396,36 @@ func (m *sftpModel) loadList() tea.Cmd {
 	}
 }
 
+// readLocalInfos 读取本地目录并转为已排序的 FileInfo 列表。
+// Info() 失败（如断链符号链接）时回退 Lstat，避免条目从列表中静默消失。
+func readLocalInfos(dir string) ([]fs.FileInfo, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	infos := make([]fs.FileInfo, 0, len(entries))
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			// DirEntry.Info 对符号链接取目标信息，断链时失败；退回 Lstat 展示链接本身
+			if li, lerr := os.Lstat(filepath.Join(dir, e.Name())); lerr == nil {
+				info = li
+			} else {
+				continue
+			}
+		}
+		infos = append(infos, info)
+	}
+	sftpc.SortEntries(infos)
+	return infos, nil
+}
+
 // loadLocal 刷新本地栏
 func (m *sftpModel) loadLocal() tea.Cmd {
 	p := m.localCwd
 	return func() tea.Msg {
-		entries, err := os.ReadDir(p)
-		if err != nil {
-			return sftpListMsg{kind: paneLocal, path: p, err: err}
-		}
-		infos := make([]fs.FileInfo, 0, len(entries))
-		for _, e := range entries {
-			if info, err := e.Info(); err == nil {
-				infos = append(infos, info)
-			}
-		}
-		sftpc.SortEntries(infos)
-		return sftpListMsg{kind: paneLocal, path: p, entries: infos}
+		infos, err := readLocalInfos(p)
+		return sftpListMsg{kind: paneLocal, path: p, entries: infos, err: err}
 	}
 }
 
@@ -476,14 +515,14 @@ func (m *sftpModel) enterCurrent() (*sftpModel, tea.Cmd) {
 	}
 	if e.IsDir() {
 		if m.focus == paneLocal {
-			m.localCwd = path.Join(m.localCwd, e.Name())
+			m.localCwd = filepath.Join(m.localCwd, e.Name()) // 本地路径用 filepath（Windows 盘符/反斜杠）
 			m.localCursor = 0
 			m.localEntries = nil
 			m.clearSel()
 			m.busy = true
 			return m, m.loadLocal()
 		}
-		m.cwd = path.Join(m.cwd, e.Name())
+		m.cwd = path.Join(m.cwd, e.Name()) // 远程路径保持 POSIX
 		m.cursor = 0
 		m.entries = nil
 		m.clearSel()
@@ -497,9 +536,13 @@ func (m *sftpModel) enterCurrent() (*sftpModel, tea.Cmd) {
 	return m.downloadEntry(e)
 }
 
+// localParent 本地栏上级目录：filepath.Dir（Windows 盘符/反斜杠语义），
+// 与远程栏的 path.Dir（POSIX）区分。
+func localParent(p string) string { return filepath.Dir(p) }
+
 func (m *sftpModel) goUp() (*sftpModel, tea.Cmd) {
 	if m.focus == paneLocal {
-		parent := path.Dir(m.localCwd)
+		parent := localParent(m.localCwd)
 		if parent == m.localCwd {
 			return m, nil
 		}
@@ -526,23 +569,16 @@ func (m *sftpModel) goUp() (*sftpModel, tea.Cmd) {
 
 func (m *sftpModel) mkdir(name string) tea.Cmd {
 	if m.focus == paneLocal {
-		dir := path.Join(m.localCwd, name)
+		dir := filepath.Join(m.localCwd, name) // 本地路径用 filepath（见 enterCurrent 注释）
 		p := m.localCwd
 		return func() tea.Msg {
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				return sftpMsgText{text: fmt.Sprintf("创建目录失败: %v", err)}
 			}
-			entries, err := os.ReadDir(p)
+			infos, err := readLocalInfos(p)
 			if err != nil {
 				return sftpMsgText{text: fmt.Sprintf("读取目录失败: %v", err)}
 			}
-			infos := make([]fs.FileInfo, 0, len(entries))
-			for _, e := range entries {
-				if info, err := e.Info(); err == nil {
-					infos = append(infos, info)
-				}
-			}
-			sftpc.SortEntries(infos)
 			return sftpListMsg{kind: paneLocal, path: p, entries: infos,
 				notice: fmt.Sprintf("已创建 %s", dir)}
 		}
@@ -697,17 +733,10 @@ func (m *sftpModel) doBatchDelete() (*sftpModel, tea.Cmd) {
 					return sftpMsgText{text: fmt.Sprintf("删除失败: %v", err)}
 				}
 			}
-			entries, err := os.ReadDir(p)
+			infos, err := readLocalInfos(p)
 			if err != nil {
 				return sftpMsgText{text: fmt.Sprintf("读取目录失败: %v", err)}
 			}
-			infos := make([]fs.FileInfo, 0, len(entries))
-			for _, e := range entries {
-				if info, err := e.Info(); err == nil {
-					infos = append(infos, info)
-				}
-			}
-			sftpc.SortEntries(infos)
 			return sftpListMsg{kind: paneLocal, path: p, entries: infos,
 				notice: fmt.Sprintf("已删除 %d 项", len(paths))}
 		})
@@ -763,8 +792,7 @@ func (m *sftpModel) handleProgress() (*sftpModel, tea.Cmd) {
 			return m, nil
 		}
 		m.status = fmt.Sprintf("%s完成 %s", transferName(up), sftpc.FormatSize(done))
-		m.cursor = 0
-		// 传输后刷新两侧列表（远程大小/时间可能变化；本地目录不变刷新无害）
+		// 保留光标位置（不跳回顶部），刷新的列表由 clampCursor 兜底；两侧列表均刷新
 		return m, tea.Batch(m.loadList(), m.loadLocal())
 	}
 	// 已确认退出但传输迟迟未结束（如远端读取阻塞）：等待约 5 秒后强制离开。
@@ -818,7 +846,7 @@ func transferName(up bool) string {
 
 // ---- 覆盖检测与确认 ----
 
-func (m *sftpModel) checkOverwriteCmd(pending *pendingTransfer) tea.Cmd {
+func (m *sftpModel) checkOverwriteCmd(ctx context.Context, pending *pendingTransfer) tea.Cmd {
 	cl := m.conn.Client
 	// 无连接时直接报错（理论上不会触发）
 	if cl == nil {
@@ -827,16 +855,37 @@ func (m *sftpModel) checkOverwriteCmd(pending *pendingTransfer) tea.Cmd {
 		}
 	}
 	return func() tea.Msg {
-		var conflicts []string
+		var res sftpc.ScanResult
 		var err error
 		if len(pending.items) > 0 {
-			conflicts, err = sftpc.BatchConflicts(cl, pending.up, pending.items)
+			res, err = sftpc.BatchScan(ctx, cl, pending.up, pending.items)
 		} else if pending.up {
-			conflicts, err = sftpc.UploadConflicts(cl, pending.src, pending.dst)
+			res, err = sftpc.ScanUpload(ctx, cl, pending.src, pending.dst)
 		} else {
-			conflicts, err = sftpc.DownloadConflicts(cl, pending.src, pending.dst)
+			res, err = sftpc.ScanDownload(ctx, cl, pending.src, pending.dst)
 		}
-		return sftpOverwriteCheckMsg{conflicts: conflicts, pending: pending, err: err}
+		return sftpOverwriteCheckMsg{conflicts: res.Conflicts, total: res.Total, pending: pending, err: err}
+	}
+}
+
+// startOverwriteCheck 发起新一轮覆盖扫描：自增代数号、创建可取消上下文，
+// 并返回扫描命令。Esc 取消时经 releaseOverwriteCancel 中断在途 Walk。
+func (m *sftpModel) startOverwriteCheck(pending *pendingTransfer) tea.Cmd {
+	if m.overwriteCancel != nil {
+		m.overwriteCancel() // 防御：不应有在途扫描，取消是幂等的
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.overwriteCancel = cancel
+	m.overwriteSeq++
+	pending.seq = m.overwriteSeq
+	return m.checkOverwriteCmd(ctx, pending)
+}
+
+// releaseOverwriteCancel 释放覆盖扫描的取消函数（结果到达或取消后调用，幂等）。
+func (m *sftpModel) releaseOverwriteCancel() {
+	if m.overwriteCancel != nil {
+		m.overwriteCancel()
+		m.overwriteCancel = nil
 	}
 }
 
@@ -846,6 +895,7 @@ func (m *sftpModel) executePendingTransfer(pending *pendingTransfer) tea.Cmd {
 	}
 	if len(pending.items) > 0 {
 		t := sftpc.NewTransfer(fmt.Sprintf("%d 项", len(pending.items)), pending.up)
+		t.SetTotal(pending.total) // 预扫描总量：批内不再逐项统计
 		m.transfer = t
 		m.busy = true
 		m.status = ""
@@ -859,6 +909,7 @@ func (m *sftpModel) executePendingTransfer(pending *pendingTransfer) tea.Cmd {
 	}
 	// 单个路径：统一走 Path 变体（兼容文件与目录，自动判断 IsDir）
 	t := sftpc.NewTransfer(filepath.Base(pending.src), pending.up)
+	t.SetTotal(pending.total)
 	m.transfer = t
 	m.busy = true
 	m.status = ""
@@ -877,13 +928,12 @@ func (m *sftpModel) requestTransfer(src, dst string, up bool) tea.Cmd {
 	if m.busy || m.checkingOverwrite {
 		return nil
 	}
-	m.overwriteSeq++
 	m.checkingOverwrite = true
 	m.busy = true
 	m.status = ""
 	m.err = ""
-	pending := &pendingTransfer{up: up, src: src, dst: dst, seq: m.overwriteSeq}
-	return m.checkOverwriteCmd(pending)
+	pending := &pendingTransfer{up: up, src: src, dst: dst}
+	return m.startOverwriteCheck(pending)
 }
 
 func (m *sftpModel) requestBatch(up bool) (*sftpModel, tea.Cmd) {
@@ -894,13 +944,12 @@ func (m *sftpModel) requestBatch(up bool) (*sftpModel, tea.Cmd) {
 	if len(items) == 0 {
 		return m, nil
 	}
-	m.overwriteSeq++
 	m.checkingOverwrite = true
 	m.busy = true
 	m.status = ""
 	m.err = ""
-	pending := &pendingTransfer{up: up, items: items, seq: m.overwriteSeq}
-	return m, m.checkOverwriteCmd(pending)
+	pending := &pendingTransfer{up: up, items: items}
+	return m, m.startOverwriteCheck(pending)
 }
 
 func (m *sftpModel) overwritePrompt() string {
@@ -951,17 +1000,10 @@ func (m *sftpModel) doDelete() (*sftpModel, tea.Cmd) {
 			if err := os.RemoveAll(local); err != nil {
 				return sftpMsgText{text: fmt.Sprintf("删除失败: %v", err)}
 			}
-			entries, err := os.ReadDir(p)
+			infos, err := readLocalInfos(p)
 			if err != nil {
 				return sftpMsgText{text: fmt.Sprintf("读取目录失败: %v", err)}
 			}
-			infos := make([]fs.FileInfo, 0, len(entries))
-			for _, e := range entries {
-				if info, err := e.Info(); err == nil {
-					infos = append(infos, info)
-				}
-			}
-			sftpc.SortEntries(infos)
 			return sftpListMsg{kind: paneLocal, path: p, entries: infos,
 				notice: fmt.Sprintf("已删除 %s", local)}
 		})
@@ -1064,7 +1106,8 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 	if m.checkingOverwrite {
 		// 检测期间忽略除 Esc 取消外的输入
 		if k.Code == tea.KeyEsc {
-			m.overwriteSeq++ // 使在途检测结果作废（迟到消息将被丢弃）
+			m.overwriteSeq++           // 使在途检测结果作废（迟到消息将被丢弃）
+			m.releaseOverwriteCancel() // 中断扫描：不等待整棵目录树走完
 			m.checkingOverwrite = false
 			m.busy = false
 			m.status = "已取消"
@@ -1412,7 +1455,7 @@ func (m *sftpModel) gotoJump() (*sftpModel, tea.Cmd) {
 }
 
 // pathJump 校验并执行路径传输（p）：本地栏上传本地路径，远程栏下载远程路径。
-// 远程路径的存在性由覆盖检测的 DownloadConflicts 异步校验。
+// 远程路径的存在性由覆盖扫描的 ScanDownload 异步校验。
 func (m *sftpModel) pathJump() (*sftpModel, tea.Cmd) {
 	v := strings.TrimSpace(m.pathIn.Value())
 	m.clearPathCandidates()
@@ -1862,10 +1905,24 @@ func renderProgress(name string, done, total int64) string {
 		return fmt.Sprintf("正在传输 %s ... %s", name, sftpc.FormatSize(done))
 	}
 	pct := float64(done) / float64(total) * 100
+	// done 可能超过 total（传输期间源文件变大、目录型遍历跟随符号链接等），必须钳位：
+	// 否则 filled > width 会让 strings.Repeat 传入负长度 panic。
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
 	const width = 20
 	filled := int(pct / 100 * width)
+	if filled < 0 {
+		filled = 0
+	}
+	if filled > width {
+		filled = width
+	}
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
-	return fmt.Sprintf("正在传输 %s  %3.0f%% %s %s", name, pct, bar, sftpc.FormatSize(done))
+	return fmt.Sprintf("正在传输 %s  %3.0f%% %s %s/%s", name, pct, bar, sftpc.FormatSize(done), sftpc.FormatSize(total))
 }
 
 func renderSFTPFooter() string {

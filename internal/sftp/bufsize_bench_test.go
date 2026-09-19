@@ -7,39 +7,102 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/pkg/sftp"
-	"golang.org/x/crypto/ssh"
-
-	"simple-connect/internal/model"
-	sshc "simple-connect/internal/ssh"
 	"simple-connect/internal/testutil"
 )
 
-// benchSFTPClient 构建 sftp 客户端（并发写开关可控）
-func benchSFTPClient(b *testing.B, env testutil.SFTPEnv, concurrent bool) *sftp.Client {
-	b.Helper()
-	h, p := testutil.SplitHostPort(env.Addr)
-	host := &model.Host{Name: "bench", Host: h, Port: p, User: "tester", Auth: model.AuthPassword}
-	sshCl, err := sshc.ConnectRaw(host, "secret", sshc.WithHostKeyCallback(ssh.InsecureIgnoreHostKey()))
-	if err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() { _ = sshCl.Close() })
+// plainReader 仅暴露 Read 的包装器，用于对照「源被包装后丢失 io.WriterTo →
+// 下载退回 32KB 串行读」的历史实现（对应修复前 downloadFile 里的 cancelReader）。
+type plainReader struct{ r io.Reader }
 
-	opts := []sftp.ClientOption{}
-	if concurrent {
-		opts = append(opts, sftp.UseConcurrentWrites(true))
+func (p plainReader) Read(b []byte) (int, error) { return p.r.Read(b) }
+
+// BenchmarkDownloadBufSize 下载路径的回归基准，对比三种写法：
+//
+// 历史实现：`io.Copy(io.MultiWriter(f, countingWriter{t}), cancelReader{rf, t})`——
+// cancelReader 只暴露 Read，挡住 *sftp.File 的 io.WriterTo，io.Copy 落入 32KB
+// 串行读；改为 `rf.WriteTo(progressWriter{f, t})` 后走 pkg/sftp 默认并发读
+// （UseConcurrentReads 默认开启），进度计数与取消检查在写侧完成。
+//
+// 观察点：生产 Download 应与裸 WriteTo 吞吐相当（明显快于旧 Reader 包装参照），
+// 若持平则说明再度被包装丢掉了并发读路径。
+func BenchmarkDownloadBufSize(b *testing.B) {
+	env := testutil.StartSFTP(b)
+
+	content := make([]byte, 8<<20)
+	for i := range content {
+		content[i] = byte(i * 17)
 	}
-	cl, err := sftp.NewClient(sshCl.Client, opts...)
-	if err != nil {
+	remote := filepath.Join(env.Root, "down.bin")
+	if err := os.WriteFile(remote, content, 0o644); err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(func() { _ = cl.Close() })
-	return cl
+	b.SetBytes(int64(len(content)))
+
+	conn := benchDial(b, env) // 生产连接（并发读默认开启）
+
+	// ① 旧 Reader 包装参照：并发读被包装挡住，退回串行 32KB
+	b.Run("旧Reader包装参照", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			rf, err := conn.Client.Open(remote)
+			if err != nil {
+				b.Fatal(err)
+			}
+			f, err := os.CreateTemp(b.TempDir(), "old-*.bin")
+			if err != nil {
+				b.Fatal(err)
+			}
+			t := NewTransfer("down.bin", false)
+			_, err = io.Copy(io.MultiWriter(f, countingWriter{t}), plainReader{rf})
+			cerr := f.Close()
+			_ = rf.Close()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if cerr != nil {
+				b.Fatal(cerr)
+			}
+		}
+	})
+
+	// ② 修复后的生产 Download 路径（rf.WriteTo + progressWriter 计数/取消）
+	dst := filepath.Join(b.TempDir(), "down-prod.bin")
+	b.Run("生产Download修复后", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			t := NewTransfer("down.bin", false)
+			Download(conn.Client, t, remote, dst)
+			if _, _, finished, err := t.Snapshot(); !finished || err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	// ③ 裸 WriteTo 参照（无计数包装，上限参考）
+	b.Run("裸WriteTo参照", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			rf, err := conn.Client.Open(remote)
+			if err != nil {
+				b.Fatal(err)
+			}
+			f, err := os.CreateTemp(b.TempDir(), "raw-*.bin")
+			if err != nil {
+				b.Fatal(err)
+			}
+			_, err = rf.WriteTo(f)
+			cerr := f.Close()
+			_ = rf.Close()
+			if err != nil {
+				b.Fatal(err)
+			}
+			if cerr != nil {
+				b.Fatal(cerr)
+			}
+		}
+	})
 }
 
-// BenchmarkUploadBufSize 上传路径的回归基准，对比三种写法：
-//
 // 历史 bug：`io.CopyBuffer(mw, f, buf)` 的 src 是 *os.File，它实现了 io.WriterTo，
 // 于是 io.CopyBuffer 直接调用 f.WriteTo(dst) 并忽略传入的 buf；os.File.WriteTo 在
 // dst 非 *os.File（这里是 MultiWriter）时走 genericWriteTo 固定 32KB 回退缓冲，
@@ -85,7 +148,7 @@ func BenchmarkUploadBufSize(b *testing.B) {
 				t := NewTransfer("up", true)
 				_, err = io.CopyBuffer(io.MultiWriter(rf, countingWriter{t}), f, make([]byte, sz))
 				cerr := rf.Close()
-				f.Close()
+				_ = f.Close()
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -124,7 +187,7 @@ func BenchmarkUploadBufSize(b *testing.B) {
 			}
 			_, err = rf.ReadFrom(f)
 			cerr := rf.Close()
-			f.Close()
+			_ = f.Close()
 			if err != nil {
 				b.Fatal(err)
 			}

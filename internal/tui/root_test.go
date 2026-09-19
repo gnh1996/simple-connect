@@ -44,8 +44,8 @@ func upd(m *Root, msg tea.Msg) *Root {
 func testStore(t *testing.T) *store.Store {
 	t.Helper()
 	dir := t.TempDir()
-	os.Setenv("XDG_CONFIG_HOME", dir)
-	t.Cleanup(func() { os.Unsetenv("XDG_CONFIG_HOME") })
+	_ = os.Setenv("XDG_CONFIG_HOME", dir)
+	t.Cleanup(func() { _ = os.Unsetenv("XDG_CONFIG_HOME") })
 	s, err := store.Load()
 	if err != nil {
 		t.Fatalf("store 加载失败: %v", err)
@@ -208,11 +208,10 @@ func TestFormAddHost(t *testing.T) {
 	root = upd(root, pressKey(tea.KeyTab))
 	fill("admin")
 
-	// 认证方式为密码，直接保存：Tab 到最后一个字段，再 Enter
+	// 认证方式为密码：密码可见、私钥路径隐藏，Tab 依次经过 认证方式→密码→本地目录
 	root = upd(root, pressKey(tea.KeyTab)) // 认证方式
 	root = upd(root, pressKey(tea.KeyTab)) // 密码
-	root = upd(root, pressKey(tea.KeyTab)) // 私钥路径
-	root = upd(root, pressKey(tea.KeyTab)) // 本地目录
+	root = upd(root, pressKey(tea.KeyTab)) // 本地目录（跳过隐藏的私钥路径）
 	root = upd(root, pressKey(tea.KeyEnter))
 
 	if root.page != pageList {
