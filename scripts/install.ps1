@@ -3,7 +3,7 @@
 #
 # Usage (PowerShell):
 #   powershell -ExecutionPolicy Bypass -File scripts\install.ps1                # build from source (needs Go)
-#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release       # download latest GitHub Release
+#   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release latest  # download latest GitHub Release
 #   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release v0.2.1
 #   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -UsePrebuilt   # use prebuilt binary in dist/
 #   powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -InstallDir D:\tools\simple-ssh
@@ -11,6 +11,12 @@
 # NOTE: This script is intentionally pure ASCII. Windows PowerShell 5.1 decodes
 # .ps1 files without BOM using the system ANSI codepage, so non-ASCII text can
 # corrupt parsing. Keep ALL output/comments ASCII.
+#
+# Upgrade: re-run this script to upgrade/downgrade in place - no uninstall needed.
+# The exe is staged to a temp file in the install dir and swapped in with one
+# rename, so a failed download/build leaves the existing installation untouched.
+# Windows locks a running exe: exit simple-ssh before installing (the script
+# checks for a running process and fails fast with a clear hint).
 
 param(
     [switch]$UsePrebuilt,
@@ -36,54 +42,92 @@ $OutExe = Join-Path $InstallDir "simple-ssh.exe"
 # Create install dir.
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
+# Windows locks a running exe: fail fast with a clear hint instead of a
+# confusing "access denied" halfway through the install.
+$running = Get-Process -Name "simple-ssh" -ErrorAction SilentlyContinue
+if ($running) {
+    $runningPids = ($running | ForEach-Object { $_.Id }) -join ", "
+    Write-Host "ERROR: simple-ssh is currently running (PID $runningPids)." -ForegroundColor Red
+    Write-Host "Exit simple-ssh first, then re-run the installer." -ForegroundColor Red
+    exit 1
+}
+
+# Stage into a temp exe next to the target, then swap it in with one rename so
+# a failed download/build never damages the existing installation.
+$TmpExe = Join-Path $InstallDir ("simple-ssh.tmp-" + [guid]::NewGuid().ToString("N").Substring(0, 8) + ".exe")
+
 function Get-RemoteFile {
     param([string]$Url, [string]$Out)
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     Invoke-WebRequest -Uri $Url -OutFile $Out -UseBasicParsing
 }
 
-if ($Release) {
-    # ---- Download prebuilt binary from GitHub Releases ----
-    $Url = if ($Release -eq "latest") {
-        "https://github.com/$Repo/releases/latest/download/simple-connect-windows-amd64.exe"
+try {
+    if ($Release) {
+        # ---- Download prebuilt binary from GitHub Releases ----
+        $Url = if ($Release -eq "latest") {
+            "https://github.com/$Repo/releases/latest/download/simple-connect-windows-amd64.exe"
+        } else {
+            "https://github.com/$Repo/releases/download/$Release/simple-connect-windows-amd64.exe"
+        }
+        Write-Host "==> Downloading prebuilt version ($Release, windows/amd64)..."
+        Write-Host "    $Url"
+        Get-RemoteFile -Url $Url -Out $TmpExe
+        # Strip Mark-of-the-Web so SmartScreen does not block it.
+        Unblock-File -Path $TmpExe -ErrorAction SilentlyContinue
+    } elseif ($UsePrebuilt) {
+        # ---- Use prebuilt binary from dist/ ----
+        $Prebuilt = Join-Path $ProjectRoot "dist\simple-connect-windows-amd64.exe"
+        if (-not (Test-Path $Prebuilt)) {
+            Write-Host "ERROR: prebuilt binary not found: $Prebuilt" -ForegroundColor Red
+            Write-Host "Build it first: go build -o dist\simple-connect-windows-amd64.exe ." -ForegroundColor Red
+            exit 1
+        }
+        Write-Host "==> Using prebuilt binary ..."
+        Copy-Item $Prebuilt $TmpExe -Force
     } else {
-        "https://github.com/$Repo/releases/download/$Release/simple-connect-windows-amd64.exe"
+        # ---- Build from source ----
+        $go = Get-Command go -ErrorAction SilentlyContinue
+        if (-not $go) {
+            Write-Host "ERROR: Go toolchain not found, cannot build from source." -ForegroundColor Red
+            Write-Host ""
+            Write-Host "Use the two-step install instead (avoids irm|iex, so Defender does not block it):" -ForegroundColor Yellow
+            Write-Host '  Invoke-WebRequest -Uri "https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.ps1" -OutFile "$env:TEMP\simple-connect-install.ps1"' -ForegroundColor Cyan
+            Write-Host '  Unblock-File "$env:TEMP\simple-connect-install.ps1"' -ForegroundColor Cyan
+            Write-Host '  powershell -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" -Release v0.2.1' -ForegroundColor Cyan
+            exit 1
+        }
+        Write-Host "==> Building simple-ssh.exe from source ..."
+        Push-Location $ProjectRoot
+        try {
+            & go build -o $TmpExe .
+            if ($LASTEXITCODE -ne 0) { throw "go build failed (exit code $LASTEXITCODE)" }
+        } finally {
+            Pop-Location
+        }
     }
-    Write-Host "==> Downloading prebuilt version ($Release, windows/amd64)..."
-    Write-Host "    $Url"
-    Get-RemoteFile -Url $Url -Out $OutExe
-    # Strip Mark-of-the-Web so SmartScreen does not block it.
-    Unblock-File -Path $OutExe -ErrorAction SilentlyContinue
-} elseif ($UsePrebuilt) {
-    # ---- Use prebuilt binary from dist/ ----
-    $Prebuilt = Join-Path $ProjectRoot "dist\simple-connect-windows-amd64.exe"
-    if (-not (Test-Path $Prebuilt)) {
-        Write-Host "ERROR: prebuilt binary not found: $Prebuilt" -ForegroundColor Red
-        Write-Host "Build it first: go build -o dist\simple-connect-windows-amd64.exe ." -ForegroundColor Red
-        exit 1
+
+    # ---- Atomic swap: replace the installed exe with one rename ----
+    # Retry briefly: antivirus can hold a transient lock on a freshly written exe.
+    $swapped = $false
+    for ($attempt = 1; $attempt -le 3 -and -not $swapped; $attempt++) {
+        try {
+            Move-Item -LiteralPath $TmpExe -Destination $OutExe -Force
+            $swapped = $true
+        } catch {
+            if ($attempt -eq 3) {
+                throw "cannot replace $OutExe - is simple-ssh still running? ($($_.Exception.Message))"
+            }
+            Start-Sleep -Milliseconds 300
+        }
     }
-    Write-Host "==> Using prebuilt binary ..."
-    Copy-Item $Prebuilt $OutExe -Force
-} else {
-    # ---- Build from source ----
-    $go = Get-Command go -ErrorAction SilentlyContinue
-    if (-not $go) {
-        Write-Host "ERROR: Go toolchain not found, cannot build from source." -ForegroundColor Red
-        Write-Host ""
-        Write-Host "Use the two-step install instead (avoids irm|iex, so Defender does not block it):" -ForegroundColor Yellow
-        Write-Host '  Invoke-WebRequest -Uri "https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.ps1" -OutFile "$env:TEMP\simple-connect-install.ps1"' -ForegroundColor Cyan
-        Write-Host '  Unblock-File "$env:TEMP\simple-connect-install.ps1"' -ForegroundColor Cyan
-        Write-Host '  powershell -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" -Release v0.2.1' -ForegroundColor Cyan
-        exit 1
-    }
-    Write-Host "==> Building simple-ssh.exe from source ..."
-    Push-Location $ProjectRoot
-    try {
-        & go build -o $OutExe .
-        if ($LASTEXITCODE -ne 0) { throw "go build failed (exit code $LASTEXITCODE)" }
-    } finally {
-        Pop-Location
-    }
+} catch {
+    Write-Host "ERROR: install failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "       The previous installation (if any) was left untouched." -ForegroundColor Yellow
+    exit 1
+} finally {
+    # Removes the staged temp exe on any failure; no-op after a successful swap.
+    Remove-Item -LiteralPath $TmpExe -Force -ErrorAction SilentlyContinue
 }
 
 # Add install dir to user PATH (persisted).
@@ -102,5 +146,5 @@ if ($userPath -notmatch [regex]::Escape($InstallDir)) {
     Write-Host "==> $InstallDir already in user PATH."
 }
 
-Write-Host "==> Installed: $OutExe"
-Write-Host "    Run simple-ssh to start."
+Write-Host "==> Installed: $OutExe (atomic swap)"
+Write-Host "    Re-run this script to upgrade/downgrade; restart simple-ssh if it was running."

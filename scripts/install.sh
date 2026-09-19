@@ -10,6 +10,10 @@
 #
 # 说明：默认从源码构建；--release 时从 GitHub Releases 拉取对应平台的预编译二进制，
 # 无需 Go 工具链。安装后终端可直接输入 simple-ssh 启动程序。
+#
+# 升级：可重复执行本脚本（无需先卸载），安装为原子替换——先写安装目录下的临时文件，
+# 成功后一次 rename 覆盖；下载/构建失败自动清理临时文件，现有安装不受影响。
+# Linux/macOS 下可替换正在运行的二进制，但需重启 simple-ssh 才会使用新版本。
 
 set -e
 
@@ -54,6 +58,31 @@ PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 # 创建安装目录
 mkdir -p "$INSTALL_DIR"
 
+# 解析安装目标：若 simple-ssh 是符号链接，则替换链接指向的真实文件（保持原有语义），
+# 而非把链接本身换成普通文件。
+DEST="$INSTALL_DIR/simple-ssh"
+LINK_DEPTH=0
+while [ -L "$DEST" ] && [ "$LINK_DEPTH" -lt 40 ]; do
+    LINK=$(readlink "$DEST")
+    case "$LINK" in
+        /*) DEST="$LINK" ;;
+        *) DEST="$(dirname -- "$DEST")/$LINK" ;;
+    esac
+    LINK_DEPTH=$((LINK_DEPTH + 1))
+done
+DEST_DIR=$(dirname -- "$DEST")
+mkdir -p "$DEST_DIR"
+
+# 原子替换用临时文件：与目标同目录，保证 mv 是 rename（同文件系统）。
+# 任何中途失败（含 Ctrl+C / 信号）都由 EXIT trap 清理，旧版本保持原样。
+TMP=""
+cleanup() {
+    if [ -n "$TMP" ]; then
+        rm -f "$TMP"
+    fi
+}
+trap cleanup EXIT
+
 # 解析目标平台
 detect_platform() {
     case "$(uname -s)" in
@@ -77,7 +106,11 @@ if [ "$MODE" = "build" ]; then
         exit 1
     fi
     echo "==> 从源码构建 simple-ssh ..."
-    (cd "$PROJECT_ROOT" && go build -o "$INSTALL_DIR/simple-ssh" .)
+    TMP=$(mktemp "$DEST_DIR/.simple-ssh.XXXXXX")
+    (cd "$PROJECT_ROOT" && go build -o "$TMP" .)
+    chmod 0755 "$TMP"
+    mv -f "$TMP" "$DEST"
+    TMP=""
 else
     # ---- 从 GitHub Releases 下载预编译二进制 ----
     detect_platform
@@ -88,15 +121,18 @@ else
     fi
     echo "==> 下载预编译版本（$TAG，$OS/$ARCH）..."
     echo "    $URL"
+    TMP=$(mktemp "$DEST_DIR/.simple-ssh.XXXXXX")
     if command -v curl >/dev/null 2>&1; then
-        curl -fSL --retry 3 -o "$INSTALL_DIR/simple-ssh" "$URL"
+        curl -fSL --retry 3 -o "$TMP" "$URL"
     elif command -v wget >/dev/null 2>&1; then
-        wget -O "$INSTALL_DIR/simple-ssh" "$URL"
+        wget -O "$TMP" "$URL"
     else
         echo "错误：未找到 curl 或 wget，无法下载。" >&2
         exit 1
     fi
-    chmod +x "$INSTALL_DIR/simple-ssh"
+    chmod 0755 "$TMP"
+    mv -f "$TMP" "$DEST"
+    TMP=""
 fi
 
 # 检查安装目录是否在 PATH 中
@@ -109,5 +145,5 @@ case ":$PATH:" in
         ;;
 esac
 
-echo "==> 安装完成：$INSTALL_DIR/simple-ssh"
-echo "    现在可以输入 simple-ssh 启动程序。"
+echo "==> 安装完成：$INSTALL_DIR/simple-ssh（原子替换）"
+echo "    可重复执行本脚本升级/降级；若程序正在运行，重启后生效。"

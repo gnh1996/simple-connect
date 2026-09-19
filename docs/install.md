@@ -87,6 +87,16 @@ simple-connect 是开源的未签名工具，首次下载运行时 Defender 可�
 - **临时信任**：可在"病毒和威胁防护"→"排除项"中添加 `%LOCALAPPDATA%\simple-connect` 目录。
 - 你随时可以对照源码（`go build`）自行构建，或对比 `SHA256SUMS` 确认二进制与官方一致。
 
+## 升级 / 重复安装
+
+安装脚本可重复执行，升级无需先卸载：新版本覆盖同一安装路径（Linux/macOS 为 `~/.local/bin/simple-ssh`，Windows 为 `%LOCALAPPDATA%\simple-connect\simple-ssh.exe`）。连接配置（`~/.config/simple-connect/hosts.json`）与 keyring 中的密码独立于二进制文件，升级不会丢失。
+
+- **原子替换**：先写入安装目录下的临时文件，成功后一次 rename 覆盖；下载/构建失败会自动清理临时文件，现有安装保持原样，不会留下损坏的半截二进制。
+- **Linux / macOS**：可替换正在运行的二进制（运行中的进程继续使用旧版本），重启 `simple-ssh` 后生效。
+- **Windows**：运行中的 exe 被系统锁定，安装前请先退出 `simple-ssh`；脚本会检测运行中的进程并提前报错，替换失败时旧版本不受影响。
+- **降级 / 回滚**：重装时指定旧版本 tag 即可，如 `--release v0.2.1` / `-Release v0.2.1`。
+- **符号链接**：若 `simple-ssh` 是符号链接（如 `/usr/local/bin/simple-ssh -> ~/.local/bin/simple-ssh`），脚本替换的是链接指向的真实文件，链接本身保持不变。
+
 ## 校验文件完整性（可选）
 
 每个 Release 附有 `SHA256SUMS` 文件，可校验下载的二进制未被篡改：
