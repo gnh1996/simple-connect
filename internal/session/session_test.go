@@ -68,7 +68,7 @@ func dialShell(t *testing.T, env *testutil.ShellEnv) *sshc.Client {
 func TestSessionEcho(t *testing.T) {
 	env := testutil.StartShell(t)
 	cl := dialShell(t, env)
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 
 	inR, inW := io.Pipe()
 	out := &syncBuf{}
@@ -108,7 +108,7 @@ func TestSessionEcho(t *testing.T) {
 func TestSessionWindowSize(t *testing.T) {
 	env := testutil.StartShell(t)
 	cl := dialShell(t, env)
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 
 	inR, inW := io.Pipe()
 	out := &syncBuf{}
@@ -151,7 +151,7 @@ func TestSessionAuthFailure(t *testing.T) {
 func TestSessionDetach(t *testing.T) {
 	env := testutil.StartShell(t)
 	cl := dialShell(t, env)
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 
 	inR, inW := io.Pipe()
 	out := &syncBuf{}
@@ -202,7 +202,7 @@ func TestSessionDetach(t *testing.T) {
 func TestDetachBoundary(t *testing.T) {
 	env := testutil.StartShell(t)
 	cl := dialShell(t, env)
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 
 	inR, inW := io.Pipe()
 	out := &syncBuf{}
@@ -289,7 +289,7 @@ func TestSessionEnvForward(t *testing.T) {
 
 	env := testutil.StartShell(t)
 	cl := dialShell(t, env)
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 
 	inR, inW := io.Pipe()
 	out := &syncBuf{}
@@ -332,7 +332,7 @@ func TestSessionEnvForward(t *testing.T) {
 func TestSessionPtyIUTF8(t *testing.T) {
 	env := testutil.StartShell(t)
 	cl := dialShell(t, env)
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 
 	inR, inW := io.Pipe()
 	out := &syncBuf{}
@@ -376,7 +376,7 @@ func TestSessionPtyIUTF8(t *testing.T) {
 func TestSessionDetachKeepsConnection(t *testing.T) {
 	env := testutil.StartShell(t)
 	cl := dialShell(t, env)
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 
 	inR, inW := io.Pipe()
 	out := &syncBuf{}
@@ -408,7 +408,7 @@ func TestSessionDetachKeepsConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("detach 后连接应可再建会话: %v", err)
 	}
-	defer s2.Close()
+	defer func() { _ = s2.Close() }()
 	var out2 syncBuf
 	s2.Stdout = &out2
 	s2.Stdin = strings.NewReader("alive\n")
@@ -418,12 +418,89 @@ func TestSessionDetachKeepsConnection(t *testing.T) {
 	waitContains(t, &out2, "alive")
 }
 
+// TestHandleClearBeforePtyRequest 回归：首次清屏必须发生在请求 PTY **之前**。
+// 旧实现把清屏放在 run()（PTY 已建立、远程登录 banner 可能已透传之后），banner
+// 会被擦掉并留下空白（实测 zsh/oh-my-zsh 主机约 0.6s），表现为连接闪烁。
+// 用「PTY 请求必然失败」的已关闭连接断言：start 失败时清屏已先行发生。
+func TestHandleClearBeforePtyRequest(t *testing.T) {
+	env := testutil.StartShell(t)
+	cl := dialShell(t, env)
+	_ = cl.Close() // 关闭后 NewSession 必然失败，start() 止步于 PTY 请求
+
+	var clearBuf syncBuf
+	h := &Handle{cl: cl, testIn: strings.NewReader(""), clearOut: &clearBuf}
+	if err := h.start(); err == nil {
+		t.Fatal("连接已关闭，start 应失败")
+	}
+	if got := clearBuf.String(); got != "\x1b[2J\x1b[H" {
+		t.Fatalf("请求 PTY 前应先清屏一次，实际清屏输出: %q", got)
+	}
+	if !h.cleared {
+		t.Fatal("清屏后应置 cleared，避免 Resume 重复清屏")
+	}
+}
+
+// TestHandleClearOnceAcrossResume 回归：清屏只在首次进入（start）执行一次，
+// detach 后 Resume 不再清屏（否则恢复时画面被清，破坏「原样恢复」语义）。
+func TestHandleClearOnceAcrossResume(t *testing.T) {
+	env := testutil.StartShell(t)
+	cl := dialShell(t, env)
+	defer func() { _ = cl.Close() }()
+
+	inR, inW := io.Pipe()
+	out := &syncBuf{}
+	clearBuf := &syncBuf{}
+	h := &Handle{cl: cl, testIn: inR, testOut: out, testErrOut: out, clearOut: clearBuf, rows: 24, cols: 80}
+	if err := h.start(); err != nil {
+		t.Fatalf("建立会话失败: %v", err)
+	}
+
+	// 首次透传：回显后挂起
+	done := make(chan error, 1)
+	go func() { done <- h.Resume() }()
+	if _, err := inW.Write([]byte("hello\n")); err != nil {
+		t.Fatal(err)
+	}
+	waitContains(t, out, "hello")
+	if _, err := inW.Write([]byte{0x18, 'f'}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrDetach) {
+			t.Fatalf("首次应 detach，实际 %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("detach 未在期限内返回")
+	}
+
+	// 恢复同一会话：继续回显，结束时仍只有一次清屏
+	done2 := make(chan error, 1)
+	go func() { done2 <- h.Resume() }()
+	if _, err := inW.Write([]byte("again\n")); err != nil {
+		t.Fatal(err)
+	}
+	waitContains(t, out, "again")
+	_ = inW.Close()
+	select {
+	case err := <-done2:
+		if err != nil {
+			t.Fatalf("恢复后会话应正常结束，实际 %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("恢复后会话未结束")
+	}
+	if got := clearBuf.String(); got != "\x1b[2J\x1b[H" {
+		t.Fatalf("清屏应只在首次进入执行一次（Resume 不重复），实际: %q", got)
+	}
+}
+
 // TestSessionResume 验证 detach 挂起后可用同一会话恢复透传（不重连）：
 // 挂起 → 恢复继续回显 → 输入 EOF 正常结束。
 func TestSessionResume(t *testing.T) {
 	env := testutil.StartShell(t)
 	cl := dialShell(t, env)
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 
 	inR, inW := io.Pipe()
 	out := &syncBuf{}

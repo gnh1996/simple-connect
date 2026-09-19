@@ -262,7 +262,7 @@ func setupSession(cl *sshc.Client, out, errOut io.Writer, rows, cols int) (*ssh.
 }
 
 // detach 时挂起：不关闭会话与输入管道，输出静音，返回 trackedCwd。
-func runOnce(s *ssh.Session, in io.Reader, tracker *oscTracker, inPipe io.WriteCloser, waitDone chan error) (string, bool, error) {
+func runOnce(in io.Reader, tracker *oscTracker, inPipe io.WriteCloser, waitDone chan error) (string, bool, error) {
 	stop := make(chan struct{})
 	if sp, ok := in.(stoppable); ok {
 		sp.setStop(stop)
@@ -307,7 +307,7 @@ func runSession(c *sshc.Client, in io.Reader, out, errOut io.Writer, rows, cols 
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- s.Wait() }()
 
-	cwd, detached, rerr := runOnce(s, in, tracker, inPipe, waitDone)
+	cwd, detached, rerr := runOnce(in, tracker, inPipe, waitDone)
 	if detached {
 		return cwd, ErrDetach // 挂起：保持会话，由调用方关闭连接
 	}
@@ -328,13 +328,32 @@ type Handle struct {
 
 	// 首次进入的三个动作各自独立记状态：失败时下次 Resume 只重试失败项（恢复时不
 	// 重发已成功的字节），且清屏只发生一次，不受注入结果影响。
-	cleared      bool // 是否已首次清屏（仅真实终端）
-	hookInjected bool // cwd 钩子是否已成功写入
-	echoRestored bool // 远程回显（stty echo）是否已成功写入
+	cleared      bool      // 是否已首次清屏（仅一次，见 clearScreen）
+	clearOut     io.Writer // 清屏输出目标（nil 时 os.Stdout；测试注入）
+	hookInjected bool      // cwd 钩子是否已成功写入
+	echoRestored bool      // 远程回显（stty echo）是否已成功写入
 
-	// 测试注入：非 nil 时绕过真实终端（raw/清屏/输入源），使用注入的 IO
+	// 测试注入：非 nil 时绕过真实终端（raw/输入源），使用注入的 IO
 	testIn              io.Reader
 	testOut, testErrOut io.Writer
+}
+
+// clearScreen 首次进入时本地清屏一次（给远程会话一个干净起点），返回是否执行了清屏。
+// 必须在请求 PTY（setupSession）**之前**调用：旧实现位于 run()（PTY 已建立、远程
+// 登录 banner 可能已透传之后），会把刚显示的 banner 擦掉并留下空白（实测 zsh +
+// oh-my-zsh 主机约 0.6s），表现为连接闪烁。Resume 不经过 start()，不会重复清屏。
+// 输出走本地终端（clearOut 可注入），不经过 SSH 会话。
+func (h *Handle) clearScreen() bool {
+	if h.cleared {
+		return false
+	}
+	out := h.clearOut
+	if out == nil {
+		out = os.Stdout
+	}
+	_, _ = fmt.Fprint(out, "\x1b[2J\x1b[H") // 清屏 + 光标归位（终端写失败无法补救，忽略）
+	h.cleared = true
+	return true
 }
 
 func (h *Handle) start() error {
@@ -342,6 +361,8 @@ func (h *Handle) start() error {
 		width, height, _ := term.GetSize(os.Stdout.Fd())
 		h.rows, h.cols = resolveTermSize(width, height)
 	}
+	// 请求 PTY 前清屏：必须早于 setupSession，避免擦掉随后到达的远程登录 banner（见 clearScreen）
+	h.clearScreen()
 	out := h.testOut
 	if out == nil {
 		out = os.Stdout
@@ -360,9 +381,10 @@ func (h *Handle) start() error {
 	return nil
 }
 
-// newTestHandle 测试构造：注入 IO 与终端尺寸，不操作真实终端（raw/清屏/输入源）。
+// newTestHandle 测试构造：注入 IO 与终端尺寸，不操作真实终端（raw/输入源）；
+// 清屏输出也重定向到 io.Discard，不污染测试输出。
 func newTestHandle(cl *sshc.Client, in io.Reader, out io.Writer, rows, cols int) (*Handle, error) {
-	h := &Handle{cl: cl, testIn: in, testOut: out, testErrOut: out, rows: rows, cols: cols}
+	h := &Handle{cl: cl, testIn: in, testOut: out, testErrOut: out, clearOut: io.Discard, rows: rows, cols: cols}
 	if err := h.start(); err != nil {
 		return nil, err
 	}
@@ -395,9 +417,9 @@ func restoreRemoteEcho(w io.Writer) bool {
 	return true
 }
 
-// run 执行一次透传：置 raw、启动输入源与尺寸监听；首次进入时清屏并注入 cwd 钩子，
-// 恢复（Resume）时原样恢复（不清屏、不发任何字节，画面保持 detach 时状态）。
-// detach 时挂起返回 ErrDetach。
+// run 执行一次透传：置 raw、启动输入源与尺寸监听；首次进入时注入 cwd 钩子
+// （清屏已在 start() 请求 PTY 前完成，见 clearScreen），恢复（Resume）时原样恢复
+// （不清屏、不发任何字节，画面保持 detach 时状态）。detach 时挂起返回 ErrDetach。
 func (h *Handle) run() error {
 	h.tracker.setQuiet(false)
 	var in io.Reader
@@ -423,11 +445,6 @@ func (h *Handle) run() error {
 			h.rows, h.cols = resolveTermSize(width, height)
 		}
 		_ = h.s.WindowChange(h.rows, h.cols)
-
-		if !h.cleared {
-			fmt.Print("\x1b[2J\x1b[H") // 仅首次进入清屏一次
-			h.cleared = true
-		}
 	}
 	// 仅首次进入：注入 cwd 追踪钩子（shell 在提示符前自动上报目录），随后单独一行
 	// 恢复远程回显。两项各自记状态：任一项失败时下次 Resume 只补发失败项，已成功的
@@ -441,7 +458,7 @@ func (h *Handle) run() error {
 		h.echoRestored = restoreRemoteEcho(h.inPipe)
 	}
 
-	_, detached, err := runOnce(h.s, in, h.tracker, h.inPipe, h.waitDone)
+	_, detached, err := runOnce(in, h.tracker, h.inPipe, h.waitDone)
 	if detached {
 		return ErrDetach
 	}
