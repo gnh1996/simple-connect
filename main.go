@@ -8,6 +8,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/term"
 
 	"simple-connect/internal/applog"
 	"simple-connect/internal/exec"
@@ -37,6 +38,9 @@ func reportErr(prefix string, err error) {
 }
 
 func run() error {
+	if err := ensureInteractiveTTY(); err != nil {
+		return err
+	}
 	s, err := store.Load()
 	if err != nil {
 		return err
@@ -53,7 +57,7 @@ func run() error {
 			if errors.Is(err, tea.ErrInterrupted) {
 				return nil // Ctrl+C 优雅退出
 			}
-			return err
+			return annotateTTYErr(err)
 		}
 		rm, ok := result.(*tui.Root)
 		if !ok {
@@ -108,7 +112,7 @@ func sftpLoop(s *store.Store, h *model.Host, sess *session.Handle) error {
 			if errors.Is(err, tea.ErrInterrupted) {
 				return nil
 			}
-			return err
+			return annotateTTYErr(err)
 		}
 		rm, ok := result.(*tui.Root)
 		if !ok || rm.Action != tui.ActionResumeSSH {
@@ -187,4 +191,40 @@ func confirmHostFingerprint(uk *sshc.UnknownHostKeyError) bool {
 
 func styleError(msg string) string {
 	return lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render(msg)
+}
+
+// ttyRequiredHint 在 IDE/管道/后台等无控制终端环境给出可操作提示。
+const ttyRequiredHint = "本程序是交互式 TUI，必须在真实终端中运行。请在系统终端启动；若在 GoLand 中调试，请在 Run Configuration 勾选 “Emulate terminal in output console”。"
+
+// ensureInteractiveTTY 在进入 TUI 前确认有可用终端。
+// bubbletea v2：stdin 已是 TTY 则直接用 stdin；否则回退打开控制终端（unix=/dev/tty）。
+// GoLand 默认 Run 两者皆无，会变成 "open /dev/tty: no such device or address"。
+func ensureInteractiveTTY() error {
+	if term.IsTerminal(os.Stdin.Fd()) {
+		return nil
+	}
+	in, out, err := tea.OpenTTY()
+	if err != nil {
+		return annotateTTYErr(err)
+	}
+	_ = in.Close()
+	if out != nil && out != in {
+		_ = out.Close()
+	}
+	return nil
+}
+
+func isTTYOpenErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "error opening TTY") || strings.Contains(msg, "could not open TTY")
+}
+
+func annotateTTYErr(err error) error {
+	if !isTTYOpenErr(err) {
+		return err
+	}
+	return fmt.Errorf("%w\n%s", err, ttyRequiredHint)
 }
