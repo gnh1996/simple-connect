@@ -17,10 +17,12 @@ import (
 	sshc "simple-connect/internal/ssh"
 	"simple-connect/internal/store"
 	"simple-connect/internal/tui"
+	"simple-connect/internal/version"
 )
 
 func main() {
 	applog.Init()
+	applog.Infof("simple-connect %s", version.Full()) // 诊断日志记录构建信息（版本/提交/构建时间）
 	code := 0
 	if err := run(); err != nil {
 		reportErr("错误", err)

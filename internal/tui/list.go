@@ -12,6 +12,7 @@ import (
 	"simple-connect/internal/model"
 	sshc "simple-connect/internal/ssh"
 	"simple-connect/internal/store"
+	"simple-connect/internal/version"
 )
 
 // ---- 连接列表页 ----
@@ -533,7 +534,7 @@ func (m *listModel) View() tea.View {
 	var b strings.Builder
 	lay := m.layout()
 
-	title := styleTitle.Render("simple-connect")
+	title := styleTitle.Render("simple-connect") + styleDim.Render(" "+version.String())
 	keyring := ""
 	if !m.store.UsingKeyring() {
 		keyring = styleDim.Render(" [密码明文存储]")

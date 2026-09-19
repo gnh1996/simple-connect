@@ -46,6 +46,11 @@ func Errorf(format string, args ...any) {
 	logger.Printf(format, args...)
 }
 
+// Infof 写一条信息日志（如启动时的构建信息）；未初始化或初始化失败时为无操作。
+func Infof(format string, args ...any) {
+	logger.Printf(format, args...)
+}
+
 // open 打开 dir 下的日志文件并切换 logger。dir 不存在时按 0700 创建。
 // limit > 0 且现有文件超过 limit 时，先滚动为 .1。
 func open(dir string, limit int64) error {

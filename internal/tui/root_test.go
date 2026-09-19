@@ -10,6 +10,7 @@ import (
 
 	"simple-connect/internal/model"
 	"simple-connect/internal/store"
+	"simple-connect/internal/version"
 )
 
 func press(text string) tea.Msg {
@@ -66,6 +67,17 @@ func TestListRendersHosts(t *testing.T) {
 	}
 	if !strings.Contains(view, "root@10.0.0.1:22") {
 		t.Fatalf("列表应显示连接目标，实际: %q", view)
+	}
+}
+
+// TestListRendersVersion 主界面标题应展示版本号（发布构建为注入的 tag，
+// 本地构建为 dev + 短提交号）。
+func TestListRendersVersion(t *testing.T) {
+	s := testStore(t)
+	root := NewRoot(s)
+	view := root.View().Content
+	if want := version.String(); !strings.Contains(view, want) {
+		t.Fatalf("主界面应显示版本号 %q，实际: %q", want, view)
 	}
 }
 

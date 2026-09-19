@@ -38,7 +38,11 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: '0'
-        run: go build -trimpath -ldflags "-s -w" -o dist/${{ matrix.name }} .
+        run: |
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          go build -trimpath \
+            -ldflags "-s -w -X simple-connect/internal/version.Version=${{ github.ref_name }} -X simple-connect/internal/version.Commit=${{ github.sha }} -X simple-connect/internal/version.Date=$BUILD_DATE" \
+            -o dist/${{ matrix.name }} .
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
