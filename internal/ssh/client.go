@@ -17,10 +17,27 @@ import (
 	"simple-connect/internal/model"
 )
 
-// Client 封装 SSH 客户端
+// Client 封装 SSH 客户端。jumps 保存 ProxyJump 链上的跳板客户端：
+// 目标连接建立在跳板的转发通道之上，跳板对象必须存活至目标关闭，
+// 并在 Close 时一并释放（否则每次经跳板连接都会泄漏跳板 TCP/SSH 连接）。
 type Client struct {
 	*ssh.Client
-	Host *model.Host
+	Host  *model.Host
+	jumps []*ssh.Client
+}
+
+// Close 关闭目标连接及其跳板链（先关目标，再自内向外关跳板），幂等。
+func (c *Client) Close() error {
+	var err error
+	if c.Client != nil {
+		err = c.Client.Close()
+	}
+	for i := len(c.jumps) - 1; i >= 0; i-- {
+		if c.jumps[i] != nil {
+			_ = c.jumps[i].Close()
+		}
+	}
+	return err
 }
 
 // Option 连接选项
@@ -38,26 +55,29 @@ func WithHostKeyCallback(cb ssh.HostKeyCallback) Option {
 // Connect 建立 SSH 连接（自动合并 ~/.ssh/config，支持 ProxyJump 跳板）
 func Connect(h *model.Host, password string, opts ...Option) (*Client, error) {
 	target, jumps := ResolveSSHConfig(h)
-	cfg, err := newConfig(target, password)
+	cfg, cleanup, err := newConfig(target, password)
 	if err != nil {
 		return nil, err
 	}
+	// 目标认证在 dialWithJumps 内完成，握手结束后即可关闭 agent 连接（避免 fd 泄漏）。
+	defer cleanup()
 	for _, o := range opts {
 		o(cfg)
 	}
-	conn, err := dialWithJumps(jumps, cfg, opts, password, target)
+	conn, chain, err := dialWithJumps(jumps, cfg, opts, password, target)
 	if err != nil {
 		return nil, err
 	}
-	return &Client{Client: conn, Host: target}, nil
+	return &Client{Client: conn, Host: target, jumps: chain}, nil
 }
 
 // ConnectRaw 建立 SSH 连接（不合并 ~/.ssh/config，测试与内嵌 SFTP 使用）
 func ConnectRaw(h *model.Host, password string, opts ...Option) (*Client, error) {
-	cfg, err := newConfig(h, password)
+	cfg, cleanup, err := newConfig(h, password)
 	if err != nil {
 		return nil, err
 	}
+	defer cleanup()
 	for _, o := range opts {
 		o(cfg)
 	}
@@ -68,32 +88,34 @@ func ConnectRaw(h *model.Host, password string, opts ...Option) (*Client, error)
 	return &Client{Client: conn, Host: h}, nil
 }
 
-// newConfig 构造 SSH 客户端配置
-func newConfig(h *model.Host, password string) (*ssh.ClientConfig, error) {
+// newConfig 构造 SSH 客户端配置。返回的 cleanup 用于在握手完成后关闭
+// authMethods 可能建立的 ssh-agent 连接（无 agent 时为 no-op）。
+func newConfig(h *model.Host, password string) (*ssh.ClientConfig, func(), error) {
 	hk, err := hostKeyCallback(h.Addr())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	auth, cleanup := authMethods(h, password)
 	return &ssh.ClientConfig{
 		User:            h.User,
-		Auth:            authMethods(h, password),
+		Auth:            auth,
 		HostKeyCallback: hk,
 		Timeout:         10 * time.Second,
 		ClientVersion:   "SSH-2.0-simple-connect",
-	}, nil
+	}, cleanup, nil
 }
 
-// dialWithJumps 依次经跳板机隧道连接目标；无跳板时直连
-func dialWithJumps(jumps []*model.Host, targetCfg *ssh.ClientConfig, opts []Option, password string, target *model.Host) (*ssh.Client, error) {
+// dialWithJumps 依次经跳板机隧道连接目标；无跳板时直连。
+// 返回目标客户端与被保留的跳板链（供 Client.Close 释放）。
+func dialWithJumps(jumps []*model.Host, targetCfg *ssh.ClientConfig, opts []Option, password string, target *model.Host) (*ssh.Client, []*ssh.Client, error) {
 	var current *ssh.Client
+	var chain []*ssh.Client
 	var err error
 	for _, j := range jumps {
-		jcfg, err := newConfig(j, password) // 跳板复用目标保存的密码与密钥
-		if err != nil {
-			if current != nil {
-				_ = current.Close()
-			}
-			return nil, err
+		jcfg, jcleanup, cfgErr := newConfig(j, password) // 跳板复用目标保存的密码与密钥
+		if cfgErr != nil {
+			closeClients(current, chain)
+			return nil, nil, cfgErr
 		}
 		for _, o := range opts {
 			o(jcfg)
@@ -113,29 +135,46 @@ func dialWithJumps(jumps []*model.Host, targetCfg *ssh.ClientConfig, opts []Opti
 				}
 			}
 		}
+		// 该跳板认证已结束（成败皆然），立即释放其 agent 连接。
+		jcleanup()
 		if err != nil {
-			if current != nil {
-				_ = current.Close()
-			}
-			return nil, fmt.Errorf("连接跳板 %s 失败: %w", j.Addr(), err)
+			closeClients(current, chain)
+			return nil, nil, fmt.Errorf("连接跳板 %s 失败: %w", j.Addr(), err)
 		}
+		chain = append(chain, current)
 	}
 
 	if current == nil {
-		return ssh.Dial("tcp", target.Addr(), targetCfg)
+		conn, err := ssh.Dial("tcp", target.Addr(), targetCfg)
+		if err != nil {
+			return nil, nil, err
+		}
+		return conn, nil, nil
 	}
 	c, err := current.Dial("tcp", target.Addr())
 	if err != nil {
-		_ = current.Close()
-		return nil, fmt.Errorf("经跳板连接 %s 失败: %w", target.Addr(), err)
+		closeClients(current, chain)
+		return nil, nil, fmt.Errorf("经跳板连接 %s 失败: %w", target.Addr(), err)
 	}
 	cc, chans, reqs, err := ssh.NewClientConn(c, target.Addr(), targetCfg)
 	if err != nil {
 		_ = c.Close()
-		_ = current.Close()
-		return nil, err
+		closeClients(current, chain)
+		return nil, nil, err
 	}
-	return ssh.NewClient(cc, chans, reqs), nil
+	return ssh.NewClient(cc, chans, reqs), chain, nil
+}
+
+// closeClients 关闭目标客户端（可能为 nil）与整条跳板链，用于拨号失败路径清理。
+func closeClients(current *ssh.Client, chain []*ssh.Client) {
+	if current != nil {
+		_ = current.Close()
+	}
+	for i := len(chain) - 1; i >= 0; i-- {
+		if chain[i] != nil && chain[i] != current {
+			_ = chain[i].Close()
+		}
+	}
 }
 
 // NewSession 创建会话（带 PTY 的交互终端）
@@ -200,9 +239,12 @@ func (c *Client) NewTerminalSession(term string, rows, cols int) (*ssh.Session, 
 	return s, nil
 }
 
-// authMethods 根据认证方式生成认证方法（私钥 + 密码 + keyboard-interactive + agent）
-func authMethods(h *model.Host, password string) []ssh.AuthMethod {
+// authMethods 根据认证方式生成认证方法（私钥 + 密码 + keyboard-interactive + agent）。
+// 返回的 cleanup 在 SSH 握手完成后调用，用于关闭可能建立的 ssh-agent 连接
+// （agent 连接需在认证期间保持打开，握手结束即不再使用；无 agent 时为 no-op）。
+func authMethods(h *model.Host, password string) ([]ssh.AuthMethod, func()) {
 	var methods []ssh.AuthMethod
+	cleanup := func() {}
 	if h.Auth == model.AuthKey && h.KeyPath != "" {
 		if signer, err := loadSigner(h.KeyPath, ""); err == nil {
 			methods = append(methods, ssh.PublicKeys(signer))
@@ -214,10 +256,11 @@ func authMethods(h *model.Host, password string) []ssh.AuthMethod {
 		methods = append(methods, ssh.KeyboardInteractive(passwordAnswer(password)))
 	}
 	// 代理认证兜底
-	if agent, err := agentSigner(); err == nil {
-		methods = append(methods, ssh.PublicKeysCallback(agent))
+	if cb, closeAgent, err := agentSigner(); err == nil {
+		methods = append(methods, ssh.PublicKeysCallback(cb))
+		cleanup = closeAgent
 	}
-	return methods
+	return methods, cleanup
 }
 
 // passwordAnswer 用保存的密码应答 keyboard-interactive 提示。
@@ -248,14 +291,16 @@ func loadSigner(keyPath, passphrase string) (ssh.Signer, error) {
 	return ssh.ParsePrivateKey(pem)
 }
 
-// agentSigner 返回 ssh-agent 中的全部签名器
-func agentSigner() (func() ([]ssh.Signer, error), error) {
+// agentSigner 返回 ssh-agent 中的全部签名器，并返回关闭其连接的 cleanup。
+// agent 连接仅在认证回调期间需要，调用方须在握手结束后调用 cleanup，
+// 否则每次连接都会泄漏一个 agent socket（旧实现从不关闭）。
+func agentSigner() (func() ([]ssh.Signer, error), func(), error) {
 	conn, err := agentConn()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ag := agent.NewClient(conn)
-	return ag.Signers, nil
+	return ag.Signers, func() { _ = conn.Close() }, nil
 }
 
 // UnknownHostKeyError 首次连接错误：主机指纹不在 known_hosts 中。

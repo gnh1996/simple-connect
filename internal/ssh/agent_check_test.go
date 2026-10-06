@@ -1,9 +1,12 @@
 package sshc
 
 import (
+	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 )
 
 // 模拟无 agent 环境：将 SSH_AUTH_SOCK 指向无效路径
@@ -45,5 +48,54 @@ func TestKeyInAgentWithoutAgent(t *testing.T) {
 	}
 	if in, known := KeyInAgent(keyPath); in || known {
 		t.Fatalf("agent 不可用时 KeyInAgent 应为 (false,false)，实际 (%v,%v)", in, known)
+	}
+}
+
+// TestAgentSignerCleanupClosesConn 回归：agentSigner 必须返回可关闭连接的 cleanup，
+// 且调用后连接真正关闭（旧实现从不关闭，每次连接泄漏一个 agent socket）。
+func TestAgentSignerCleanupClosesConn(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket 仅在类 Unix 平台可用")
+	}
+	sock := filepath.Join(t.TempDir(), "agent.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("监听测试 agent socket 失败: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan struct{})
+	eof := make(chan struct{})
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		close(accepted)
+		// agent 协议由客户端按需发起；此处仅等待对端关闭（Read 返回 EOF）。
+		buf := make([]byte, 1)
+		_, _ = c.Read(buf)
+		_ = c.Close()
+		close(eof)
+	}()
+	t.Setenv("SSH_AUTH_SOCK", sock)
+
+	_, cleanup, err := agentSigner()
+	if err != nil {
+		t.Fatalf("agentSigner 失败: %v", err)
+	}
+	if cleanup == nil {
+		t.Fatal("agentSigner 应返回非 nil cleanup")
+	}
+	select {
+	case <-accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("agentSigner 未连接到测试 agent")
+	}
+	cleanup()
+	select {
+	case <-eof:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup 未关闭 agent 连接（fd 泄漏）")
 	}
 }
