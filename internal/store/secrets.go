@@ -37,7 +37,12 @@ func (s keyringSecrets) Set(key, value string) error {
 }
 
 func (s keyringSecrets) Delete(key string) error {
-	return keyring.Delete(keyringService, key)
+	// 条目不存在视为删除成功：否则 SetPassword(h, "") 清除密码时会因 ErrNotFound
+	// 直接失败，跳过后续 writeHosts，导致 HasPassword 与真实状态不一致。
+	if err := keyring.Delete(keyringService, key); err != nil && !errors.Is(err, keyring.ErrNotFound) {
+		return err
+	}
+	return nil
 }
 
 // fileSecrets 本地文件兜底后端（权限 0600），在无系统 keyring 时使用。

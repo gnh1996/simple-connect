@@ -92,7 +92,6 @@ func (t *oscTracker) setQuiet(q bool) {
 
 func (t *oscTracker) Write(p []byte) (int, error) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	// 关键：合并残留 + 新数据时必须**拷贝**到独立切片，不能 append(t.buf, p...) 直接
 	// 复用 t.buf 的底层数组。否则 data 与 t.buf 共享同一数组，scan 在遍历 data 时
 	// 又会 t.buf = append(t.buf, tail...) 写入同一数组，导致 data 未处理部分被覆盖
@@ -101,14 +100,38 @@ func (t *oscTracker) Write(p []byte) (int, error) {
 	buf = append(buf, t.buf...)
 	buf = append(buf, p...)
 	cleaned := t.scan(buf)
-	if !t.quiet {
+	quiet := t.quiet
+	t.mu.Unlock()
+	// 锁外写本地终端：ssh 会话的 stdout 由单一 reader goroutine 串行写入，不会乱序；
+	// 避免慢终端写阻塞 setQuiet（detach 挂起需及时静音）与 Cwd。
+	if !quiet {
 		_, _ = t.out.Write(cleaned)
 	}
 	return len(p), nil
 }
 
+// indexOSCTerminator 在 b 中查找 OSC 终止符：BEL(0x07) 或 ST(ESC \)。
+// 返回最早终止符的起始下标、其长度（1= BEL，2= ST）与是否找到。
+func indexOSCTerminator(b []byte) (int, int, bool) {
+	bel := bytes.IndexByte(b, 0x07)
+	st := bytes.Index(b, []byte{0x1b, '\\'})
+	switch {
+	case bel < 0 && st < 0:
+		return 0, 0, false
+	case st < 0:
+		return bel, 1, true
+	case bel < 0:
+		return st, 2, true
+	case bel < st:
+		return bel, 1, true
+	default:
+		return st, 2, true
+	}
+}
+
 // scan 扫描数据，提取 OSC 133;cwd 序列并从输出中剔除；返回应透传的字节。
 // 跨 Write 边界未收尾的序列头部保留在 t.buf，与下次数据合并。
+// 终止符兼容 BEL(0x07) 与 ST(ESC \)，对齐常见 shell integration 实现。
 // 注意：不能以「第一个 ESC 到第一个 BEL」为界——cwd OSC 之前可能已有其他 ESC
 // 序列（如 \x1b[?2004h 括号粘贴、光标移动），首个 ESC 并非 OSC 起点。
 // 必须精确定位 `\x1b]133;cwd=` 前缀。
@@ -141,27 +164,26 @@ func (t *oscTracker) scan(data []byte) []byte {
 				matched++
 			}
 			if pos+2+matched >= len(data) {
-				// 缓冲耗尽但前缀仍可能延续（可能是 cwd 序列未到 BEL）→ 保留跨边界续扫。
-				// 只在「确实是 cwd 前缀或 cwd 路径」时保留，非 cwd 的前缀在下一分支立即透传。
-				tail := data[pos:]
-				if len(tail) > oscMaxKeep {
-					tail = tail[len(tail)-oscMaxKeep:]
-				}
-				t.buf = append(t.buf, tail...)
+				// 缓冲耗尽但前缀仍可能延续（可能是 cwd 序列未到终止符）→ 保留跨边界续扫。
+				// 此处 data[pos:] 长度恒 ≤ 2+len(prefix)（循环在数据尽处停止），无需封顶。
+				t.buf = append(t.buf, data[pos:]...)
 				return out
 			}
 			if matched == len(prefix) {
-				// 前缀完整匹配 `\x1b]133;cwd=`：收集路径直到 BEL 并从输出剔除
+				// 前缀完整匹配 `\x1b]133;cwd=`：收集路径直到终止符（BEL 或 ST）并从输出剔除
 				start := pos + 2 + matched
-				if j := bytes.IndexByte(data[start:], 0x07); j >= 0 {
+				if j, jlen, ok := indexOSCTerminator(data[start:]); ok {
 					t.cwd = string(data[start : start+j])
-					pos = start + j + 1
+					pos = start + j + jlen
 					continue
 				}
-				// 路径未收尾：保留跨边界续扫
+				// 路径未收尾：保留跨边界续扫。超过 oscMaxKeep 仍无终止符时，不静默截断
+				// 丢字节（旧实现截尾会丢失前缀导致残留字节被当普通数据输出），而是把整段
+				// 视作非 cwd 序列透传并放弃，避免内存无限增长。
 				tail := data[pos:]
 				if len(tail) > oscMaxKeep {
-					tail = tail[len(tail)-oscMaxKeep:]
+					out = append(out, tail...)
+					return out
 				}
 				t.buf = append(t.buf, tail...)
 				return out

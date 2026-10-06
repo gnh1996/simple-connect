@@ -280,3 +280,31 @@ func TestStoreReloadSeesOtherWrites(t *testing.T) {
 		t.Fatalf("Reload 后实例 B 应看到实例 A 的写入，实际 %+v", s2.Hosts())
 	}
 }
+
+// TestStoreConcurrentReadWriteSameInstance 并发读写同一 Store 实例：
+// Hosts/Find 与 Add 并发时不得有数据竞争（-race 下校验内存快照的 RWMutex）。
+func TestStoreConcurrentReadWriteSameInstance(t *testing.T) {
+	dir := t.TempDir()
+	s := loadTempStore(t, dir)
+	if err := s.Add(&model.Host{Name: "seed", Host: "127.0.0.1", User: "root", Auth: model.AuthPassword}); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = s.Hosts()
+			_ = s.Find("nonexistent")
+		}()
+	}
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_ = s.Add(&model.Host{Name: fmt.Sprintf("h%02d", i), Host: "127.0.0.1", User: "root", Auth: model.AuthPassword})
+		}(i)
+	}
+	wg.Wait()
+}

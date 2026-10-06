@@ -207,6 +207,52 @@ func TestOSCTrackerCwdPrefixHeldOnly(t *testing.T) {
 	}
 }
 
+// TestOSCTrackerSTTerminator 回归：cwd 序列以 ST(ESC \) 终止时也应被识别并剔除，
+// 且跨 Write 边界切开 ST 亦能正确拼回。
+func TestOSCTrackerSTTerminator(t *testing.T) {
+	var buf bytes.Buffer
+	tr := newOSCTracker(&buf)
+	tr.Write([]byte("before\x1b]133;cwd=/srv/app\x1b\\after"))
+	if tr.Cwd() != "/srv/app" {
+		t.Fatalf("ST 终止的 cwd 应被跟踪，实际 %q", tr.Cwd())
+	}
+	if buf.String() != "beforeafter" {
+		t.Fatalf("ST 终止的 cwd 序列应被剔除，实际 %q", buf.String())
+	}
+
+	// 跨边界切开 ST（ESC 与 \ 分属两次 Write）
+	var buf2 bytes.Buffer
+	tr2 := newOSCTracker(&buf2)
+	tr2.Write([]byte("x\x1b]133;cwd=/tmp\x1b"))
+	tr2.Write([]byte("\\y"))
+	if tr2.Cwd() != "/tmp" || buf2.String() != "xy" {
+		t.Fatalf("跨边界的 ST 应正确处理: cwd=%q out=%q", tr2.Cwd(), buf2.String())
+	}
+}
+
+// TestOSCTrackerOverflowNoSilentDrop 回归：看似 cwd 前缀后跟超长且无终止符的输入，
+// 不得静默截断丢字节（旧实现截尾会让残留被当普通数据输出/错乱）；应整体透传并复位。
+func TestOSCTrackerOverflowNoSilentDrop(t *testing.T) {
+	var buf bytes.Buffer
+	tr := newOSCTracker(&buf)
+	payload := append([]byte("\x1b]133;cwd="), bytes.Repeat([]byte("a"), 5000)...)
+	tr.Write(payload)
+	if buf.Len() != len(payload) || buf.String() != string(payload) {
+		t.Fatalf("超长未终止序列应整体原样透传: got %d want %d", buf.Len(), len(payload))
+	}
+	if len(tr.buf) != 0 {
+		t.Fatalf("溢出后不应残留缓冲: %d 字节", len(tr.buf))
+	}
+	// 之后仍能正常跟踪 cwd
+	tr.Write([]byte("mid\x1b]133;cwd=/ok\x07end"))
+	if tr.Cwd() != "/ok" {
+		t.Fatalf("溢出后应恢复正常跟踪，实际 %q", tr.Cwd())
+	}
+	if !strings.HasSuffix(buf.String(), "midend") {
+		t.Fatalf("后续普通输出应正常透传，实际尾部 %q", buf.String()[len(buf.String())-10:])
+	}
+}
+
 // TestOSCTrackerNoDuplicateOnBoundary 回归：跨 Write 边界时，无 ESC 的纯文本
 // （如登录横幅）不得在后续 Write 中重复输出。历史 bug：scan 在「无 ESC 序列」
 // 分支把全部已透传数据又写回 t.buf，导致下一 Write 重复输出该内容（登录横幅

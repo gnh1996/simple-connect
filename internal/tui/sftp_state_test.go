@@ -115,3 +115,50 @@ func TestSFTPPromptCompletionStaleResultDiscarded(t *testing.T) {
 		t.Fatalf("陈旧补全结果不应写入 g 输入框，期望 %q 实际 %q", want, next.promptIn.Value())
 	}
 }
+
+// TestSFTPSelectionPrunedAfterRefresh 回归：文件被外部删除后刷新，选中集合应被裁剪，
+// 避免"已选中 N 项"/批量删除确认项数虚高。
+func TestSFTPSelectionPrunedAfterRefresh(t *testing.T) {
+	env := testutil.StartSFTP(t)
+	m := newTestSFTPModel(t, env)
+	defer m.close()
+	m.focus = paneLocal
+
+	root := t.TempDir()
+	m.localCwd = root
+	_ = os.WriteFile(filepath.Join(root, "a.txt"), []byte("a"), 0o644)
+
+	next, _ := m.Update(m.loadLocal()())
+	next.localCursor = indexOfName(next.localEntries, "a.txt")
+	next, _ = next.handleKey(pressKey(tea.KeySpace).(tea.KeyPressMsg))
+	if next.selCount() != 1 {
+		t.Fatalf("应选中 1 项，实际 %d", next.selCount())
+	}
+
+	_ = os.Remove(filepath.Join(root, "a.txt"))
+	next, _ = next.Update(next.loadLocal()())
+	if next.selCount() != 0 || next.hasSel() {
+		t.Fatalf("外部删除并刷新后选中应被清理: selCount=%d hasSel=%v", next.selCount(), next.hasSel())
+	}
+}
+
+// TestSFTPRemoteDeleteWithoutConnNoPanic 回归：未连接时删除远程条目不得解引用空连接。
+func TestSFTPRemoteDeleteWithoutConnNoPanic(t *testing.T) {
+	m := &sftpModel{
+		focus:          paneRemote,
+		connState:      connIdle,
+		confirmID:      0,
+		localConfirmID: -1,
+		entries:        []os.FileInfo{benchFileInfo{name: "x.txt"}},
+		selLocal:       map[string]struct{}{},
+		selRemote:      map[string]struct{}{},
+	}
+	if _, cmd := m.doDelete(); cmd == nil {
+		t.Fatal("无连接删除远程应返回错误提示命令而非 panic")
+	}
+	m.selRemote["x.txt"] = struct{}{}
+	m.confirmBatch = true
+	if _, cmd := m.doBatchDelete(); cmd == nil {
+		t.Fatal("无连接批量删除远程应返回错误提示命令而非 panic")
+	}
+}

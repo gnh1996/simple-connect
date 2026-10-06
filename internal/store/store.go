@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 
 	"simple-connect/internal/model"
 )
@@ -13,9 +14,12 @@ import (
 // Store 负责连接配置与密钥的持久化。
 // 多实例并发安全：所有变更操作先获取文件锁，再重读磁盘最新数据按 ID 应用变更，
 // 原子写回；读取方通过共享锁 / 原子写保证看不到半截文件。
+// 进程内并发安全：内存中的 hosts 快照用 RWMutex 保护（文件锁只管跨文件读写，
+// 不管内存切片）。
 type Store struct {
 	path     string
 	lockPath string
+	mu       sync.RWMutex
 	hosts    []*model.Host
 	secrets  Secrets
 	keyring  bool
@@ -60,8 +64,24 @@ func (s *Store) load() error {
 	if err != nil {
 		return err
 	}
-	s.hosts = hosts
+	s.setHosts(hosts)
 	return nil
+}
+
+// setHosts 原子替换内存快照（写路径统一走这里）。
+func (s *Store) setHosts(hosts []*model.Host) {
+	s.mu.Lock()
+	s.hosts = hosts
+	s.mu.Unlock()
+}
+
+// hostsSnapshot 返回内存快照的浅拷贝，供读取路径在锁外使用。
+func (s *Store) hostsSnapshot() []*model.Host {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*model.Host, len(s.hosts))
+	copy(out, s.hosts)
+	return out
 }
 
 // withExclusiveLock 持有排他锁执行 fn（读-改-写操作互斥）
@@ -115,8 +135,7 @@ func (s *Store) writeHosts(hosts []*model.Host) error {
 
 // Hosts 返回按名称排序的连接列表
 func (s *Store) Hosts() []*model.Host {
-	out := make([]*model.Host, len(s.hosts))
-	copy(out, s.hosts)
+	out := s.hostsSnapshot()
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
@@ -140,7 +159,7 @@ func (s *Store) Add(h *model.Host) error {
 		if err := s.writeHosts(hosts); err != nil {
 			return err
 		}
-		s.hosts = hosts
+		s.setHosts(hosts)
 		return nil
 	})
 }
@@ -166,7 +185,7 @@ func (s *Store) Update(h *model.Host) error {
 		if err := s.writeHosts(hosts); err != nil {
 			return err
 		}
-		s.hosts = hosts
+		s.setHosts(hosts)
 		return nil
 	})
 }
@@ -197,14 +216,14 @@ func (s *Store) Delete(id string) error {
 			// keyring 缺失或 Secret Service 锁屏等场景会失败，记录但不阻塞删除主机
 			// （孤儿密码可在下次覆盖时清理）；文件兜底已在锁内原子化，不会静默覆盖。
 		}
-		s.hosts = out
+		s.setHosts(out)
 		return nil
 	})
 }
 
 // Find 按 ID 查找连接
 func (s *Store) Find(id string) *model.Host {
-	for _, e := range s.hosts {
+	for _, e := range s.hostsSnapshot() {
 		if e.ID == id {
 			return e
 		}
@@ -254,7 +273,7 @@ func (s *Store) SetPassword(h *model.Host, pass string) error {
 		if err := s.writeHosts(hosts); err != nil {
 			return err
 		}
-		s.hosts = hosts
+		s.setHosts(hosts)
 		return nil
 	})
 }
@@ -266,7 +285,7 @@ func (s *Store) Reload() error {
 		if err != nil {
 			return err
 		}
-		s.hosts = hosts
+		s.setHosts(hosts)
 		return nil
 	})
 }

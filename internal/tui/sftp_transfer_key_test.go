@@ -246,7 +246,7 @@ func TestSFTPPathCompleteLocal(t *testing.T) {
 	}
 	next, _ = next.Update(cm)
 	if len(next.promptCandidates) != 2 {
-		t.Fatalf("候选应写入 pathCandidates，实际 %v", next.promptCandidates)
+		t.Fatalf("候选应写入 promptCandidates，实际 %v", next.promptCandidates)
 	}
 	want1 := filepath.Join(root, "alpha.txt")
 	if next.promptIn.Value() != want1 {

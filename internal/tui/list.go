@@ -158,7 +158,10 @@ func (m *listModel) runStatusChecks() tea.Cmd {
 		cmds = append(cmds, func() tea.Msg {
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			return statusResultMsg{gen: gen, id: h.ID, status: sshc.CheckStatus(h, statusCheckTimeout)}
+			// 探活同样合并 ~/.ssh/config（Host 别名的真实地址/端口），
+			// 否则仅在 config 中定义的主机会被误判离线。
+			resolved, _ := sshc.ResolveSSHConfig(h)
+			return statusResultMsg{gen: gen, id: h.ID, status: sshc.CheckStatus(resolved, statusCheckTimeout)}
 		})
 	}
 	return tea.Batch(cmds...)

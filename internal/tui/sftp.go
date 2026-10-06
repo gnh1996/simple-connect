@@ -331,11 +331,13 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 		if msg.kind == paneRemote {
 			if msg.path == m.cwd {
 				m.entries = msg.entries
+				pruneSel(m.selRemote, msg.entries) // 外部删除的文件不应继续算作选中
 				m.clampCursor()
 			}
 		} else {
 			if msg.path == m.localCwd {
 				m.localEntries = msg.entries
+				pruneSel(m.selLocal, msg.entries)
 				m.clampLocalCursor()
 			}
 		}
@@ -515,8 +517,6 @@ func (m *sftpModel) bodyHeightWith(dynLen int) int {
 }
 
 // ---- 导航 ----
-
-func (m *sftpModel) pane() int { return m.focus }
 
 func (m *sftpModel) entryAt(idx int) fs.FileInfo {
 	if m.focus == paneLocal {
@@ -744,6 +744,23 @@ func (m *sftpModel) selectedEntries() []fs.FileInfo {
 	return out
 }
 
+// pruneSel 移除选中集合中已不在 entries 里的名字。刷新后文件被外部删除时，
+// 若不清除，界面的"已选中 N 项"与批量删除确认项数会虚高（实际操作为空）。
+func pruneSel(sel map[string]struct{}, entries []fs.FileInfo) {
+	if len(sel) == 0 {
+		return
+	}
+	names := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		names[e.Name()] = struct{}{}
+	}
+	for n := range sel {
+		if _, ok := names[n]; !ok {
+			delete(sel, n)
+		}
+	}
+}
+
 // doBatchDelete 批量删除焦点栏全部选中条目（本地 RemoveAll / 远程递归）
 func (m *sftpModel) doBatchDelete() (*sftpModel, tea.Cmd) {
 	sel := m.selectedEntries()
@@ -773,6 +790,9 @@ func (m *sftpModel) doBatchDelete() (*sftpModel, tea.Cmd) {
 		})
 	}
 	p := m.cwd
+	if !m.remoteReady() {
+		return m, tea.Cmd(func() tea.Msg { return sftpMsgText{text: "未连接 SFTP，无法删除远程条目"} })
+	}
 	cl := m.conn.Client
 	type item struct {
 		path  string
@@ -1044,6 +1064,9 @@ func (m *sftpModel) doDelete() (*sftpModel, tea.Cmd) {
 	e := m.entries[idx]
 	remote := path.Join(m.cwd, e.Name())
 	p := m.cwd
+	if !m.remoteReady() {
+		return m, tea.Cmd(func() tea.Msg { return sftpMsgText{text: "未连接 SFTP，无法删除远程条目"} })
+	}
 	cl := m.conn.Client
 	return m, tea.Cmd(func() tea.Msg {
 		if err := sftpc.Remove(cl, remote, e.IsDir()); err != nil {
