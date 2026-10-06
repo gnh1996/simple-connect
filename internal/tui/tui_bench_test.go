@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"time"
 	"testing"
+	"time"
 
 	"simple-connect/internal/model"
 	sshc "simple-connect/internal/ssh"
@@ -42,12 +42,12 @@ func BenchmarkListView(b *testing.B) {
 	hosts := make([]*model.Host, n)
 	for i := range hosts {
 		hosts[i] = &model.Host{
-			ID:         fmt.Sprintf("id-%04d", i),
-			Name:       fmt.Sprintf("生产服务器-%04d", i),
-			Host:       fmt.Sprintf("10.0.%d.%d", i/250, i%250+1),
-			Port:       22,
-			User:       "root",
-			Auth:       model.AuthPassword,
+			ID:          fmt.Sprintf("id-%04d", i),
+			Name:        fmt.Sprintf("生产服务器-%04d", i),
+			Host:        fmt.Sprintf("10.0.%d.%d", i/250, i%250+1),
+			Port:        22,
+			User:        "root",
+			Auth:        model.AuthPassword,
 			HasPassword: true,
 		}
 	}
