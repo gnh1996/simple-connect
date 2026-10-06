@@ -25,27 +25,27 @@ func TestSFTPConnectingFeedbackAndBusyReset(t *testing.T) {
 
 	m := newSFTPModel(s, h, "", nil)
 	_ = m.Init()
-	if !m.busy || m.status == "" {
-		t.Fatalf("Init 应显示连接中并置 busy，实际 busy=%v status=%q", m.busy, m.status)
+	if m.connState != connConnecting || m.status == "" {
+		t.Fatalf("Init 应显示连接中并置连接态，实际 state=%v status=%q", m.connState, m.status)
 	}
 
-	// 拨号失败：busy 复位 + 错误提示
+	// 拨号失败：进入失败态 + 错误提示
 	next, _ := m.Update(sftpConnMsg{err: errors.New("dial tcp: connection refused")})
-	if next.busy {
-		t.Fatal("连接失败后 busy 应复位")
+	if next.connState != connFailed {
+		t.Fatal("连接失败后应进入失败态")
 	}
 	if !strings.Contains(next.err, "连接失败") {
 		t.Fatalf("应显示连接失败，实际 %q", next.err)
 	}
 
-	// 指纹确认态：busy 复位，y 重连时再置回
+	// 指纹确认态：进入失败态，y 重连时再置回连接中
 	m2 := newSFTPModel(s, h, "", nil)
 	m2.trustHostKey = func(*sshc.UnknownHostKeyError) error { return nil } // 禁止触碰真实 known_hosts
 	_ = m2.Init()
 	uk := &sshc.UnknownHostKeyError{Hostname: "10.0.0.1:22", Fingerprint: "SHA256:abc"}
 	next2, _ := m2.Update(sftpConnMsg{err: uk})
-	if next2.busy {
-		t.Fatal("指纹确认期间 busy 应复位")
+	if next2.connState != connFailed {
+		t.Fatal("指纹确认期间应处于失败/待确认态")
 	}
 	if next2.pendingKey == nil {
 		t.Fatal("应进入指纹确认态")
@@ -54,8 +54,8 @@ func TestSFTPConnectingFeedbackAndBusyReset(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("确认信任后应重新拨号")
 	}
-	if !next2.busy || !strings.Contains(next2.status, "重连") {
-		t.Fatalf("重连时应重新置 busy 并提示，实际 busy=%v status=%q", next2.busy, next2.status)
+	if next2.connState != connConnecting || !strings.Contains(next2.status, "重连") {
+		t.Fatalf("重连时应重新置连接中并提示，实际 state=%v status=%q", next2.connState, next2.status)
 	}
 }
 
@@ -82,7 +82,7 @@ func TestRenderProgressClamp(t *testing.T) {
 // TestSFTPLocalNavigationUsesFilepath 本地栏导航使用 filepath 语义（2.4）。
 func TestSFTPLocalNavigationUsesFilepath(t *testing.T) {
 	base := filepath.Join("/tmp", "sc-local", "a", "b")
-	m := &sftpModel{localCwd: base, selLocal: map[int]struct{}{}, selRemote: map[int]struct{}{}}
+	m := &sftpModel{localCwd: base, selLocal: map[string]struct{}{}, selRemote: map[string]struct{}{}}
 	next, cmd := m.goUp()
 	if cmd == nil {
 		t.Fatal("上一级应刷新本地列表")
@@ -92,7 +92,7 @@ func TestSFTPLocalNavigationUsesFilepath(t *testing.T) {
 	}
 
 	// 根目录再向上应原地不动
-	root := &sftpModel{localCwd: "/", selLocal: map[int]struct{}{}, selRemote: map[int]struct{}{}}
+	root := &sftpModel{localCwd: "/", selLocal: map[string]struct{}{}, selRemote: map[string]struct{}{}}
 	nextRoot, cmd := root.goUp()
 	if cmd != nil || nextRoot.localCwd != "/" {
 		t.Fatalf("根目录向上应原地不动，实际 %q cmd=%v", nextRoot.localCwd, cmd != nil)
@@ -102,8 +102,8 @@ func TestSFTPLocalNavigationUsesFilepath(t *testing.T) {
 	m3 := &sftpModel{
 		localCwd:       "/tmp/sc-local",
 		localEntries:   []fs.FileInfo{benchFileInfo{name: "sub", dir: true}},
-		selLocal:       map[int]struct{}{},
-		selRemote:      map[int]struct{}{},
+		selLocal:       map[string]struct{}{},
+		selRemote:      map[string]struct{}{},
 		localConfirmID: -1, confirmID: -1,
 	}
 	next3, cmd := m3.enterCurrent()
@@ -180,8 +180,8 @@ func TestSFTPInitConnStatusClearedAfterConnect(t *testing.T) {
 	env := testutil.StartSFTP(t)
 	m := newTestSFTPModel(t, env)
 	connect(t, m) // connect 内部走 Init → sftpConnMsg → 两条列表消息
-	if m.status == "正在连接…" || m.busy {
-		t.Fatalf("连接完成后应清除连接中状态与 busy，实际 status=%q busy=%v", m.status, m.busy)
+	if m.status == "正在连接…" || m.connState != connReady {
+		t.Fatalf("连接完成后应清除连接中状态并进入就绪态，实际 status=%q state=%v", m.status, m.connState)
 	}
 }
 

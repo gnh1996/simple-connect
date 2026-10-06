@@ -282,7 +282,7 @@ func TestSFTPGotoLocalJump(t *testing.T) {
 	if next.mode != modeGoto {
 		t.Fatalf("g 应进入路径跳转模式，实际 %d", next.mode)
 	}
-	next.gotoIn.SetValue(target)
+	next.promptIn.SetValue(target)
 	next, cmd := next.gotoJump()
 	if cmd == nil {
 		t.Fatal("本地跳转应产生刷新命令")
@@ -312,7 +312,7 @@ func TestSFTPGotoLocalInvalid(t *testing.T) {
 	m.focus = paneLocal
 
 	next, _ := m.openGoto()
-	next.gotoIn.SetValue("/nonexistent/xyz")
+	next.promptIn.SetValue("/nonexistent/xyz")
 	next, cmd := next.gotoJump()
 	if cmd != nil {
 		t.Fatal("无效路径不应产生刷新命令")
@@ -339,7 +339,7 @@ func TestSFTPGotoRemoteJump(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(target, "a.txt"), []byte("x"), 0o644)
 
 	next, _ := m.openGoto()
-	next.gotoIn.SetValue(target)
+	next.promptIn.SetValue(target)
 	next, cmd := next.gotoJump()
 	if cmd == nil {
 		t.Fatal("远程跳转应产生命令")
@@ -374,8 +374,8 @@ func TestSFTPGotoCompleteLocal(t *testing.T) {
 	m.localCwd = root
 
 	m.mode = modeGoto
-	m.gotoIn.SetValue("al")
-	next, cmd := m.gotoComplete()
+	m.promptIn.SetValue("al")
+	next, cmd := m.promptComplete()
 	cm, ok := cmd().(sftpGotoCompleteMsg)
 	if !ok {
 		t.Fatalf("补全命令应返回 sftpGotoCompleteMsg，实际 %T", cm)
@@ -387,31 +387,31 @@ func TestSFTPGotoCompleteLocal(t *testing.T) {
 		t.Fatalf("应匹配 2 个候选，实际 %v", cm.cands)
 	}
 	next, _ = next.Update(cm)
-	if len(next.gotoCandidates) != 2 {
-		t.Fatalf("候选应写入模型，实际 %v", next.gotoCandidates)
+	if len(next.promptCandidates) != 2 {
+		t.Fatalf("候选应写入模型，实际 %v", next.promptCandidates)
 	}
 	want1 := filepath.Join(root, "alpha.txt")
-	if next.gotoIn.Value() != want1 {
-		t.Fatalf("首次补全应填入 %s，实际 %s", want1, next.gotoIn.Value())
+	if next.promptIn.Value() != want1 {
+		t.Fatalf("首次补全应填入 %s，实际 %s", want1, next.promptIn.Value())
 	}
-	if pos := next.gotoIn.Position(); pos != len(want1) {
+	if pos := next.promptIn.Position(); pos != len(want1) {
 		t.Fatalf("首次补全后光标应在末尾 %d，实际 %d", len(want1), pos)
 	}
 
 	// Tab 循环到第二个
-	next, _ = next.gotoComplete()
-	if next.gotoIn.Value() != filepath.Join(root, "alpine.txt") {
-		t.Fatalf("二次 Tab 应填入 alpine.txt，实际 %s", next.gotoIn.Value())
+	next, _ = next.promptComplete()
+	if next.promptIn.Value() != filepath.Join(root, "alpine.txt") {
+		t.Fatalf("二次 Tab 应填入 alpine.txt，实际 %s", next.promptIn.Value())
 	}
-	if pos := next.gotoIn.Position(); pos != len(filepath.Join(root, "alpine.txt")) {
+	if pos := next.promptIn.Position(); pos != len(filepath.Join(root, "alpine.txt")) {
 		t.Fatalf("循环切换后光标应在末尾 %d，实际 %d", len(filepath.Join(root, "alpine.txt")), pos)
 	}
 	// 再 Tab 回绕到第一个
-	next, _ = next.gotoComplete()
-	if next.gotoIn.Value() != want1 {
-		t.Fatalf("三次 Tab 应回绕到 %s，实际 %s", want1, next.gotoIn.Value())
+	next, _ = next.promptComplete()
+	if next.promptIn.Value() != want1 {
+		t.Fatalf("三次 Tab 应回绕到 %s，实际 %s", want1, next.promptIn.Value())
 	}
-	if pos := next.gotoIn.Position(); pos != len(want1) {
+	if pos := next.promptIn.Position(); pos != len(want1) {
 		t.Fatalf("回绕后光标应在末尾 %d，实际 %d", len(want1), pos)
 	}
 }
@@ -430,8 +430,8 @@ func TestSFTPGotoCompleteRemote(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(env.Root, "beta.txt"), []byte("x"), 0o644)
 
 	m.mode = modeGoto
-	m.gotoIn.SetValue("al")
-	next, cmd := m.gotoComplete()
+	m.promptIn.SetValue("al")
+	next, cmd := m.promptComplete()
 	cm, ok := cmd().(sftpGotoCompleteMsg)
 	if !ok {
 		t.Fatalf("补全命令应返回 sftpGotoCompleteMsg，实际 %T", cm)
@@ -441,10 +441,10 @@ func TestSFTPGotoCompleteRemote(t *testing.T) {
 	}
 	next, _ = next.Update(cm)
 	want1 := path.Join(env.Root, "alpha.txt")
-	if next.gotoIn.Value() != want1 {
-		t.Fatalf("远程补全应填入 %s，实际 %s", want1, next.gotoIn.Value())
+	if next.promptIn.Value() != want1 {
+		t.Fatalf("远程补全应填入 %s，实际 %s", want1, next.promptIn.Value())
 	}
-	if pos := next.gotoIn.Position(); pos != len(want1) {
+	if pos := next.promptIn.Position(); pos != len(want1) {
 		t.Fatalf("远程补全后光标应在末尾 %d，实际 %d", len(want1), pos)
 	}
 }
@@ -479,8 +479,8 @@ func TestSFTPMultiSelectBatchUpload(t *testing.T) {
 	// 刷新本地列表并多选 f1.txt 与 dir
 	lm := m.loadLocal()
 	next, _ := m.Update(lm())
-	next.selLocal[indexOfName(next.localEntries, "f1.txt")] = struct{}{}
-	next.selLocal[indexOfName(next.localEntries, "dir")] = struct{}{}
+	next.selLocal["f1.txt"] = struct{}{}
+	next.selLocal["dir"] = struct{}{}
 	if next.selCount() != 2 {
 		t.Fatalf("应选中 2 项，实际 %d", next.selCount())
 	}
@@ -517,8 +517,8 @@ func TestSFTPMultiSelectBatchDownload(t *testing.T) {
 	m.entries = nil
 	rl := m.loadList()
 	next, _ := m.Update(rl())
-	next.selRemote[indexOfName(next.entries, "r1.txt")] = struct{}{}
-	next.selRemote[indexOfName(next.entries, "rdir")] = struct{}{}
+	next.selRemote["r1.txt"] = struct{}{}
+	next.selRemote["rdir"] = struct{}{}
 
 	next, start := next.requestBatch(false)
 	if start == nil {
@@ -546,8 +546,8 @@ func TestSFTPMultiSelectBatchDelete(t *testing.T) {
 	m.entries = nil
 	rl := m.loadList()
 	next, _ := m.Update(rl())
-	next.selRemote[indexOfName(next.entries, "d1.txt")] = struct{}{}
-	next.selRemote[indexOfName(next.entries, "d2.txt")] = struct{}{}
+	next.selRemote["d1.txt"] = struct{}{}
+	next.selRemote["d2.txt"] = struct{}{}
 
 	// x → 批量删除确认；y 确认执行
 	next, _ = next.handleKey(press("x").(tea.KeyPressMsg))
@@ -581,8 +581,8 @@ func TestSFTPMultiSelectBatchDeleteLocal(t *testing.T) {
 
 	lm := m.loadLocal()
 	next, _ := m.Update(lm())
-	next.selLocal[indexOfName(next.localEntries, "l1.txt")] = struct{}{}
-	next.selLocal[indexOfName(next.localEntries, "l2.txt")] = struct{}{}
+	next.selLocal["l1.txt"] = struct{}{}
+	next.selLocal["l2.txt"] = struct{}{}
 
 	next, _ = next.handleKey(press("x").(tea.KeyPressMsg))
 	if !next.confirmBatch {
@@ -613,7 +613,7 @@ func TestSFTPSelectionRender(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(root, "sel.txt"), []byte("x"), 0o644)
 	lm := m.loadLocal()
 	next, _ := m.Update(lm())
-	next.selLocal[indexOfName(next.localEntries, "sel.txt")] = struct{}{}
+	next.selLocal["sel.txt"] = struct{}{}
 
 	next.width, next.height = 100, 30
 	content := next.View().Content
@@ -907,8 +907,8 @@ func TestSFTPOverwriteBatchUpload(t *testing.T) {
 	}
 	lm := m.loadLocal()
 	next, _ := m.Update(lm())
-	next.selLocal[indexOfName(next.localEntries, "a.txt")] = struct{}{}
-	next.selLocal[indexOfName(next.localEntries, "b.txt")] = struct{}{}
+	next.selLocal["a.txt"] = struct{}{}
+	next.selLocal["b.txt"] = struct{}{}
 	next, cmd := next.requestBatch(true)
 	if cmd == nil {
 		t.Fatal("批量上传应触发覆盖检测")
@@ -951,8 +951,8 @@ func TestSFTPOverwriteBatchDownload(t *testing.T) {
 	m.entries = nil
 	rl := m.loadList()
 	next, _ := m.Update(rl())
-	next.selRemote[indexOfName(next.entries, "x.txt")] = struct{}{}
-	next.selRemote[indexOfName(next.entries, "y.txt")] = struct{}{}
+	next.selRemote["x.txt"] = struct{}{}
+	next.selRemote["y.txt"] = struct{}{}
 	next, cmd := next.requestBatch(false)
 	ow := cmd().(sftpOverwriteCheckMsg)
 	if len(ow.conflicts) != 1 {
@@ -1009,7 +1009,7 @@ func TestSFTPOverwriteCancelStaleMsg(t *testing.T) {
 		t.Fatalf("覆盖检测失败: %v", ow.err)
 	}
 	next, _ = next.Update(ow)
-	if next.transfer != nil || next.busy {
+	if next.transfer != nil || next.opBusy() {
 		t.Fatal("取消后迟到的检测结果不得启动传输")
 	}
 	if _, err := os.Stat(filepath.Join(env.Root, "late.txt")); !os.IsNotExist(err) {
@@ -1058,14 +1058,14 @@ func TestSFTPOverwriteStaleMsgKeepsNewCheck(t *testing.T) {
 	if cmdB == nil {
 		t.Fatal("应触发 B 的覆盖检测命令")
 	}
-	if !next.checkingOverwrite || !next.busy {
+	if !next.checkingOverwrite || !next.opBusy() {
 		t.Fatal("B 检测期间应处于 busy/checking 状态")
 	}
 
 	// A 的迟到结果到达：必须整体丢弃，不得触碰 B 的状态
 	owA := cmdA().(sftpOverwriteCheckMsg)
 	next, _ = next.Update(owA)
-	if !next.checkingOverwrite || !next.busy {
+	if !next.checkingOverwrite || !next.opBusy() {
 		t.Fatal("过期消息不得清除新一轮检测的 busy/checking 状态")
 	}
 	if next.confirmOverwrite || next.transfer != nil {

@@ -96,6 +96,17 @@ type pendingTransfer struct {
 	total int64 // 预扫描总量，执行时直接预设，避免再走一遍目录树
 }
 
+// connState 显式连接状态：取代"conn == nil 即未连接"的隐式判断，让"未连接却
+// 操作远程"可以被统一拦截（旧实现散落 nil 判断，漏一处即 panic）。
+type connState int
+
+const (
+	connIdle       connState = iota // 尚未发起连接（本地浏览）
+	connConnecting                  // 正在拨号 / 建立 SFTP 通道
+	connReady                       // 通道可用
+	connFailed                      // 拨号失败或等待指纹确认
+)
+
 // sftpModel 双栏（本地 | 远程）文件浏览/传输模型。
 // 远程栏：cwd/entries/cursor/confirmID（字段名向后兼容测试）；
 // 本地栏：localCwd/localEntries/localCursor/localConfirmID。
@@ -103,6 +114,9 @@ type sftpModel struct {
 	store *store.Store
 	host  *model.Host
 	conn  *sftpc.Conn
+
+	// connState 与 conn 配套：远程操作入口统一经 remoteReady() 判断。
+	connState connState
 
 	// sshClient 会话复用连接（Ctrl+X f 挂起会话唤起场景，非 nil 时 SFTP 复用同一
 	// SSH 连接，免重新认证；列表页进入为 nil，走独立 Dial）。
@@ -131,9 +145,10 @@ type sftpModel struct {
 	localTop       int
 	localConfirmID int // 待删除条目下标，-1 表示无
 
-	// 多选（按列表下标）
-	selLocal  map[int]struct{}
-	selRemote map[int]struct{}
+	// 多选按"条目名"（稳定标识）保存：刷新导致排序/下标变化时仍对应同一文件，
+	// 不会像按下标保存那样错位到别的条目；换目录时清空。
+	selLocal  map[string]struct{}
+	selRemote map[string]struct{}
 	// confirmBatch 批量删除确认中（有选中项按 x 触发）
 	confirmBatch bool
 
@@ -141,27 +156,26 @@ type sftpModel struct {
 
 	remoteCwd string // 会话内跟踪到的远程工作目录（热键唤起定位用，空串=默认）
 
-	mode     sftpMode
-	pathIn   *textinput.Model
+	mode sftpMode
+	// promptIn 是 g（跳转）与 p（路径传输）共用的路径输入框：二者同一时刻只会激活
+	// 一个，由 mode（modeGoto / modePath）区分语义；共用一套补全状态，避免重复实现。
+	promptIn *textinput.Model
 	newDirIn *textinput.Model
-	gotoIn   *textinput.Model
 
-	// 路径传输（p）Tab 补全状态
-	pathCandidates []string // 候选完整路径（当前输入快照下的匹配项）
-	pathLastSet    string   // 最近一次写入输入框的值（用于 Tab 循环切换判断）
-	pathSel        int
-
-	// 路径跳转（g）Tab 补全状态
-	gotoCandidates []string // 候选完整路径（当前输入快照下的匹配项）
-	gotoLastSet    string   // 最近一次写入输入框的值（用于 Tab 循环切换判断）
-	gotoSel        int
+	// 路径输入（g/p 共用）的 Tab 补全状态
+	promptCandidates []string // 候选完整路径（当前输入快照下的匹配项）
+	promptLastSet    string   // 最近一次写入输入框的值（用于 Tab 循环切换判断）
+	promptSel        int
 
 	fromSession bool // 会话中热键唤起：q 返回时请求重连会话
 
 	transfer *sftpc.Transfer
 	status   string
 	err      string
-	busy     bool
+	// loading 仅表示"正在读取目录"（列表加载）。busy 语义被拆分：
+	// 覆盖扫描看 checkingOverwrite，传输看 transfer != nil，连接看 connState。
+	// 这样列表回包不会把"传输中"误判为空闲（旧实现共用 busy 会）。
+	loading bool
 
 	// 传输中退出确认（q / Ctrl+C）：confirmExit 显示确认提示；
 	// exiting 表示已确认退出、正在等待取消完成（此后屏蔽输入，done 后回列表）。
@@ -189,14 +203,13 @@ type sftpModel struct {
 func newSFTPModel(s *store.Store, h *model.Host, remoteCwd string, sshCl *sshc.Client) *sftpModel {
 	pt := textInput("", "路径（Tab 补全）")
 	nw := textInput("", "新目录名")
-	gt := textInput("", "路径（Tab 补全）")
 	m := &sftpModel{
 		store: s, host: h,
 		sshClient: sshCl,
-		pathIn:    &pt, newDirIn: &nw, gotoIn: &gt,
+		promptIn:  &pt, newDirIn: &nw,
 		confirmID: -1, localConfirmID: -1,
-		selLocal:     map[int]struct{}{},
-		selRemote:    map[int]struct{}{},
+		selLocal:     map[string]struct{}{},
+		selRemote:    map[string]struct{}{},
 		focus:        paneRemote,
 		remoteCwd:    remoteCwd,
 		trustHostKey: sshc.TrustHostKey,
@@ -216,12 +229,22 @@ func (m *sftpModel) close() {
 		m.conn.Close()
 		m.conn = nil
 	}
+	m.connState = connIdle
+}
+
+// remoteReady 报告远程 SFTP 通道是否可用。所有远程操作入口统一用它判断，
+// 避免散落的 nil 判断漏掉某一入口而解引用空指针。
+func (m *sftpModel) remoteReady() bool { return m.connState == connReady && m.conn != nil }
+
+// opBusy 报告是否有操作正在进行（列表加载 / 覆盖扫描 / 传输），用于拦截并发的
+// 传输发起；不使用单一布尔，避免某类回包误清其它类的忙碌状态。
+func (m *sftpModel) opBusy() bool {
+	return m.loading || m.checkingOverwrite || m.transfer != nil
 }
 
 func (m *sftpModel) Init() tea.Cmd {
-	// 拨号期间给出明确反馈并置 busy；失败与指纹确认分支负责复位，
-	// 成功后由首条列表消息清除（Init 与 busy 复位必须同一处管理，见 docs/ux-perf-review.md 3.1）。
-	m.busy = true
+	// 拨号期间给出明确反馈并置连接中；失败与指纹确认分支负责复位（见 3.1）。
+	m.connState = connConnecting
 	if m.sshClient != nil {
 		m.status = "正在建立 SFTP 通道…"
 	} else {
@@ -262,7 +285,7 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 		return m, nil
 	case sftpConnMsg:
 		if msg.err != nil {
-			m.busy = false // 拨号失败：复位 busy，否则 t/p/x/r 全被挡住
+			m.connState = connFailed // 拨号失败：进入显式失败态，远程操作被统一拦截
 			var uk *sshc.UnknownHostKeyError
 			if errors.As(msg.err, &uk) {
 				// 首次连接：不静默信任，页面进入确认态展示指纹（对齐 OpenSSH ask）
@@ -279,6 +302,7 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 			return m, nil
 		}
 		m.conn = msg.conn
+		m.connState = connReady
 		m.status = "" // 清除 Init 的"正在连接…"（下方会话目录提示会按需覆盖）
 		if cwd, err := m.conn.Client.Getwd(); err == nil {
 			m.cwd = cwd
@@ -293,11 +317,11 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 			// 服务器环境特殊），落到默认路径并提示，便于定位。
 			m.status = "未获取会话目录（shell 钩子未生效？目录可能不准确，可用 g 跳转）"
 		}
-		m.busy = true
+		m.loading = true
 		return m, tea.Batch(m.loadList(), m.loadLocal())
 
 	case sftpListMsg:
-		m.busy = false
+		m.loading = false
 		if msg.err != nil {
 			m.err = fmt.Sprintf("读取目录失败: %v", msg.err)
 			return m, nil
@@ -338,9 +362,9 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 	case sftpGotoJumpMsg:
 		if msg.err != nil {
 			m.err = msg.err.Error()
-			m.busy = false
+			m.loading = false
 			m.mode = modeBrowse
-			m.clearGotoCandidates()
+			m.clearPromptCandidates()
 			return m, nil
 		}
 		m.cwd = msg.path
@@ -348,21 +372,20 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 		m.cursor = 0
 		m.remoteTop = 0
 		m.clearSel()
-		m.busy = false
+		m.loading = false
 		m.mode = modeBrowse
-		m.clearGotoCandidates()
+		m.clearPromptCandidates()
 		return m, nil
 
 	case sftpOverwriteCheckMsg:
 		if msg.pending == nil || msg.pending.seq != m.overwriteSeq {
 			// 过期结果（用户已取消或发起了新的检测）：丢弃，不执行任何传输，
-			// 也不得触碰当前状态（可能有新一轮检测仍在途，误清 busy/checkingOverwrite
+			// 也不得触碰当前状态（可能有新一轮检测仍在途，误清 checkingOverwrite
 			// 会解除输入屏蔽并丢失"正在检测"提示）
 			return m, nil
 		}
 		m.releaseOverwriteCancel()
 		m.checkingOverwrite = false
-		m.busy = false
 		m.status = ""
 		if msg.err != nil {
 			m.err = fmt.Sprintf("检测覆盖失败: %v", msg.err)
@@ -389,9 +412,9 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 
 // loadList 刷新远程栏
 func (m *sftpModel) loadList() tea.Cmd {
-	if m.conn == nil || m.conn.Client == nil {
+	if !m.remoteReady() {
 		// 未连接（拨号失败后仍可按键）：返回错误列表消息而非解引用 nil；
-		// 走 sftpListMsg 以便同时复位 busy（goUp/r 会先置 busy 再调用本函数）。
+		// 走 sftpListMsg 以便同时复位 loading（goUp/r 会先置 loading 再调用本函数）。
 		p := m.cwd
 		return func() tea.Msg {
 			return sftpListMsg{kind: paneRemote, path: p, err: fmt.Errorf("未连接 SFTP，请按 q 返回列表重试")}
@@ -527,14 +550,14 @@ func (m *sftpModel) enterCurrent() (*sftpModel, tea.Cmd) {
 			m.localCursor = 0
 			m.localEntries = nil
 			m.clearSel()
-			m.busy = true
+			m.loading = true
 			return m, m.loadLocal()
 		}
 		m.cwd = path.Join(m.cwd, e.Name()) // 远程路径保持 POSIX
 		m.cursor = 0
 		m.entries = nil
 		m.clearSel()
-		m.busy = true
+		m.loading = true
 		return m, m.loadList()
 	}
 	// 文件：本地栏 Enter=上传，远程栏 Enter=下载
@@ -558,7 +581,7 @@ func (m *sftpModel) goUp() (*sftpModel, tea.Cmd) {
 		m.localCursor = 0
 		m.localEntries = nil
 		m.clearSel()
-		m.busy = true
+		m.loading = true
 		return m, m.loadLocal()
 	}
 	parent := path.Dir(m.cwd)
@@ -569,7 +592,7 @@ func (m *sftpModel) goUp() (*sftpModel, tea.Cmd) {
 	m.cursor = 0
 	m.entries = nil
 	m.clearSel()
-	m.busy = true
+	m.loading = true
 	return m, m.loadList()
 }
 
@@ -592,7 +615,7 @@ func (m *sftpModel) mkdir(name string) tea.Cmd {
 		}
 	}
 	dir := path.Join(m.cwd, name)
-	if m.conn == nil || m.conn.Client == nil {
+	if !m.remoteReady() {
 		return func() tea.Msg { return sftpMsgText{text: "未连接 SFTP，无法创建远程目录"} }
 	}
 	cl := m.conn.Client
@@ -615,7 +638,7 @@ func (m *sftpModel) uploadEntry(localPath string) tea.Cmd {
 
 // downloadEntry 下载远程条目到本地栏当前目录（目录递归，带覆盖检测）
 func (m *sftpModel) downloadEntry(e fs.FileInfo) (*sftpModel, tea.Cmd) {
-	if m.busy || m.checkingOverwrite {
+	if m.opBusy() {
 		return m, nil
 	}
 	if err := os.MkdirAll(m.localCwd, 0o755); err != nil {
@@ -638,8 +661,8 @@ func (m *sftpModel) collectBatchItems(up bool) []sftpc.BatchItem {
 	}
 	entries := m.currentEntries()
 	items := make([]sftpc.BatchItem, 0, len(sel))
-	for i, e := range entries {
-		if _, ok := sel[i]; !ok {
+	for _, e := range entries {
+		if _, ok := sel[e.Name()]; !ok {
 			continue
 		}
 		if up {
@@ -659,7 +682,7 @@ func (m *sftpModel) collectBatchItems(up bool) []sftpc.BatchItem {
 
 // ---- 多选 ----
 
-func (m *sftpModel) selectedMap() map[int]struct{} {
+func (m *sftpModel) selectedMap() map[string]struct{} {
 	if m.focus == paneLocal {
 		return m.selLocal
 	}
@@ -671,13 +694,6 @@ func (m *sftpModel) currentEntries() []fs.FileInfo {
 		return m.localEntries
 	}
 	return m.entries
-}
-
-func (m *sftpModel) currentCursor() int {
-	if m.focus == paneLocal {
-		return m.localCursor
-	}
-	return m.cursor
 }
 
 func (m *sftpModel) hasSel() bool {
@@ -696,28 +712,32 @@ func (m *sftpModel) selCount() int {
 
 // clearSel 清空双栏选中
 func (m *sftpModel) clearSel() {
-	m.selLocal = map[int]struct{}{}
-	m.selRemote = map[int]struct{}{}
+	m.selLocal = map[string]struct{}{}
+	m.selRemote = map[string]struct{}{}
 	m.confirmBatch = false
 }
 
 func (m *sftpModel) toggleSel() {
+	e := m.currentEntry()
+	if e == nil {
+		return
+	}
 	sel := m.selectedMap()
-	idx := m.currentCursor()
-	if _, ok := sel[idx]; ok {
-		delete(sel, idx)
+	name := e.Name()
+	if _, ok := sel[name]; ok {
+		delete(sel, name)
 	} else {
-		sel[idx] = struct{}{}
+		sel[name] = struct{}{}
 	}
 }
 
-// selectedNames 返回焦点栏选中条目的名字（有序，用于批量删除确认/渲染）
+// selectedEntries 返回焦点栏选中条目（按当前列表顺序，用于批量删除确认/传输）
 func (m *sftpModel) selectedEntries() []fs.FileInfo {
 	sel := m.selectedMap()
 	entries := m.currentEntries()
 	var out []fs.FileInfo
-	for i, e := range entries {
-		if _, ok := sel[i]; ok {
+	for _, e := range entries {
+		if _, ok := sel[e.Name()]; ok {
 			out = append(out, e)
 		}
 	}
@@ -787,7 +807,6 @@ func (m *sftpModel) handleProgress() (*sftpModel, tea.Cmd) {
 		done, _, _, _ := m.transfer.Snapshot()
 		canceled := m.transfer.Canceled()
 		m.transfer = nil
-		m.busy = false
 		m.confirmExit = false // 传输已结束：撤销可能仍显示的退出确认
 		// 已确认退出：取消完成（临时文件已清理）后离开页面，不再提示完成/错误
 		if m.exiting {
@@ -858,7 +877,7 @@ func transferName(up bool) string {
 // ---- 覆盖检测与确认 ----
 
 func (m *sftpModel) checkOverwriteCmd(ctx context.Context, pending *pendingTransfer) tea.Cmd {
-	if m.conn == nil || m.conn.Client == nil {
+	if !m.remoteReady() {
 		return func() tea.Msg {
 			return sftpOverwriteCheckMsg{pending: pending, err: fmt.Errorf("未连接")}
 		}
@@ -903,15 +922,13 @@ func (m *sftpModel) executePendingTransfer(pending *pendingTransfer) tea.Cmd {
 	if pending == nil {
 		return nil
 	}
-	if m.conn == nil || m.conn.Client == nil {
-		m.busy = false
+	if !m.remoteReady() {
 		return func() tea.Msg { return sftpMsgText{text: "未连接 SFTP，无法传输"} }
 	}
 	if len(pending.items) > 0 {
 		t := sftpc.NewTransfer(fmt.Sprintf("%d 项", len(pending.items)), pending.up)
 		t.SetTotal(pending.total) // 预扫描总量：批内不再逐项统计
 		m.transfer = t
-		m.busy = true
 		m.status = ""
 		m.confirmBatch = false
 		m.clearSel()
@@ -925,7 +942,6 @@ func (m *sftpModel) executePendingTransfer(pending *pendingTransfer) tea.Cmd {
 	t := sftpc.NewTransfer(filepath.Base(pending.src), pending.up)
 	t.SetTotal(pending.total)
 	m.transfer = t
-	m.busy = true
 	m.status = ""
 	cl := m.conn.Client
 	if pending.up {
@@ -939,11 +955,10 @@ func (m *sftpModel) executePendingTransfer(pending *pendingTransfer) tea.Cmd {
 }
 
 func (m *sftpModel) requestTransfer(src, dst string, up bool) tea.Cmd {
-	if m.busy || m.checkingOverwrite {
+	if m.opBusy() {
 		return nil
 	}
 	m.checkingOverwrite = true
-	m.busy = true
 	m.status = ""
 	m.err = ""
 	pending := &pendingTransfer{up: up, src: src, dst: dst}
@@ -951,7 +966,7 @@ func (m *sftpModel) requestTransfer(src, dst string, up bool) tea.Cmd {
 }
 
 func (m *sftpModel) requestBatch(up bool) (*sftpModel, tea.Cmd) {
-	if m.busy || m.checkingOverwrite {
+	if m.opBusy() {
 		return m, nil
 	}
 	items := m.collectBatchItems(up)
@@ -959,7 +974,6 @@ func (m *sftpModel) requestBatch(up bool) (*sftpModel, tea.Cmd) {
 		return m, nil
 	}
 	m.checkingOverwrite = true
-	m.busy = true
 	m.status = ""
 	m.err = ""
 	pending := &pendingTransfer{up: up, items: items}
@@ -1093,6 +1107,16 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 		return m, nil
 	}
 
+	// 传输进行中：只允许请求退出（q / Ctrl+C → 退出确认），其余按键一律忽略。
+	// 旧实现传输中仍可导航，而列表回包会把 busy 误清为 false，导致可再发起一次
+	// 传输并覆盖正在进行的 transfer。
+	if m.transfer != nil {
+		if k.Text == "q" {
+			return m.requestExit()
+		}
+		return m, nil
+	}
+
 	// 覆盖确认（上传/下载目标已存在）
 	if m.confirmOverwrite {
 		switch {
@@ -1103,14 +1127,12 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 			m.confirmOverwrite = false
 			m.overwriteConflicts = nil
 			m.pendingOverwrite = nil
-			m.busy = false
 			m.checkingOverwrite = false
 			return m, m.executePendingTransfer(pending)
 		case k.Code == tea.KeyEsc || k.Text == "n" || k.Text == "N" || k.Text == "q":
 			m.confirmOverwrite = false
 			m.overwriteConflicts = nil
 			m.pendingOverwrite = nil
-			m.busy = false
 			m.checkingOverwrite = false
 			m.status = "已取消"
 			return m, nil
@@ -1123,7 +1145,6 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 			m.overwriteSeq++           // 使在途检测结果作废（迟到消息将被丢弃）
 			m.releaseOverwriteCancel() // 中断扫描：不等待整棵目录树走完
 			m.checkingOverwrite = false
-			m.busy = false
 			m.status = "已取消"
 			return m, nil
 		}
@@ -1153,23 +1174,26 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 		return m, nil
 	}
 
-	// 路径传输输入（p）：方向按焦点栏——本地=上传、远程=下载
-	if m.mode == modePath {
+	// 路径输入（p 传输 / g 跳转共用输入框，语义由 mode 区分）
+	if m.mode == modePath || m.mode == modeGoto {
 		switch k.Code {
 		case tea.KeyEsc:
 			m.mode = modeBrowse
-			m.clearPathCandidates()
+			m.clearPromptCandidates()
 			return m, nil
 		case tea.KeyEnter:
+			if m.mode == modeGoto {
+				return m.gotoJump()
+			}
 			return m.pathJump()
 		case tea.KeyTab:
-			return m.pathComplete()
+			return m.promptComplete()
 		}
-		in, cmd := m.pathIn.Update(msg)
-		if in.Value() != m.pathLastSet {
-			m.clearPathCandidates()
+		in, cmd := m.promptIn.Update(msg)
+		if in.Value() != m.promptLastSet {
+			m.clearPromptCandidates()
 		}
-		*m.pathIn = in
+		*m.promptIn = in
 		return m, cmd
 	}
 
@@ -1189,26 +1213,6 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 		}
 		in, cmd := m.newDirIn.Update(msg)
 		*m.newDirIn = in
-		return m, cmd
-	}
-
-	// 路径跳转输入
-	if m.mode == modeGoto {
-		switch k.Code {
-		case tea.KeyEsc:
-			m.mode = modeBrowse
-			m.clearGotoCandidates()
-			return m, nil
-		case tea.KeyEnter:
-			return m.gotoJump()
-		case tea.KeyTab:
-			return m.gotoComplete()
-		}
-		in, cmd := m.gotoIn.Update(msg)
-		if in.Value() != m.gotoLastSet {
-			m.clearGotoCandidates()
-		}
-		*m.gotoIn = in
 		return m, cmd
 	}
 
@@ -1253,7 +1257,7 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 		if k.Text != "" {
 			switch k.Text {
 			case "t":
-				if m.busy {
+				if m.opBusy() {
 					return m, nil
 				}
 				if m.hasSel() {
@@ -1268,24 +1272,24 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 				}
 				return m.downloadEntry(e)
 			case "p":
-				if m.busy {
+				if m.opBusy() {
 					return m, nil
 				}
 				return m.openPath()
 			case "g":
-				if m.busy {
+				if m.opBusy() {
 					return m, nil
 				}
 				return m.openGoto()
 			case "n":
-				if m.busy {
+				if m.opBusy() {
 					return m, nil
 				}
 				m.mode = modeNewDir
 				m.newDirIn.Focus()
 				return m, nil
 			case "x":
-				if m.busy {
+				if m.opBusy() {
 					return m, nil
 				}
 				if m.hasSel() {
@@ -1302,10 +1306,10 @@ func (m *sftpModel) handleKey(msg tea.KeyPressMsg) (*sftpModel, tea.Cmd) {
 					m.confirmID = m.cursor
 				}
 			case "r":
-				if m.busy {
+				if m.loading {
 					return m, nil
 				}
-				m.busy = true
+				m.loading = true
 				if m.focus == paneLocal {
 					return m, m.loadLocal()
 				}
@@ -1366,12 +1370,9 @@ func (m *sftpModel) setCursor(idx int) {
 
 // ---- 路径跳转与 Tab 补全 ----
 
-func (m *sftpModel) clearGotoCandidates() {
-	clearComplete(&m.gotoCandidates, &m.gotoLastSet, &m.gotoSel)
-}
-
-func (m *sftpModel) clearPathCandidates() {
-	clearComplete(&m.pathCandidates, &m.pathLastSet, &m.pathSel)
+// clearPromptCandidates 重置 g/p 共用输入框的补全状态。
+func (m *sftpModel) clearPromptCandidates() {
+	clearComplete(&m.promptCandidates, &m.promptLastSet, &m.promptSel)
 }
 
 // clearComplete 重置一组补全状态（候选 / 最近写入值 / 当前下标）
@@ -1383,14 +1384,14 @@ func clearComplete(cands *[]string, lastSet *string, sel *int) {
 
 func (m *sftpModel) openGoto() (*sftpModel, tea.Cmd) {
 	m.mode = modeGoto
-	m.clearGotoCandidates()
+	m.clearPromptCandidates()
 	if m.focus == paneLocal {
-		m.gotoIn.SetValue(m.localCwd)
+		m.promptIn.SetValue(m.localCwd)
 	} else {
-		m.gotoIn.SetValue(m.cwd)
+		m.promptIn.SetValue(m.cwd)
 	}
-	m.gotoIn.Focus()
-	m.gotoIn.CursorEnd() // SetValue 复用时不会重置光标，显式落到末尾便于追加/修改
+	m.promptIn.Focus()
+	m.promptIn.CursorEnd() // SetValue 复用时不会重置光标，显式落到末尾便于追加/修改
 	return m, nil
 }
 
@@ -1398,14 +1399,14 @@ func (m *sftpModel) openGoto() (*sftpModel, tea.Cmd) {
 // 不预填路径，避免直接 Enter 误传整个当前目录；Tab 补全基准取焦点栏 cwd。
 func (m *sftpModel) openPath() (*sftpModel, tea.Cmd) {
 	m.mode = modePath
-	m.clearPathCandidates()
-	m.pathIn.SetValue("")
+	m.clearPromptCandidates()
+	m.promptIn.SetValue("")
 	if m.focus == paneLocal {
-		m.pathIn.Placeholder = "本地路径，Enter 上传"
+		m.promptIn.Placeholder = "本地路径，Enter 上传"
 	} else {
-		m.pathIn.Placeholder = "远程路径，Enter 下载"
+		m.promptIn.Placeholder = "远程路径，Enter 下载"
 	}
-	m.pathIn.Focus()
+	m.promptIn.Focus()
 	return m, nil
 }
 
@@ -1434,8 +1435,8 @@ func splitPathInput(v string, local bool) (dir, base string) {
 
 // gotoJump 校验并跳转到输入路径（本地同步校验，远程异步 List 校验）
 func (m *sftpModel) gotoJump() (*sftpModel, tea.Cmd) {
-	v := strings.TrimSpace(m.gotoIn.Value())
-	m.clearGotoCandidates()
+	v := strings.TrimSpace(m.promptIn.Value())
+	m.clearPromptCandidates()
 	if v == "" {
 		m.mode = modeBrowse
 		return m, nil
@@ -1453,16 +1454,16 @@ func (m *sftpModel) gotoJump() (*sftpModel, tea.Cmd) {
 		m.localEntries = nil
 		m.localTop = 0
 		m.clearSel()
-		m.busy = true
+		m.loading = true
 		return m, m.loadLocal()
 	}
-	if m.conn == nil || m.conn.Client == nil {
+	if !m.remoteReady() {
 		m.err = "未连接 SFTP，无法跳转远程目录"
 		return m, nil
 	}
 	cl := m.conn.Client
 	p := v
-	m.busy = true
+	m.loading = true
 	return m, tea.Cmd(func() tea.Msg {
 		entries, err := sftpc.List(cl, p)
 		if err != nil {
@@ -1475,8 +1476,8 @@ func (m *sftpModel) gotoJump() (*sftpModel, tea.Cmd) {
 // pathJump 校验并执行路径传输（p）：本地栏上传本地路径，远程栏下载远程路径。
 // 远程路径的存在性由覆盖扫描的 ScanDownload 异步校验。
 func (m *sftpModel) pathJump() (*sftpModel, tea.Cmd) {
-	v := strings.TrimSpace(m.pathIn.Value())
-	m.clearPathCandidates()
+	v := strings.TrimSpace(m.promptIn.Value())
+	m.clearPromptCandidates()
 	if v == "" {
 		m.mode = modeBrowse
 		return m, nil
@@ -1491,7 +1492,7 @@ func (m *sftpModel) pathJump() (*sftpModel, tea.Cmd) {
 		remote := path.Join(m.cwd, filepath.Base(p))
 		return m, m.requestTransfer(p, remote, true)
 	}
-	if m.conn == nil {
+	if !m.remoteReady() {
 		m.err = "未连接"
 		return m, nil
 	}
@@ -1504,13 +1505,9 @@ func (m *sftpModel) pathJump() (*sftpModel, tea.Cmd) {
 	return m, m.requestTransfer(v, local, false)
 }
 
-// gotoComplete / pathComplete Tab 补全入口，共用 completeCycle。
-func (m *sftpModel) gotoComplete() (*sftpModel, tea.Cmd) {
-	return m.completeCycle(m.gotoIn, &m.gotoCandidates, &m.gotoLastSet, &m.gotoSel, modeGoto)
-}
-
-func (m *sftpModel) pathComplete() (*sftpModel, tea.Cmd) {
-	return m.completeCycle(m.pathIn, &m.pathCandidates, &m.pathLastSet, &m.pathSel, modePath)
+// promptComplete g/p 共用输入框的 Tab 补全入口。
+func (m *sftpModel) promptComplete() (*sftpModel, tea.Cmd) {
+	return m.completeCycle(m.promptIn, &m.promptCandidates, &m.promptLastSet, &m.promptSel, m.mode)
 }
 
 // completeCycle Tab 补全通用处理：有新鲜候选时循环切换，否则异步读取目录计算候选。
@@ -1543,7 +1540,7 @@ func (m *sftpModel) completeCandidates(v string, target sftpMode) tea.Cmd {
 	}
 	var cl *sftp.Client
 	if !local {
-		if m.conn == nil || m.conn.Client == nil {
+		if !m.remoteReady() {
 			return func() tea.Msg {
 				return sftpGotoCompleteMsg{target: target, input: v, err: fmt.Errorf("未连接 SFTP")}
 			}
@@ -1582,37 +1579,29 @@ func (m *sftpModel) completeCandidates(v string, target sftpMode) tea.Cmd {
 	})
 }
 
-// handleComplete 应用补全结果：按 target 写入 g/p 对应的补全状态。
+// handleComplete 应用补全结果。g/p 共用一个输入框，需校验结果仍属于当前输入
+// （模式未变、输入未变，且结果 target 与当前模式一致），否则丢弃陈旧结果。
 func (m *sftpModel) handleComplete(msg sftpGotoCompleteMsg) (*sftpModel, tea.Cmd) {
-	in, cands, lastSet, sel := m.completeState(msg.target)
-	if in == nil || msg.input != in.Value() {
-		return m, nil // 输入已变化，丢弃陈旧结果
+	if (m.mode != modePath && m.mode != modeGoto) || msg.target != m.mode || msg.input != m.promptIn.Value() {
+		return m, nil // 已离开输入模式或输入已变化，丢弃陈旧结果
 	}
 	if msg.err != nil {
 		m.err = fmt.Sprintf("补全失败: %v", msg.err)
-		clearComplete(cands, lastSet, sel)
+		m.clearPromptCandidates()
 		return m, nil
 	}
 	if len(msg.cands) == 0 {
-		clearComplete(cands, lastSet, sel)
+		m.clearPromptCandidates()
 		m.status = "无匹配项"
 		return m, nil
 	}
-	*cands = msg.cands
-	*sel = 0
+	m.promptCandidates = msg.cands
+	m.promptSel = 0
 	next := msg.cands[0]
-	in.SetValue(next)
-	in.CursorEnd() // 首次补全后光标落到末尾便于继续输入
-	*lastSet = next
+	m.promptIn.SetValue(next)
+	m.promptIn.CursorEnd() // 首次补全后光标落到末尾便于继续输入
+	m.promptLastSet = next
 	return m, nil
-}
-
-// completeState 返回指定来源（g/p）的输入框与补全状态指针。
-func (m *sftpModel) completeState(target sftpMode) (*textinput.Model, *[]string, *string, *int) {
-	if target == modePath {
-		return m.pathIn, &m.pathCandidates, &m.pathLastSet, &m.pathSel
-	}
-	return m.gotoIn, &m.gotoCandidates, &m.gotoLastSet, &m.gotoSel
 }
 
 func joinGoto(dir, name string, local bool) string {
@@ -1723,17 +1712,17 @@ func (m *sftpModel) dynamicLines() []string {
 		// 浏览模式无输入行
 	case modePath:
 		if m.focus == paneLocal {
-			lines = append(lines, styleCursor.Render("上传 ")+"本地路径(Tab 补全): "+m.pathIn.View())
+			lines = append(lines, styleCursor.Render("上传 ")+"本地路径(Tab 补全): "+m.promptIn.View())
 		} else {
-			lines = append(lines, styleCursor.Render("下载 ")+"远程路径(Tab 补全): "+m.pathIn.View())
+			lines = append(lines, styleCursor.Render("下载 ")+"远程路径(Tab 补全): "+m.promptIn.View())
 		}
-		lines = append(lines, completionLines(m.pathCandidates, m.pathSel)...)
+		lines = append(lines, completionLines(m.promptCandidates, m.promptSel)...)
 		lines = append(lines, styleHint.Render("Tab 补全  Enter 传输  Esc 取消"))
 	case modeNewDir:
 		lines = append(lines, styleCursor.Render("新建目录: ")+m.newDirIn.View())
 	case modeGoto:
-		lines = append(lines, styleCursor.Render("跳转路径: ")+m.gotoIn.View())
-		lines = append(lines, completionLines(m.gotoCandidates, m.gotoSel)...)
+		lines = append(lines, styleCursor.Render("跳转路径: ")+m.promptIn.View())
+		lines = append(lines, completionLines(m.promptCandidates, m.promptSel)...)
 		lines = append(lines, styleHint.Render("Tab 补全  Enter 跳转  Esc 取消"))
 	}
 
@@ -1871,10 +1860,10 @@ func (m *sftpModel) renderEntry(e fs.FileInfo, idx, cursor int, lay paneLayout, 
 	}
 	selMark := " "
 	if kind == paneLocal {
-		if _, ok := m.selLocal[idx]; ok {
+		if _, ok := m.selLocal[e.Name()]; ok {
 			selMark = "●"
 		}
-	} else if _, ok := m.selRemote[idx]; ok {
+	} else if _, ok := m.selRemote[e.Name()]; ok {
 		selMark = "●"
 	}
 	cursorMark := " "

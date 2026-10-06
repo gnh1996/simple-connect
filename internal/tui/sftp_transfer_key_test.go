@@ -117,9 +117,9 @@ func TestSFTPTransferKeyBatch(t *testing.T) {
 		}
 	}
 	next, _ := m.Update(m.loadLocal()())
-	next.selLocal = map[int]struct{}{
-		findEntry(t, next.localEntries, "b1.txt"): {},
-		findEntry(t, next.localEntries, "b2.txt"): {},
+	next.selLocal = map[string]struct{}{
+		"b1.txt": {},
+		"b2.txt": {},
 	}
 	next, cmd := next.handleKey(press("t").(tea.KeyPressMsg))
 	if cmd == nil {
@@ -144,7 +144,7 @@ func TestSFTPTransferKeyNoEntry(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("空列表按 t 不应产生命令")
 	}
-	if next.busy {
+	if next.opBusy() {
 		t.Fatal("空列表按 t 不应置忙")
 	}
 }
@@ -167,10 +167,10 @@ func TestSFTPPathUpload(t *testing.T) {
 	if next.mode != modePath {
 		t.Fatalf("p 应进入 modePath，实际 %d", next.mode)
 	}
-	if next.pathIn.Value() != "" {
-		t.Fatalf("p 不应预填路径，实际 %q", next.pathIn.Value())
+	if next.promptIn.Value() != "" {
+		t.Fatalf("p 不应预填路径，实际 %q", next.promptIn.Value())
 	}
-	next.pathIn.SetValue(src)
+	next.promptIn.SetValue(src)
 	next, cmd := next.pathJump()
 	if next.mode != modeBrowse {
 		t.Fatalf("提交后应回到浏览模式，实际 %d", next.mode)
@@ -202,7 +202,7 @@ func TestSFTPPathDownload(t *testing.T) {
 	}
 
 	next, _ := m.openPath()
-	next.pathIn.SetValue(remoteFile)
+	next.promptIn.SetValue(remoteFile)
 	next, cmd := next.pathJump()
 	next = driveWithOverwriteCheck(t, next, cmd)
 	if b, err := os.ReadFile(filepath.Join(next.localCwd, "p-dl.txt")); err != nil || string(b) != "pdl" {
@@ -210,7 +210,7 @@ func TestSFTPPathDownload(t *testing.T) {
 	}
 
 	next, _ = next.openPath()
-	next.pathIn.SetValue(remoteDir)
+	next.promptIn.SetValue(remoteDir)
 	next, cmd = next.pathJump()
 	next = driveWithOverwriteCheck(t, next, cmd)
 	if b, err := os.ReadFile(filepath.Join(next.localCwd, "p-dldir", "deep.txt")); err != nil || string(b) != "deep" {
@@ -231,7 +231,7 @@ func TestSFTPPathCompleteLocal(t *testing.T) {
 	m.localCwd = root
 
 	next, _ := m.openPath()
-	next.pathIn.SetValue("al")
+	next.promptIn.SetValue("al")
 	// 经 handleKey 的 Tab 分发，验证按键接线
 	next, cmd := next.handleKey(pressKey(tea.KeyTab).(tea.KeyPressMsg))
 	if cmd == nil {
@@ -245,16 +245,16 @@ func TestSFTPPathCompleteLocal(t *testing.T) {
 		t.Fatalf("p 本地补全异常: target=%d err=%v cands=%v", cm.target, cm.err, cm.cands)
 	}
 	next, _ = next.Update(cm)
-	if len(next.pathCandidates) != 2 {
-		t.Fatalf("候选应写入 pathCandidates，实际 %v", next.pathCandidates)
+	if len(next.promptCandidates) != 2 {
+		t.Fatalf("候选应写入 pathCandidates，实际 %v", next.promptCandidates)
 	}
 	want1 := filepath.Join(root, "alpha.txt")
-	if next.pathIn.Value() != want1 {
-		t.Fatalf("首次补全应填入 %s，实际 %s", want1, next.pathIn.Value())
+	if next.promptIn.Value() != want1 {
+		t.Fatalf("首次补全应填入 %s，实际 %s", want1, next.promptIn.Value())
 	}
-	next, _ = next.pathComplete()
-	if next.pathIn.Value() != filepath.Join(root, "alpine.txt") {
-		t.Fatalf("二次 Tab 应填入 alpine.txt，实际 %s", next.pathIn.Value())
+	next, _ = next.promptComplete()
+	if next.promptIn.Value() != filepath.Join(root, "alpine.txt") {
+		t.Fatalf("二次 Tab 应填入 alpine.txt，实际 %s", next.promptIn.Value())
 	}
 }
 
@@ -271,8 +271,8 @@ func TestSFTPPathCompleteRemote(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(env.Root, "alpine.txt"), []byte("x"), 0o644)
 
 	next, _ := m.openPath()
-	next.pathIn.SetValue("al")
-	next, cmd := next.pathComplete()
+	next.promptIn.SetValue("al")
+	next, cmd := next.promptComplete()
 	cm, ok := cmd().(sftpGotoCompleteMsg)
 	if !ok {
 		t.Fatalf("补全命令应返回 sftpGotoCompleteMsg，实际 %T", cmd())
@@ -281,8 +281,8 @@ func TestSFTPPathCompleteRemote(t *testing.T) {
 		t.Fatalf("p 远程补全异常: target=%d err=%v cands=%v", cm.target, cm.err, cm.cands)
 	}
 	next, _ = next.Update(cm)
-	if next.pathIn.Value() != path.Join(env.Root, "alpha.txt") {
-		t.Fatalf("远程补全应填入 alpha.txt，实际 %s", next.pathIn.Value())
+	if next.promptIn.Value() != path.Join(env.Root, "alpha.txt") {
+		t.Fatalf("远程补全应填入 alpha.txt，实际 %s", next.promptIn.Value())
 	}
 }
 

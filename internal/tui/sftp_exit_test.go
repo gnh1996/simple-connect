@@ -19,7 +19,6 @@ func TestSFTPQuitDuringTransferPrompts(t *testing.T) {
 	defer m.close()
 
 	m.transfer = sftpc.NewTransfer("big.bin", false)
-	m.busy = true
 
 	next, cmd := m.handleKey(press("q").(tea.KeyPressMsg))
 	if cmd != nil {
@@ -52,7 +51,6 @@ func TestSFTPQuitDuringTransferConfirmCancels(t *testing.T) {
 
 	tr := sftpc.NewTransfer("big.bin", false)
 	m.transfer = tr
-	m.busy = true
 
 	next, _ := m.handleKey(press("q").(tea.KeyPressMsg))
 	next, cmd := next.handleKey(press("y").(tea.KeyPressMsg))
@@ -80,7 +78,6 @@ func TestSFTPCtrlCTriggersExit(t *testing.T) {
 	defer m.close()
 
 	m.transfer = sftpc.NewTransfer("big.bin", false)
-	m.busy = true
 
 	next, cmd := m.handleKey(tea.KeyPressMsg(tea.Key{Code: 'c', Mod: tea.ModCtrl}))
 	if cmd != nil {
@@ -102,7 +99,6 @@ func TestSFTPProgressExitingLeavesPage(t *testing.T) {
 	tr := sftpc.NewTransfer("x", false)
 	sftpc.Download(m.conn.Client, tr, filepath.Join(env.Root, "no-such-file"), filepath.Join(t.TempDir(), "x"))
 	m.transfer = tr
-	m.busy = true
 	m.exiting = true
 
 	next, cmd := m.handleProgress()
@@ -128,7 +124,6 @@ func TestSFTPProgressCanceledShowsStatus(t *testing.T) {
 	tr.Cancel()
 	sftpc.Download(m.conn.Client, tr, filepath.Join(env.Root, "no-such-file"), filepath.Join(t.TempDir(), "x"))
 	m.transfer = tr
-	m.busy = true
 
 	next, cmd := m.handleProgress()
 	if next.transfer != nil {
