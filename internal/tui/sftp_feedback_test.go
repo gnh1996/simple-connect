@@ -184,3 +184,33 @@ func TestSFTPInitConnStatusClearedAfterConnect(t *testing.T) {
 		t.Fatalf("连接完成后应清除连接中状态与 busy，实际 status=%q busy=%v", m.status, m.busy)
 	}
 }
+
+// TestSFTPKeysWithoutConnDoNotPanic 回归：拨号失败后页面仍可接收按键，任何按键
+// 都不得解引用 nil 连接导致 panic（旧实现 r/Backspace/g/p/n 等会崩溃）。
+func TestSFTPKeysWithoutConnDoNotPanic(t *testing.T) {
+	s := testStore(t)
+	h := &model.Host{Name: "t", Host: "10.0.0.1", User: "root", Auth: model.AuthPassword}
+	m := newSFTPModel(s, h, "", nil)
+	m, _ = m.Update(sftpConnMsg{err: errors.New("dial tcp: connection refused")})
+	if m.conn != nil {
+		t.Fatal("拨号失败后不应有连接")
+	}
+
+	// 覆盖浏览/输入模式下的远程相关按键，确保均不 panic
+	for _, key := range []string{"r", "g", "p", "n", "x", "t", "Backspace"} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("按键 %q 在无连接时 panic: %v", key, r)
+				}
+			}()
+			var msg tea.KeyPressMsg
+			if key == "Backspace" {
+				msg = pressKey(tea.KeyBackspace).(tea.KeyPressMsg)
+			} else {
+				msg = press(key).(tea.KeyPressMsg)
+			}
+			m, _ = m.handleKey(msg)
+		}()
+	}
+}

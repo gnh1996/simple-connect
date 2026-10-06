@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+
+	"simple-connect/internal/model"
 )
 
 // TestFormErrorPersistsUntilNextKey View 只读：保存失败后错误保留，
@@ -123,5 +125,65 @@ func TestFormKeyAuthSave(t *testing.T) {
 	}
 	if hosts[0].KeyPath == "" {
 		t.Fatal("应保存私钥路径")
+	}
+}
+
+// TestFormEditHostWithNewPasswordKeepsFieldChanges 回归：编辑连接并同时修改密码时，
+// 名称/主机等字段修改不得被丢弃。旧实现只调 store.SetPassword（仅写密码与
+// HasPassword），漏掉 store.Update，导致改密码把其它编辑整体覆盖回磁盘旧值。
+func TestFormEditHostWithNewPasswordKeepsFieldChanges(t *testing.T) {
+	s := testStore(t)
+	h := &model.Host{Name: "旧名", Host: "10.0.0.1", Port: 22, User: "root", Auth: model.AuthPassword}
+	if err := s.Add(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPassword(h, "oldpass"); err != nil {
+		t.Fatal(err)
+	}
+
+	root := NewRoot(s)
+	root = upd(root, press("e")) // 编辑选中连接
+	if root.page != pageForm {
+		t.Fatalf("应进入编辑表单, page=%v", root.page)
+	}
+
+	// 清空并改名称
+	for range "旧名" {
+		root = upd(root, pressKey(tea.KeyBackspace))
+	}
+	for _, r := range "新名" {
+		root = upd(root, press(string(r)))
+	}
+	// 修改主机
+	root = upd(root, pressKey(tea.KeyTab))
+	for range "10.0.0.1" {
+		root = upd(root, pressKey(tea.KeyBackspace))
+	}
+	for _, r := range "10.9.9.9" {
+		root = upd(root, press(string(r)))
+	}
+	// 跳过 端口/用户名/认证方式 到达密码字段
+	root = upd(root, pressKey(tea.KeyTab))
+	root = upd(root, pressKey(tea.KeyTab))
+	root = upd(root, pressKey(tea.KeyTab))
+	root = upd(root, pressKey(tea.KeyTab))
+	for _, r := range "newpass" {
+		root = upd(root, press(string(r)))
+	}
+	root = upd(root, pressKey(tea.KeyTab))   // 本地目录（最后一个可见字段）
+	root = upd(root, pressKey(tea.KeyEnter)) // 保存
+
+	if root.page != pageList {
+		t.Fatalf("保存后应回列表, page=%v err=%q", root.page, root.form.err)
+	}
+	got := root.Store.Find(h.ID)
+	if got == nil {
+		t.Fatal("主机丢失")
+	}
+	if got.Name != "新名" || got.Host != "10.9.9.9" {
+		t.Fatalf("编辑字段被丢弃: %+v", got)
+	}
+	if p, ok := root.Store.Password(got); !ok || p != "newpass" {
+		t.Fatalf("密码未更新: ok=%v p=%q", ok, p)
 	}
 }

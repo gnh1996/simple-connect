@@ -281,10 +281,14 @@ func (m *formModel) save() (*formModel, tea.Cmd) {
 	if m.editing != nil {
 		h.ID = m.editing.ID
 		h.HasPassword = m.editing.HasPassword
+		// 先持久化字段变更，再单独保存密码：SetPassword 只更新密码/HasPassword，
+		// 不会带上 name/host 等编辑。若只调 SetPassword，改密码会静默丢弃所有其它字段修改。
+		if err = m.store.Update(h); err != nil {
+			m.err = err.Error()
+			return m, nil
+		}
 		if pass != "" {
 			err = m.store.SetPassword(h, pass)
-		} else {
-			err = m.store.Update(h)
 		}
 	} else {
 		err = m.store.Add(h)

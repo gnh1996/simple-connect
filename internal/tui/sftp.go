@@ -389,6 +389,14 @@ func (m *sftpModel) Update(msg tea.Msg) (*sftpModel, tea.Cmd) {
 
 // loadList 刷新远程栏
 func (m *sftpModel) loadList() tea.Cmd {
+	if m.conn == nil || m.conn.Client == nil {
+		// 未连接（拨号失败后仍可按键）：返回错误列表消息而非解引用 nil；
+		// 走 sftpListMsg 以便同时复位 busy（goUp/r 会先置 busy 再调用本函数）。
+		p := m.cwd
+		return func() tea.Msg {
+			return sftpListMsg{kind: paneRemote, path: p, err: fmt.Errorf("未连接 SFTP，请按 q 返回列表重试")}
+		}
+	}
 	cl, p := m.conn.Client, m.cwd
 	return func() tea.Msg {
 		entries, err := sftpc.List(cl, p)
@@ -584,6 +592,9 @@ func (m *sftpModel) mkdir(name string) tea.Cmd {
 		}
 	}
 	dir := path.Join(m.cwd, name)
+	if m.conn == nil || m.conn.Client == nil {
+		return func() tea.Msg { return sftpMsgText{text: "未连接 SFTP，无法创建远程目录"} }
+	}
 	cl := m.conn.Client
 	p := m.cwd
 	return func() tea.Msg {
@@ -847,13 +858,12 @@ func transferName(up bool) string {
 // ---- 覆盖检测与确认 ----
 
 func (m *sftpModel) checkOverwriteCmd(ctx context.Context, pending *pendingTransfer) tea.Cmd {
-	cl := m.conn.Client
-	// 无连接时直接报错（理论上不会触发）
-	if cl == nil {
+	if m.conn == nil || m.conn.Client == nil {
 		return func() tea.Msg {
 			return sftpOverwriteCheckMsg{pending: pending, err: fmt.Errorf("未连接")}
 		}
 	}
+	cl := m.conn.Client
 	return func() tea.Msg {
 		var res sftpc.ScanResult
 		var err error
@@ -892,6 +902,10 @@ func (m *sftpModel) releaseOverwriteCancel() {
 func (m *sftpModel) executePendingTransfer(pending *pendingTransfer) tea.Cmd {
 	if pending == nil {
 		return nil
+	}
+	if m.conn == nil || m.conn.Client == nil {
+		m.busy = false
+		return func() tea.Msg { return sftpMsgText{text: "未连接 SFTP，无法传输"} }
 	}
 	if len(pending.items) > 0 {
 		t := sftpc.NewTransfer(fmt.Sprintf("%d 项", len(pending.items)), pending.up)
@@ -1442,6 +1456,10 @@ func (m *sftpModel) gotoJump() (*sftpModel, tea.Cmd) {
 		m.busy = true
 		return m, m.loadLocal()
 	}
+	if m.conn == nil || m.conn.Client == nil {
+		m.err = "未连接 SFTP，无法跳转远程目录"
+		return m, nil
+	}
 	cl := m.conn.Client
 	p := v
 	m.busy = true
@@ -1524,7 +1542,12 @@ func (m *sftpModel) completeCandidates(v string, target sftpMode) tea.Cmd {
 		dir = sshc.ExpandPath(dir)
 	}
 	var cl *sftp.Client
-	if !local && m.conn != nil {
+	if !local {
+		if m.conn == nil || m.conn.Client == nil {
+			return func() tea.Msg {
+				return sftpGotoCompleteMsg{target: target, input: v, err: fmt.Errorf("未连接 SFTP")}
+			}
+		}
 		cl = m.conn.Client
 	}
 	return tea.Cmd(func() tea.Msg {
