@@ -547,3 +547,84 @@ func TestSessionResume(t *testing.T) {
 		t.Fatal("恢复后会话未结束")
 	}
 }
+
+// gateReader 模拟 unix pollInput：Read 阻塞直到收到 stop（setStop 的 channel 关闭），
+// 之后继续阻塞在 release 上，用于验证 runOnce 是否等待输入泵退出。
+type gateReader struct {
+	readStarted chan struct{}
+	stopped     chan struct{}
+	release     chan struct{}
+}
+
+func newGateReader() *gateReader {
+	return &gateReader{
+		readStarted: make(chan struct{}, 1),
+		stopped:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+}
+
+func (r *gateReader) setStop(stop chan struct{}) {
+	go func() {
+		<-stop
+		close(r.stopped)
+	}()
+}
+
+func (r *gateReader) Read(p []byte) (int, error) {
+	select {
+	case r.readStarted <- struct{}{}:
+	default:
+	}
+	<-r.stopped // 等 stop（等价 pollInput 被自管道唤醒）
+	<-r.release // 保持未退出，直到测试放行
+	return 0, io.EOF
+}
+
+type nopWriteCloser struct{}
+
+func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (nopWriteCloser) Close() error                { return nil }
+
+// TestRunOnceWaitsForInputPump 回归：透传结束时 runOnce 必须等可唤醒的输入泵
+// 完全退出再返回，否则回 TUI 后残留的 pollInput 会吞掉首个按键
+// （实测约 2/3 概率丢一键，见 docs/ssh-compat.md 第 1 节）。
+func TestRunOnceWaitsForInputPump(t *testing.T) {
+	in := newGateReader()
+	tracker := newOSCTracker(io.Discard)
+	waitDone := make(chan error, 1)
+
+	done := make(chan struct{})
+	go func() {
+		_, _, _ = runOnce(in, tracker, nopWriteCloser{}, waitDone)
+		close(done)
+	}()
+
+	select {
+	case <-in.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("输入泵未开始读取")
+	}
+
+	waitDone <- nil // 模拟远程会话正常结束
+
+	select {
+	case <-in.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("stop 未传递给输入泵")
+	}
+
+	// 输入泵仍未退出：runOnce 必须阻塞等待，不得提前返回
+	select {
+	case <-done:
+		t.Fatal("runOnce 在输入泵退出前返回（残留读取会吞掉回 TUI 的首键）")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(in.release) // 放行输入泵
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("输入泵退出后 runOnce 未返回")
+	}
+}

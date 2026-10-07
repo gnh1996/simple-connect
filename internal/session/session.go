@@ -286,15 +286,28 @@ func setupSession(cl *sshc.Client, out, errOut io.Writer, rows, cols int) (*ssh.
 // detach 时挂起：不关闭会话与输入管道，输出静音，返回 trackedCwd。
 func runOnce(in io.Reader, tracker *oscTracker, inPipe io.WriteCloser, waitDone chan error) (string, bool, error) {
 	stop := make(chan struct{})
+	_, canStop := in.(stoppable)
 	if sp, ok := in.(stoppable); ok {
 		sp.setStop(stop)
 	}
 	detached := make(chan struct{})
-	go pumpInput(inPipe, in, stop, detached)
+	// pumpDone 用于在本次透传结束时等待输入泵**完全退出**再返回：否则 pollInput 可能
+	// 仍阻塞在 poll(2)，返回 TUI 后到达的首个按键会被这个残留读取吞掉（实测约 2/3
+	// 概率丢失）。normal 结束与 detach 两条路径都必须等它退出。
+	pumpDone := make(chan struct{})
+	go func() {
+		pumpInput(inPipe, in, stop, detached)
+		close(pumpDone)
+	}()
 
 	select {
 	case err := <-waitDone:
 		close(stop)
+		// 仅对可唤醒的输入源等待输入泵退出（unix pollInput 会因 stop 立即返回）；
+		// Windows 阻塞读无法被 stop 唤醒，等待会挂住会话退出，故不等待。
+		if canStop {
+			<-pumpDone
+		}
 		// 远程进程正常退出（含 exit 0/非 0、信号）视为正常结束
 		if err == nil {
 			return "", false, nil
@@ -310,6 +323,7 @@ func runOnce(in io.Reader, tracker *oscTracker, inPipe io.WriteCloser, waitDone 
 		return "", false, fmt.Errorf("会话异常结束: %w", err)
 	case <-detached:
 		close(stop)
+		<-pumpDone             // detach 时 pumpInput 已主动返回，必定已完成
 		tracker.setQuiet(true) // 挂起期间丢弃远程输出（防污染 SFTP 页），连接保持
 		return tracker.Cwd(), true, nil
 	}

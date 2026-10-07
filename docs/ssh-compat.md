@@ -20,6 +20,7 @@
 - **恢复**（`Handle.Resume`）：**原样恢复**——重新 `MakeRaw`、重建输入源与 SIGWINCH 监听、发一次当前尺寸 `WindowChange`（尺寸通知无语义副作用）；**不清屏、不发任何字节**（画面保持 detach 时状态，用户按键后自然刷新）。仅**首次进入**会话时本地清屏一次：在 `Handle.start()` 的 `clearScreen` 中、**请求 PTY（`setupSession`）之前**执行——若在 PTY 建立后清屏（旧实现位于 `run()`），会晚于远程登录 banner 到达并把它擦掉，随后是等待 shell 初始化的空白期（实测 zsh + oh-my-zsh 约 0.6s），表现为连接闪烁。
 - **首次进入注入 cwd 追踪钩子**：经 `StdinPipe` 发送钩子命令（bash `PROMPT_COMMAND` 追加 / zsh `precmd_functions` 追加，见第 3 节），让 shell 在每次提示符前（空闲时刻）上报目录，绕开 sshd AcceptEnv 对 PROMPT_COMMAND 的拒绝；随后**单独一行**发送 `stty echo` 恢复回显（不与钩子命令同行，避免非 POSIX shell 解析失败时一并丢弃导致盲打）。
 - **`Wait()` 只调一次**：`StartInteractive` 启动一次 goroutine 收 `Session.Wait()` 结果，挂起/恢复循环经 channel `select` 复用；detach 挂起期间 goroutine 阻塞，会话真正结束时返回。
+- **透传结束必须等输入泵退出（unix）**：`runOnce` 在正常结束与 detach 两条路径上，对 `stoppable` 输入源（unix `pollInput`/`busyInput`）关闭 stop 后须 `<-pumpDone` 等 `pumpInput` 完全返回再交还终端。否则 `pollInput` 仍阻塞在 `poll(2)`，回 TUI 后到达的首个按键会被残留读取吞掉（实测约 2/3 概率丢一键）。Windows 阻塞读非 `stoppable`，不等待（残留读取会在下次按键自行退出，可能吞一键，已知取舍）。
 - **SFTP 复用同一 SSH 连接**（`sftp.NewClient` 开新 channel，不重新认证）；`Conn.Close` 只关 SFTP 通道，不影响会话。
 
 ## 2. TerminalModes 完整集（`internal/ssh/client.go` NewTerminalSession）
