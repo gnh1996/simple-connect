@@ -38,6 +38,8 @@ go build -o simple-ssh .
 ```
 
 > 指定版本、手动安装、`SHA256SUMS` 校验、Defender 误报处理等见 [docs/install.md](docs/install.md)；升级可直接重复执行安装命令（原子替换，失败不影响现有安装，详见该文档“升级 / 重复安装”）。
+>
+> **从 v0.2.x 升级**：v0.3.0 起密码改存 age 加密密码本，旧版 keyring / `secrets.json` 不会迁移；升级后需重新输入服务器密码，并请立即备份首次生成的 `vault.key`（丢失后只能重置密码库）。
 
 ## 使用
 

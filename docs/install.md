@@ -1,6 +1,6 @@
 # 安装指南
 
-> **版本说明**：本指南与 README 描述 `main` 分支行为，自 `v0.2.1` 起的 Release 与之一致；安装更早版本（如 `v0.2.0`）时 SFTP 键位为旧的 `u` 路径上传 / `d` 下载。
+> **版本说明**：本指南与 README 描述 `main` 分支行为，自 `v0.3.0` 起的 Release 与之一致。`v0.3.0` 起密码改存 age 加密密码本，**不迁移旧版 keyring / `secrets.json`，升级后需重新输入服务器密码**，并请妥善备份 `vault.key`。更早版本（如 `v0.2.0`）的 SFTP 键位为旧的 `u` 路径上传 / `d` 下载。
 
 ## Linux / macOS
 
@@ -13,7 +13,7 @@
 curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -s -- --release
 
 # 指定版本（可用版本见 https://github.com/gnh1996/simple-connect/releases）
-curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -s -- --release v0.2.1
+curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -s -- --release v0.3.0
 
 # 自定义安装目录（默认 ~/.local/bin）
 INSTALL_DIR=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/gnh1996/simple-connect/main/scripts/install.sh | sh -s -- --release
@@ -66,7 +66,7 @@ powershell -ExecutionPolicy Bypass -File "$env:TEMP\simple-connect-install.ps1" 
 ```powershell
 # 下载二进制
 New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\simple-connect" | Out-Null
-Invoke-WebRequest -Uri https://github.com/gnh1996/simple-connect/releases/download/v0.2.1/simple-connect-windows-amd64.exe `
+Invoke-WebRequest -Uri https://github.com/gnh1996/simple-connect/releases/download/v0.3.0/simple-connect-windows-amd64.exe `
   -OutFile "$env:LOCALAPPDATA\simple-connect\simple-ssh.exe"
 Unblock-File "$env:LOCALAPPDATA\simple-connect\simple-ssh.exe"
 
@@ -94,7 +94,8 @@ simple-connect 是开源的未签名工具，首次下载运行时 Defender 可�
 - **原子替换**：先写入安装目录下的临时文件，成功后一次 rename 覆盖；下载/构建失败会自动清理临时文件，现有安装保持原样，不会留下损坏的半截二进制。
 - **Linux / macOS**：可替换正在运行的二进制（运行中的进程继续使用旧版本），重启 `simple-ssh` 后生效。
 - **Windows**：运行中的 exe 被系统锁定，安装前请先退出 `simple-ssh`；脚本会检测运行中的进程并提前报错，替换失败时旧版本不受影响。
-- **降级 / 回滚**：重装时指定旧版本 tag 即可，如 `--release v0.2.1` / `-Release v0.2.1`。
+- **降级 / 回滚**：重装时指定旧版本 tag 即可，如 `--release v0.3.0` / `-Release v0.3.0`。
+- **v0.3.0 凭据迁移**：密码存储从系统 keyring 改为 `vault.age` 加密密码本，旧版 keyring / `secrets.json` 不读取、不删除；升级后需重新输入服务器密码。首次启动会生成 `vault.key`，请立即备份（丢失后只能重置密码库并重新输入所有密码）。
 - **符号链接**：若 `simple-ssh` 是符号链接（如 `/usr/local/bin/simple-ssh -> ~/.local/bin/simple-ssh`），脚本替换的是链接指向的真实文件，链接本身保持不变。
 
 ## 校验文件完整性（可选）
@@ -103,7 +104,7 @@ simple-connect 是开源的未签名工具，首次下载运行时 Defender 可�
 
 ```powershell
 Get-FileHash "$env:LOCALAPPDATA\simple-connect\simple-ssh.exe" -Algorithm SHA256
-# 将输出与 https://github.com/gnh1996/simple-connect/releases/download/v0.2.1/SHA256SUMS 比对
+# 将输出与 https://github.com/gnh1996/simple-connect/releases/download/v0.3.0/SHA256SUMS 比对
 ```
 
 ## 源码构建
@@ -121,7 +122,7 @@ go build -o simple-ssh .
 ```bash
 ./scripts/install.sh                 # 源码构建（需 Go）
 ./scripts/install.sh --release       # 下载 GitHub 最新 Release
-./scripts/install.sh --release v0.2.1
+./scripts/install.sh --release v0.3.0
 INSTALL_DIR=/usr/local/bin ./scripts/install.sh   # 自定义安装目录
 ```
 
@@ -130,6 +131,6 @@ INSTALL_DIR=/usr/local/bin ./scripts/install.sh   # 自定义安装目录
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1                    # 源码构建（需 Go）
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release latest    # 下载 GitHub 最新 Release
-powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release v0.2.1    # 指定版本
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -Release v0.3.0    # 指定版本
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -UsePrebuilt       # 使用 dist/ 预编译二进制
 ```
