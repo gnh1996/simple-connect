@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"testing"
 
@@ -32,8 +33,9 @@ func BenchmarkDownloadBufSize(b *testing.B) {
 	for i := range content {
 		content[i] = byte(i * 17)
 	}
-	remote := filepath.Join(env.Root, "down.bin")
-	if err := os.WriteFile(remote, content, 0o644); err != nil {
+	remote := path.Join(env.RemoteRoot, "down.bin")
+	localRemote := filepath.Join(env.Root, "down.bin")
+	if err := os.WriteFile(localRemote, content, 0o644); err != nil {
 		b.Fatal(err)
 	}
 	b.SetBytes(int64(len(content)))
@@ -134,7 +136,7 @@ func BenchmarkUploadBufSize(b *testing.B) {
 	for _, sz := range sizes {
 		sz := sz
 		b.Run(fmt.Sprintf("旧CopyBuffer参照/buf=%dK", sz>>10), func(b *testing.B) {
-			remote := filepath.Join(env.Root, fmt.Sprintf("up-copy-%d.bin", sz))
+			remote := path.Join(env.RemoteRoot, fmt.Sprintf("up-copy-%d.bin", sz))
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
 				f, err := os.Open(local)
@@ -160,7 +162,7 @@ func BenchmarkUploadBufSize(b *testing.B) {
 	}
 
 	// ② 修复后的生产 Upload 路径（走 sftp.File.ReadFrom + countingReader 计数）
-	remote := filepath.Join(env.Root, "up-prod.bin")
+	remote := path.Join(env.RemoteRoot, "up-prod.bin")
 	b.Run("生产Upload修复后", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
@@ -173,7 +175,7 @@ func BenchmarkUploadBufSize(b *testing.B) {
 	})
 
 	// ③ 裸 rf.ReadFrom(f) 参照（无计数包装，上限参考）
-	remote = filepath.Join(env.Root, "up-raw.bin")
+	remote = path.Join(env.RemoteRoot, "up-raw.bin")
 	b.Run("裸ReadFrom参照", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {

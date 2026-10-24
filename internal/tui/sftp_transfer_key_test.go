@@ -30,7 +30,7 @@ func TestSFTPTransferKeyLocalUpload(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.focus = paneLocal
 
 	if err := os.WriteFile(filepath.Join(m.localCwd, "t-up.bin"), []byte("up"), 0o644); err != nil {
@@ -71,7 +71,7 @@ func TestSFTPTransferKeyRemoteDownload(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.focus = paneRemote
 
 	if err := os.WriteFile(filepath.Join(env.Root, "t-dl.txt"), []byte("dl"), 0o644); err != nil {
@@ -108,7 +108,7 @@ func TestSFTPTransferKeyBatch(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.focus = paneLocal
 
 	for _, n := range []string{"b1.txt", "b2.txt"} {
@@ -155,7 +155,7 @@ func TestSFTPPathUpload(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.focus = paneLocal
 
 	src := filepath.Join(m.localCwd, "p-up.txt")
@@ -202,7 +202,7 @@ func TestSFTPPathDownload(t *testing.T) {
 	}
 
 	next, _ := m.openPath()
-	next.promptIn.SetValue(remoteFile)
+	next.promptIn.SetValue(env.Remote(remoteFile))
 	next, cmd := next.pathJump()
 	next = driveWithOverwriteCheck(t, next, cmd)
 	if b, err := os.ReadFile(filepath.Join(next.localCwd, "p-dl.txt")); err != nil || string(b) != "pdl" {
@@ -210,7 +210,7 @@ func TestSFTPPathDownload(t *testing.T) {
 	}
 
 	next, _ = next.openPath()
-	next.promptIn.SetValue(remoteDir)
+	next.promptIn.SetValue(env.Remote(remoteDir))
 	next, cmd = next.pathJump()
 	next = driveWithOverwriteCheck(t, next, cmd)
 	if b, err := os.ReadFile(filepath.Join(next.localCwd, "p-dldir", "deep.txt")); err != nil || string(b) != "deep" {
@@ -265,7 +265,7 @@ func TestSFTPPathCompleteRemote(t *testing.T) {
 	connect(t, m)
 	defer m.close()
 	m.focus = paneRemote
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 
 	_ = os.WriteFile(filepath.Join(env.Root, "alpha.txt"), []byte("x"), 0o644)
 	_ = os.WriteFile(filepath.Join(env.Root, "alpine.txt"), []byte("x"), 0o644)
@@ -281,7 +281,7 @@ func TestSFTPPathCompleteRemote(t *testing.T) {
 		t.Fatalf("p 远程补全异常: target=%d err=%v cands=%v", cm.target, cm.err, cm.cands)
 	}
 	next, _ = next.Update(cm)
-	if next.promptIn.Value() != path.Join(env.Root, "alpha.txt") {
+	if next.promptIn.Value() != path.Join(env.RemoteRoot, "alpha.txt") {
 		t.Fatalf("远程补全应填入 alpha.txt，实际 %s", next.promptIn.Value())
 	}
 }

@@ -82,8 +82,8 @@ func TestSFTPLocalNavigation(t *testing.T) {
 	if c == nil {
 		t.Fatal("进入目录应产生刷新命令")
 	}
-	if next.localCwd != path.Join(root, "subdir") {
-		t.Fatalf("本地应进入 %s，实际 %s", path.Join(root, "subdir"), next.localCwd)
+	if next.localCwd != filepath.Join(root, "subdir") {
+		t.Fatalf("本地应进入 %s，实际 %s", filepath.Join(root, "subdir"), next.localCwd)
 	}
 
 	// 上级
@@ -124,7 +124,7 @@ func TestSFTPLocalEnterUpload(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 
 	// 本地源文件
 	src := filepath.Join(m.localCwd, "pane-src.bin")
@@ -165,7 +165,7 @@ func TestSFTPDualPaneRender(t *testing.T) {
 	connect(t, m)
 	defer m.close()
 
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.localCwd = t.TempDir()
 	_ = os.WriteFile(filepath.Join(m.localCwd, "local.txt"), []byte("x"), 0o644)
 	_ = os.WriteFile(filepath.Join(env.Root, "remote.txt"), []byte("y"), 0o644)
@@ -228,7 +228,7 @@ func TestSFTPRemoteEnterDownload(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 
 	// 预置远程文件
 	if err := os.WriteFile(filepath.Join(env.Root, "dl.bin"), []byte("download-me"), 0o644); err != nil {
@@ -332,11 +332,12 @@ func TestSFTPGotoRemoteJump(t *testing.T) {
 	connect(t, m)
 	defer m.close()
 	m.focus = paneRemote
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 
-	target := filepath.Join(env.Root, "jump-dir")
-	_ = os.MkdirAll(target, 0o755)
-	_ = os.WriteFile(filepath.Join(target, "a.txt"), []byte("x"), 0o644)
+	target := path.Join(env.RemoteRoot, "jump-dir")
+	localTarget := filepath.Join(env.Root, "jump-dir")
+	_ = os.MkdirAll(localTarget, 0o755)
+	_ = os.WriteFile(filepath.Join(localTarget, "a.txt"), []byte("x"), 0o644)
 
 	next, _ := m.openGoto()
 	next.promptIn.SetValue(target)
@@ -423,7 +424,7 @@ func TestSFTPGotoCompleteRemote(t *testing.T) {
 	connect(t, m)
 	defer m.close()
 	m.focus = paneRemote
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 
 	_ = os.WriteFile(filepath.Join(env.Root, "alpha.txt"), []byte("x"), 0o644)
 	_ = os.WriteFile(filepath.Join(env.Root, "alpine.txt"), []byte("x"), 0o644)
@@ -440,7 +441,7 @@ func TestSFTPGotoCompleteRemote(t *testing.T) {
 		t.Fatalf("远程补全异常: err=%v cands=%v", cm.err, cm.cands)
 	}
 	next, _ = next.Update(cm)
-	want1 := path.Join(env.Root, "alpha.txt")
+	want1 := path.Join(env.RemoteRoot, "alpha.txt")
 	if next.promptIn.Value() != want1 {
 		t.Fatalf("远程补全应填入 %s，实际 %s", want1, next.promptIn.Value())
 	}
@@ -469,7 +470,7 @@ func TestSFTPMultiSelectBatchUpload(t *testing.T) {
 	connect(t, m)
 	defer m.close()
 	m.focus = paneLocal
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 
 	// 本地源：f1.txt + dir/n.txt（嵌套目录）
 	_ = os.WriteFile(filepath.Join(m.localCwd, "f1.txt"), []byte("111"), 0o644)
@@ -507,7 +508,7 @@ func TestSFTPMultiSelectBatchDownload(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 
 	_ = os.WriteFile(filepath.Join(env.Root, "r1.txt"), []byte("r1"), 0o644)
 	_ = os.MkdirAll(filepath.Join(env.Root, "rdir", "sub"), 0o755)
@@ -538,7 +539,7 @@ func TestSFTPMultiSelectBatchDelete(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 
 	_ = os.WriteFile(filepath.Join(env.Root, "d1.txt"), []byte("x"), 0o644)
 	_ = os.WriteFile(filepath.Join(env.Root, "d2.txt"), []byte("y"), 0o644)
@@ -640,7 +641,7 @@ func TestSFTPFooterFixedAtBottom(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	m.cwd = root
+	m.cwd = env.RemoteRoot
 	m.entries = nil
 	lm := m.loadList()
 	m, _ = m.Update(lm())
@@ -667,7 +668,7 @@ func TestSFTPFooterFixedWithDynamicRows(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.width, m.height = 100, 15
 
 	m.status = "测试状态"
@@ -698,7 +699,7 @@ func TestSFTPListScrollArrows(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	m.cwd = root
+	m.cwd = env.RemoteRoot
 	m.entries = nil
 	lm := m.loadList()
 	m, _ = m.Update(lm())
@@ -744,7 +745,7 @@ func TestSFTPOverwriteUpload(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.focus = paneLocal
 
 	// 远程已存在同名文件
@@ -799,7 +800,7 @@ func TestSFTPOverwriteUploadCancel(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.focus = paneLocal
 
 	if err := os.WriteFile(filepath.Join(env.Root, "keep.txt"), []byte("keep"), 0o644); err != nil {
@@ -846,7 +847,7 @@ func TestSFTPOverwriteDownload(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 
 	// 远程文件
 	if err := os.WriteFile(filepath.Join(env.Root, "down.txt"), []byte("remote"), 0o644); err != nil {
@@ -891,7 +892,7 @@ func TestSFTPOverwriteBatchUpload(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.focus = paneLocal
 
 	// 远程已存在 a.txt
@@ -937,7 +938,7 @@ func TestSFTPOverwriteBatchDownload(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 
 	if err := os.WriteFile(filepath.Join(env.Root, "x.txt"), []byte("rx"), 0o644); err != nil {
 		t.Fatal(err)
@@ -976,7 +977,7 @@ func TestSFTPOverwriteCancelStaleMsg(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.focus = paneLocal
 
 	src := filepath.Join(m.localCwd, "late.txt")
@@ -1025,7 +1026,7 @@ func TestSFTPOverwriteStaleMsgKeepsNewCheck(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.focus = paneLocal
 
 	// 本地两个文件
@@ -1097,7 +1098,7 @@ func TestSFTPOverwriteNoPrompt(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.focus = paneLocal
 
 	src := filepath.Join(m.localCwd, "fresh.txt")

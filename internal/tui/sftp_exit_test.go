@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -97,7 +98,7 @@ func TestSFTPProgressExitingLeavesPage(t *testing.T) {
 
 	// 用一个必然失败的传输构造 finished 状态（不依赖真实传输耗时）
 	tr := sftpc.NewTransfer("x", false)
-	sftpc.Download(m.conn.Client, tr, filepath.Join(env.Root, "no-such-file"), filepath.Join(t.TempDir(), "x"))
+	sftpc.Download(m.conn.Client, tr, path.Join(env.RemoteRoot, "no-such-file"), filepath.Join(t.TempDir(), "x"))
 	m.transfer = tr
 	m.exiting = true
 
@@ -122,7 +123,7 @@ func TestSFTPProgressCanceledShowsStatus(t *testing.T) {
 
 	tr := sftpc.NewTransfer("x", false)
 	tr.Cancel()
-	sftpc.Download(m.conn.Client, tr, filepath.Join(env.Root, "no-such-file"), filepath.Join(t.TempDir(), "x"))
+	sftpc.Download(m.conn.Client, tr, path.Join(env.RemoteRoot, "no-such-file"), filepath.Join(t.TempDir(), "x"))
 	m.transfer = tr
 
 	next, cmd := m.handleProgress()

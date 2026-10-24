@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"testing"
 
@@ -46,7 +47,7 @@ func TestListSortOrder(t *testing.T) {
 	conn := dialTest(t, env)
 	defer conn.Close()
 
-	entries, err := List(conn.Client, env.Root)
+	entries, err := List(conn.Client, env.RemoteRoot)
 	if err != nil {
 		t.Fatalf("列目录失败: %v", err)
 	}
@@ -70,7 +71,8 @@ func TestTransferUploadDownload(t *testing.T) {
 	conn := dialTest(t, env)
 	defer conn.Close()
 
-	remoteFile := filepath.Join(env.Root, "src.dat")
+	remoteFile := path.Join(env.RemoteRoot, "src.dat")
+	localRemote := filepath.Join(env.Root, "src.dat")
 
 	// 本地源文件
 	local := filepath.Join(t.TempDir(), "src.dat")
@@ -89,7 +91,7 @@ func TestTransferUploadDownload(t *testing.T) {
 	if !finished || err != nil {
 		t.Fatalf("上传异常: finished=%v err=%v", finished, err)
 	}
-	if b, e := os.ReadFile(remoteFile); e != nil || string(b) != string(content) {
+	if b, e := os.ReadFile(localRemote); e != nil || string(b) != string(content) {
 		t.Fatalf("远程文件校验失败: %v", e)
 	}
 
@@ -109,7 +111,7 @@ func TestTransferUploadDownload(t *testing.T) {
 	if err := Remove(conn.Client, remoteFile, false); err != nil {
 		t.Fatalf("删除失败: %v", err)
 	}
-	if _, e := os.Stat(remoteFile); !os.IsNotExist(e) {
+	if _, e := os.Stat(localRemote); !os.IsNotExist(e) {
 		t.Fatal("远程文件应已删除")
 	}
 }
@@ -131,7 +133,8 @@ func TestLargeFileConcurrentUpload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	remote := filepath.Join(env.Root, "big.bin")
+	remote := path.Join(env.RemoteRoot, "big.bin")
+	localRemote := filepath.Join(env.Root, "big.bin")
 	tup := NewTransfer("big.bin", true)
 	Upload(conn.Client, tup, local, remote)
 	done, total, finished, err := tup.Snapshot()
@@ -142,7 +145,7 @@ func TestLargeFileConcurrentUpload(t *testing.T) {
 		t.Fatalf("上传进度 total=%d done=%d，期望 %d", total, done, len(content))
 	}
 
-	b, err := os.ReadFile(remote)
+	b, err := os.ReadFile(localRemote)
 	if err != nil {
 		t.Fatalf("读取远程文件失败: %v", err)
 	}
@@ -186,8 +189,9 @@ func TestTransferCancelCleansUp(t *testing.T) {
 	defer conn.Close()
 
 	content := bytes.Repeat([]byte{0x5}, 8192)
-	remoteSrc := filepath.Join(env.Root, "cancel-src.bin")
-	if err := os.WriteFile(remoteSrc, content, 0o644); err != nil {
+	remoteSrc := path.Join(env.RemoteRoot, "cancel-src.bin")
+	localSrc := filepath.Join(env.Root, "cancel-src.bin")
+	if err := os.WriteFile(localSrc, content, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -214,7 +218,7 @@ func TestTransferCancelCleansUp(t *testing.T) {
 	if err := os.WriteFile(local, content, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	remoteDst := filepath.Join(env.Root, "cancel-up.bin")
+	remoteDst := path.Join(env.RemoteRoot, "cancel-up.bin")
 	tu := NewTransfer("cancel-up.bin", true)
 	tu.Cancel()
 	Upload(conn.Client, tu, local, remoteDst)
@@ -243,7 +247,7 @@ func TestTransferAtomicNoPartLeftover(t *testing.T) {
 	if err := os.WriteFile(local, content, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	remote := filepath.Join(env.Root, "atomic.bin")
+	remote := path.Join(env.RemoteRoot, "atomic.bin")
 	tup := NewTransfer("atomic.bin", true)
 	Upload(conn.Client, tup, local, remote)
 	if _, _, finished, err := tup.Snapshot(); !finished || err != nil {
@@ -272,7 +276,7 @@ func TestTransferFailure(t *testing.T) {
 
 	// 上传不存在的本地文件应报错
 	tup := NewTransfer("nope", true)
-	Upload(conn.Client, tup, filepath.Join(t.TempDir(), "不存在"), filepath.Join(env.Root, "nope"))
+	Upload(conn.Client, tup, filepath.Join(t.TempDir(), "不存在"), path.Join(env.RemoteRoot, "nope"))
 	_, _, finished, err := tup.Snapshot()
 	if !finished || err == nil {
 		t.Fatalf("上传应失败: finished=%v err=%v", finished, err)
@@ -294,7 +298,7 @@ func TestRecursiveUploadDownload(t *testing.T) {
 	wantTotal := int64(3 + 3000 + 3)
 
 	// 递归上传目录
-	remoteDir := filepath.Join(env.Root, "proj")
+	remoteDir := path.Join(env.RemoteRoot, "proj")
 	tup := NewTransfer("proj", true)
 	UploadPath(conn.Client, tup, local, remoteDir)
 	_, _, finished, err := tup.Snapshot()
@@ -307,11 +311,11 @@ func TestRecursiveUploadDownload(t *testing.T) {
 	}
 
 	// 校验远程结构
-	checkRemoteFile(t, conn.Client, filepath.Join(remoteDir, "top.txt"), "top")
-	checkRemoteFile(t, conn.Client, filepath.Join(remoteDir, "sub", "a.txt"), "aaa")
-	checkRemoteFile(t, conn.Client, filepath.Join(remoteDir, "sub", "b.bin"), string(bytes.Repeat([]byte{0x1}, 3000)))
+	checkRemoteFile(t, conn.Client, path.Join(remoteDir, "top.txt"), "top")
+	checkRemoteFile(t, conn.Client, path.Join(remoteDir, "sub", "a.txt"), "aaa")
+	checkRemoteFile(t, conn.Client, path.Join(remoteDir, "sub", "b.bin"), string(bytes.Repeat([]byte{0x1}, 3000)))
 	// 空目录保留
-	if st, err := conn.Client.Stat(filepath.Join(remoteDir, "sub", "empty")); err != nil || !st.IsDir() {
+	if st, err := conn.Client.Stat(path.Join(remoteDir, "sub", "empty")); err != nil || !st.IsDir() {
 		t.Fatalf("远程空目录应保留: %v", err)
 	}
 
@@ -340,10 +344,10 @@ func TestBatchTransfer(t *testing.T) {
 	_ = os.MkdirAll(filepath.Join(local, "dir2"), 0o755)
 	_ = os.WriteFile(filepath.Join(local, "dir2", "nested.txt"), bytes.Repeat([]byte{0x2}, 1000), 0o644)
 
-	remoteBase := filepath.Join(env.Root, "batch")
+	remoteBase := path.Join(env.RemoteRoot, "batch")
 	items := []BatchItem{
-		{Src: filepath.Join(local, "f1.txt"), Dst: filepath.Join(remoteBase, "f1.txt")},
-		{Src: filepath.Join(local, "dir2"), Dst: filepath.Join(remoteBase, "dir2")},
+		{Src: filepath.Join(local, "f1.txt"), Dst: path.Join(remoteBase, "f1.txt")},
+		{Src: filepath.Join(local, "dir2"), Dst: path.Join(remoteBase, "dir2")},
 	}
 	tb := NewTransfer("2 项", true)
 	BatchTransfer(conn.Client, tb, true, items)
@@ -351,14 +355,14 @@ func TestBatchTransfer(t *testing.T) {
 	if !finished || err != nil {
 		t.Fatalf("批量上传异常: finished=%v err=%v", finished, err)
 	}
-	checkRemoteFile(t, conn.Client, filepath.Join(remoteBase, "f1.txt"), "111")
-	checkRemoteFile(t, conn.Client, filepath.Join(remoteBase, "dir2", "nested.txt"), string(bytes.Repeat([]byte{0x2}, 1000)))
+	checkRemoteFile(t, conn.Client, path.Join(remoteBase, "f1.txt"), "111")
+	checkRemoteFile(t, conn.Client, path.Join(remoteBase, "dir2", "nested.txt"), string(bytes.Repeat([]byte{0x2}, 1000)))
 
 	// 批量下载
 	dst := t.TempDir()
 	items = []BatchItem{
-		{Src: filepath.Join(remoteBase, "f1.txt"), Dst: filepath.Join(dst, "f1.txt")},
-		{Src: filepath.Join(remoteBase, "dir2"), Dst: filepath.Join(dst, "dir2")},
+		{Src: path.Join(remoteBase, "f1.txt"), Dst: filepath.Join(dst, "f1.txt")},
+		{Src: path.Join(remoteBase, "dir2"), Dst: filepath.Join(dst, "dir2")},
 	}
 	td := NewTransfer("2 项", false)
 	BatchTransfer(conn.Client, td, false, items)
@@ -376,8 +380,8 @@ func TestBatchTransferFailureAborts(t *testing.T) {
 	defer conn.Close()
 
 	items := []BatchItem{
-		{Src: filepath.Join(t.TempDir(), "missing"), Dst: filepath.Join(env.Root, "m1")},
-		{Src: filepath.Join(t.TempDir(), "also-missing"), Dst: filepath.Join(env.Root, "m2")},
+		{Src: filepath.Join(t.TempDir(), "missing"), Dst: path.Join(env.RemoteRoot, "m1")},
+		{Src: filepath.Join(t.TempDir(), "also-missing"), Dst: path.Join(env.RemoteRoot, "m2")},
 	}
 	tb := NewTransfer("2 项", true)
 	BatchTransfer(conn.Client, tb, true, items)
@@ -445,7 +449,8 @@ func TestScanUploadSingleFile(t *testing.T) {
 	if err := os.WriteFile(local, []byte("abc"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	remote := filepath.Join(env.Root, "remote.txt")
+	remote := path.Join(env.RemoteRoot, "remote.txt")
+	localRemote := filepath.Join(env.Root, "remote.txt")
 	// 无冲突：总量应为源文件大小
 	res := scanUploadTest(t, conn, local, remote)
 	if len(res.Conflicts) != 0 {
@@ -455,7 +460,7 @@ func TestScanUploadSingleFile(t *testing.T) {
 		t.Fatalf("扫描总量应为 3，实际 %d", res.Total)
 	}
 	// 创建远程文件后应检测到冲突
-	if err := os.WriteFile(remote, []byte("old"), 0o644); err != nil {
+	if err := os.WriteFile(localRemote, []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if res := scanUploadTest(t, conn, local, remote); len(res.Conflicts) != 1 {
@@ -471,7 +476,7 @@ func TestScanUploadDirectory(t *testing.T) {
 	_ = os.MkdirAll(filepath.Join(local, "sub"), 0o755)
 	_ = os.WriteFile(filepath.Join(local, "a.txt"), []byte("a"), 0o644)
 	_ = os.WriteFile(filepath.Join(local, "sub", "b.txt"), []byte("bb"), 0o644)
-	remote := filepath.Join(env.Root, "proj")
+	remote := path.Join(env.RemoteRoot, "proj")
 	// 远程空目录，无冲突；总量为目录内普通文件大小之和
 	_ = os.MkdirAll(filepath.Join(env.Root, "proj"), 0o755)
 	res := scanUploadTest(t, conn, local, remote)
@@ -504,8 +509,9 @@ func TestScanDownloadSingleFile(t *testing.T) {
 	env := testutil.StartSFTP(t)
 	conn := dialTest(t, env)
 	defer conn.Close()
-	remote := filepath.Join(env.Root, "r.txt")
-	if err := os.WriteFile(remote, []byte("xy"), 0o644); err != nil {
+	remote := path.Join(env.RemoteRoot, "r.txt")
+	localRemote := filepath.Join(env.Root, "r.txt")
+	if err := os.WriteFile(localRemote, []byte("xy"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	local := filepath.Join(t.TempDir(), "l.txt")
@@ -532,14 +538,15 @@ func TestBatchScan(t *testing.T) {
 	local := t.TempDir()
 	_ = os.WriteFile(filepath.Join(local, "f1.txt"), []byte("a"), 0o644)
 	_ = os.WriteFile(filepath.Join(local, "f2.txt"), []byte("bb"), 0o644)
-	remoteBase := filepath.Join(env.Root, "batch")
-	_ = os.MkdirAll(remoteBase, 0o755)
-	if err := os.WriteFile(filepath.Join(remoteBase, "f1.txt"), []byte("old"), 0o644); err != nil {
+	remoteBase := path.Join(env.RemoteRoot, "batch")
+	localBase := filepath.Join(env.Root, "batch")
+	_ = os.MkdirAll(localBase, 0o755)
+	if err := os.WriteFile(filepath.Join(localBase, "f1.txt"), []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	items := []BatchItem{
-		{Src: filepath.Join(local, "f1.txt"), Dst: filepath.Join(remoteBase, "f1.txt")},
-		{Src: filepath.Join(local, "f2.txt"), Dst: filepath.Join(remoteBase, "f2.txt")},
+		{Src: filepath.Join(local, "f1.txt"), Dst: path.Join(remoteBase, "f1.txt")},
+		{Src: filepath.Join(local, "f2.txt"), Dst: path.Join(remoteBase, "f2.txt")},
 	}
 	res := batchScanTest(t, conn, true, items)
 	if len(res.Conflicts) != 1 {
@@ -557,12 +564,13 @@ func TestScanCancelledContext(t *testing.T) {
 	conn := dialTest(t, env)
 	defer conn.Close()
 
-	remoteDir := filepath.Join(env.Root, "big")
-	if err := os.MkdirAll(remoteDir, 0o755); err != nil {
+	remoteDir := path.Join(env.RemoteRoot, "big")
+	localRemoteDir := filepath.Join(env.Root, "big")
+	if err := os.MkdirAll(localRemoteDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"f1", "f2", "f3"} {
-		if err := os.WriteFile(filepath.Join(remoteDir, name), []byte("x"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(localRemoteDir, name), []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -576,7 +584,7 @@ func TestScanCancelledContext(t *testing.T) {
 	if _, err := ScanDownload(ctx, conn.Client, remoteDir, filepath.Join(t.TempDir(), "dst")); err == nil {
 		t.Fatal("已取消上下文应中断远程 Walk")
 	}
-	if _, err := ScanUpload(ctx, conn.Client, localDir, filepath.Join(env.Root, "up-dst")); err == nil {
+	if _, err := ScanUpload(ctx, conn.Client, localDir, path.Join(env.RemoteRoot, "up-dst")); err == nil {
 		t.Fatal("已取消上下文应中断本地 Walk")
 	}
 }
@@ -592,8 +600,9 @@ func TestSFTPOverwriteTypeConflict(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(localDir, "inner.txt"), 0o755); err == nil {
 		_ = os.WriteFile(filepath.Join(localDir, "inner.txt"), []byte("x"), 0o644)
 	}
-	remoteFile := filepath.Join(env.Root, "thing")
-	if err := os.WriteFile(remoteFile, []byte("old"), 0o644); err != nil {
+	remoteFile := path.Join(env.RemoteRoot, "thing")
+	localRemoteFile := filepath.Join(env.Root, "thing")
+	if err := os.WriteFile(localRemoteFile, []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	res := scanUploadTest(t, conn, localDir, remoteFile)
@@ -602,11 +611,12 @@ func TestSFTPOverwriteTypeConflict(t *testing.T) {
 	}
 
 	// 下载：远程目录 vs 本地同名普通文件
-	remoteDir := filepath.Join(env.Root, "rdir")
-	if err := os.MkdirAll(remoteDir, 0o755); err != nil {
+	remoteDir := path.Join(env.RemoteRoot, "rdir")
+	localRemoteDir := filepath.Join(env.Root, "rdir")
+	if err := os.MkdirAll(localRemoteDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(remoteDir, "f.txt"), []byte("rf"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(localRemoteDir, "f.txt"), []byte("rf"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	localFile := filepath.Join(t.TempDir(), "rdir")

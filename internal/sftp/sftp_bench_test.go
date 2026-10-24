@@ -3,6 +3,7 @@ package sftp
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"testing"
 
@@ -34,6 +35,7 @@ func BenchmarkList(b *testing.B) {
 
 	const n = 1000
 	dir := filepath.Join(env.Root, "big")
+	remoteDir := path.Join(env.RemoteRoot, "big")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		b.Fatal(err)
 	}
@@ -46,7 +48,7 @@ func BenchmarkList(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		entries, err := List(conn.Client, dir)
+		entries, err := List(conn.Client, remoteDir)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -108,7 +110,7 @@ func BenchmarkUpload(b *testing.B) {
 	if err := os.WriteFile(local, content, 0o644); err != nil {
 		b.Fatal(err)
 	}
-	remote := filepath.Join(env.Root, "up.bin")
+	remote := path.Join(env.RemoteRoot, "up.bin")
 
 	b.SetBytes(int64(len(content)))
 	b.ReportAllocs()
@@ -131,8 +133,9 @@ func BenchmarkDownload(b *testing.B) {
 	for i := range content {
 		content[i] = byte(i * 31)
 	}
-	remote := filepath.Join(env.Root, "dl.bin")
-	if err := os.WriteFile(remote, content, 0o644); err != nil {
+	remote := path.Join(env.RemoteRoot, "dl.bin")
+	localRemote := filepath.Join(env.Root, "dl.bin")
+	if err := os.WriteFile(localRemote, content, 0o644); err != nil {
 		b.Fatal(err)
 	}
 	local := filepath.Join(b.TempDir(), "dl.bin")
@@ -168,7 +171,7 @@ func BenchmarkUploadPath(b *testing.B) {
 			}
 		}
 	}
-	remote := filepath.Join(env.Root, "proj")
+	remote := path.Join(env.RemoteRoot, "proj")
 
 	b.ReportAllocs()
 	b.ResetTimer()

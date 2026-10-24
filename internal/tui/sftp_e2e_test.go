@@ -108,7 +108,7 @@ func TestSFTPConnectAndList(t *testing.T) {
 	_ = os.MkdirAll(filepath.Join(env.Root, "sub"), 0o755)
 
 	// 刷新目录
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.entries = nil
 	lm := m.loadList()
 	m, _ = m.Update(lm())
@@ -128,7 +128,7 @@ func TestSFTPUploadDownloadDelete(t *testing.T) {
 	env := testutil.StartSFTP(t)
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 
 	// 本地源文件
 	src := filepath.Join(m.localCwd, "src.bin")
@@ -154,7 +154,7 @@ func TestSFTPUploadDownloadDelete(t *testing.T) {
 
 	// 下载（经覆盖检测）
 	dst := filepath.Join(m.localCwd, "dst.bin")
-	dl := m.requestTransfer(path.Join(env.Root, "src.bin"), dst, false)
+	dl := m.requestTransfer(path.Join(env.RemoteRoot, "src.bin"), dst, false)
 	m = driveWithOverwriteCheck(t, m, dl)
 	if m.err != "" {
 		t.Fatalf("下载失败: %s", m.err)
@@ -182,7 +182,7 @@ func TestSFTPMkdirAndNavigate(t *testing.T) {
 	env := testutil.StartSFTP(t)
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 
 	// 新建目录
 	mk := m.mkdir("data")
@@ -205,13 +205,13 @@ func TestSFTPMkdirAndNavigate(t *testing.T) {
 	}
 	m.cursor = indexOfDir(m.entries, "data")
 	m, _ = m.enterCurrent()
-	if m.cwd != path.Join(env.Root, "data") {
-		t.Fatalf("应进入 %s，实际 %s", path.Join(env.Root, "data"), m.cwd)
+	if m.cwd != path.Join(env.RemoteRoot, "data") {
+		t.Fatalf("应进入 %s，实际 %s", path.Join(env.RemoteRoot, "data"), m.cwd)
 	}
 	// 返回上级
 	m, _ = m.goUp()
-	if m.cwd != env.Root {
-		t.Fatalf("应返回 %s，实际 %s", env.Root, m.cwd)
+	if m.cwd != env.RemoteRoot {
+		t.Fatalf("应返回 %s，实际 %s", env.RemoteRoot, m.cwd)
 	}
 	m.close()
 }

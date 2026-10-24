@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -42,15 +43,18 @@ func TestOpenWritesLogFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat 日志: %v", err)
 	}
-	if perm := fi.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("日志文件权限应为 0600，实际 %o", perm)
-	}
 	di, err := os.Stat(dir)
 	if err != nil {
 		t.Fatalf("stat 目录: %v", err)
 	}
-	if perm := di.Mode().Perm(); perm != 0o700 {
-		t.Fatalf("日志目录权限应为 0700，实际 %o", perm)
+	// Windows 无 Unix 权限位（Go 的 FileMode.Perm 由只读属性推导），跳过权限断言。
+	if runtime.GOOS != "windows" {
+		if perm := fi.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("日志文件权限应为 0600，实际 %o", perm)
+		}
+		if perm := di.Mode().Perm(); perm != 0o700 {
+			t.Fatalf("日志目录权限应为 0700，实际 %o", perm)
+		}
 	}
 }
 

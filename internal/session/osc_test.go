@@ -449,6 +449,16 @@ func TestSessionCwdHookInjected(t *testing.T) {
 	}
 }
 
+// runShellScript 通过 stdin 向 shell 传入脚本（`shell -s`），而不是 `-c <参数>`。
+// Windows 下 PATH 中的 bash 常是 WSL 的启动器，它会对 `-c` 参数里的 `$VAR` 做
+// 二次处理（实测 `FOO=abc; echo "$FOO"` 输出空），导致脚本语义被破坏；
+// 走 stdin 可绕开该问题，同时保持 Unix 下的覆盖。
+func runShellScript(shell, script string) ([]byte, error) {
+	cmd := exec.Command(shell, "-s")
+	cmd.Stdin = strings.NewReader(script)
+	return cmd.CombinedOutput()
+}
+
 // TestCwdHookCommandNounsetSafe 回归：cwd 钩子命令必须能在 `set -u`（nounset）
 // 且 PROMPT_COMMAND/TMUX 未设置时正常安装并调用——所有变量引用用 `${VAR:-}` / `:+`
 // 展开，否则用户 dotfiles 里的 `set -u` 会让钩子安装失败、cwd 跟踪静默失效。
@@ -460,7 +470,7 @@ func TestCwdHookCommandNounsetSafe(t *testing.T) {
 	// 在 nounset + 干净环境下安装钩子并调用一次，最后打印 PROMPT_COMMAND。
 	script := "set -u; unset PROMPT_COMMAND TMUX; " + cwdHookCommand +
 		`; _sc_cwd; printf 'PROMPT_COMMAND=%s' "$PROMPT_COMMAND"`
-	out, err := exec.Command(bash, "-c", script).CombinedOutput()
+	out, err := runShellScript(bash, script)
 	if err != nil {
 		t.Fatalf("set -u 下钩子安装/调用失败: %v，输出: %q", err, out)
 	}
@@ -482,7 +492,7 @@ func TestCwdHookCommandZsh(t *testing.T) {
 	// 数组未设置 + nounset：钩子仍可安装并调用。
 	script := "set -u; unset PROMPT_COMMAND TMUX; unset precmd_functions; " + cwdHookCommand +
 		`; _sc_cwd; printf 'PF=%s' "${precmd_functions[*]}"`
-	out, err := exec.Command(zsh, "-c", script).CombinedOutput()
+	out, err := runShellScript(zsh, script)
 	if err != nil {
 		t.Fatalf("set -u 下 zsh 钩子安装/调用失败: %v，输出: %q", err, out)
 	}
@@ -496,7 +506,7 @@ func TestCwdHookCommandZsh(t *testing.T) {
 	// 追加不覆盖：已有 precmd_functions 必须保留且钩子追加在后。
 	script = "set -u; unset PROMPT_COMMAND TMUX; precmd_functions=(mystyle); " + cwdHookCommand +
 		`; printf 'PF=%s' "${precmd_functions[*]}"`
-	out, err = exec.Command(zsh, "-c", script).CombinedOutput()
+	out, err = runShellScript(zsh, script)
 	if err != nil {
 		t.Fatalf("zsh 追加已有 precmd_functions 失败: %v，输出: %q", err, out)
 	}

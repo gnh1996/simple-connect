@@ -80,7 +80,7 @@ internal/
 - TUI 模型测试用直接 `Update` 驱动（已禁用光标闪烁，无需真实程序）。
 - SFTP 测试统一使用 `internal/testutil.StartSFTP`（内存 SSH/SFTP 服务器），远程文件系统限定在 `t.TempDir()`，主机指纹通过 `sshc.WithHostKeyCallback(InsecureIgnoreHostKey())` 注入，禁止触碰真实 `~/.ssh/known_hosts`。
 - 交互会话测试使用 `internal/testutil.StartShell`（内存 SSH 服务器，仅 keyboard-interactive 认证 + shell 回显），用 `io.Pipe` 注入 in/out 驱动 `runSession`；热键 detach 用 `TestSessionDetach` 覆盖（Ctrl+X f 返回 `ErrDetach`、序列不转发远程、跨 Read 边界、`\x18x` 原样转发）。
-- 注意：测试服务器 `WithServerWorkingDirectory` 只对相对路径生效，测试中远程路径一律基于 `env.Root` 拼绝对路径。
+- 注意：测试服务器 `WithServerWorkingDirectory` 只对相对路径生效。测试中**远程路径一律用 `env.RemoteRoot` / `env.Remote(localPath)`**（Windows 下为 `/C:/...` 的 POSIX 形式），**本地文件预置/校验用 `env.Root` + `filepath`**；把 Windows 绝对路径 `C:\...` 直接当远程路径会被服务器当成相对路径再拼一次工作目录（`C:\root\C:\root`）。
 - 注意：`sshc.Connect` 会读取真实 `~/.ssh/config`，**测试一律用 `ConnectRaw`/`sftpc.Dial`** 避免污染；config 合并逻辑用注入的 `configGetter` 单测覆盖。
 - 新增功能必须补测试；修改传输/导航逻辑必须跑通 e2e 测试，并可用 `go test -race` 校验并发安全。
 - 密码本测试用 `store.LoadWithOptions(Options{Dir: ...})` 隔离目录，**不读写任何系统 keyring**。覆盖：age 密文/权限、密钥缺失不自动生成、密钥不匹配不改写、自定义 `--key-file`/`config.json`、重置删除与重建、并发 `SetPassword`。

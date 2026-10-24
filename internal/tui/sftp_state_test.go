@@ -53,7 +53,7 @@ func TestSFTPTransferNotRestartableByListMsg(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.focus = paneLocal
 	_ = os.WriteFile(filepath.Join(m.localCwd, "u.txt"), []byte("u"), 0o644)
 	m, _ = m.Update(m.loadLocal()())
@@ -75,7 +75,7 @@ func TestSFTPTransferBlocksNavigation(t *testing.T) {
 	m := newTestSFTPModel(t, env)
 	connect(t, m)
 	defer m.close()
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.focus = paneRemote
 
 	m.transfer = sftpc.NewTransfer("big.bin", false)

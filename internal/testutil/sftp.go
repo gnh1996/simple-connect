@@ -6,15 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
+	"runtime"
 
 	pkgsftp "github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 )
 
-// SFTPEnv 测试环境：地址与远程根目录
+// SFTPEnv 测试环境：地址、本地根目录与远程根路径。
+// Root 是本地文件系统路径（预置/校验文件用）；RemoteRoot 是 SFTP 客户端可见的
+// POSIX 远程路径（Windows 下为 /C:/...，Linux 下与 Root 相同）。
 type SFTPEnv struct {
-	Addr string
-	Root string
+	Addr       string
+	Root       string
+	RemoteRoot string
 }
 
 // TB 测试/基准共用最小接口：*testing.T 与 *testing.B 均满足，
@@ -64,7 +69,29 @@ func StartSFTP(tb TB) SFTPEnv {
 			go serveConn(conn, cfg, root)
 		}
 	}()
-	return SFTPEnv{Addr: ln.Addr().String(), Root: root}
+	return SFTPEnv{Addr: ln.Addr().String(), Root: root, RemoteRoot: remoteRoot(root)}
+}
+
+// remoteRoot 返回测试服务器根目录对应的 POSIX 远程路径。
+// pkg/sftp 的服务器要求远程路径使用 POSIX 形式；Windows 下把 C:\x 表示为
+// /C:/x 才能被正确映射回本地路径（直接传 C:\x 会被当成相对路径再拼工作目录）。
+func remoteRoot(root string) string {
+	if runtime.GOOS == "windows" {
+		return "/" + filepath.ToSlash(root)
+	}
+	return root
+}
+
+// Remote 把本地绝对路径转换为该测试服务器可见的远程 POSIX 路径。
+// 仅用于 SFTP 客户端调用；本地文件操作仍应使用 Root 下的 filepath 路径。
+func (e SFTPEnv) Remote(localPath string) string {
+	if runtime.GOOS != "windows" {
+		return localPath
+	}
+	if !filepath.IsAbs(localPath) {
+		return filepath.ToSlash(localPath)
+	}
+	return "/" + filepath.ToSlash(localPath)
 }
 
 func serveConn(conn net.Conn, cfg *ssh.ServerConfig, root string) {

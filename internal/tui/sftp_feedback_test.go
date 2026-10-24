@@ -81,7 +81,7 @@ func TestRenderProgressClamp(t *testing.T) {
 
 // TestSFTPLocalNavigationUsesFilepath 本地栏导航使用 filepath 语义（2.4）。
 func TestSFTPLocalNavigationUsesFilepath(t *testing.T) {
-	base := filepath.Join("/tmp", "sc-local", "a", "b")
+	base := filepath.Join(t.TempDir(), "a", "b")
 	m := &sftpModel{localCwd: base, selLocal: map[string]struct{}{}, selRemote: map[string]struct{}{}}
 	next, cmd := m.goUp()
 	if cmd == nil {
@@ -91,16 +91,21 @@ func TestSFTPLocalNavigationUsesFilepath(t *testing.T) {
 		t.Fatalf("goUp 应使用 filepath.Dir，期望 %q 实际 %q", want, next.localCwd)
 	}
 
-	// 根目录再向上应原地不动
-	root := &sftpModel{localCwd: "/", selLocal: map[string]struct{}{}, selRemote: map[string]struct{}{}}
+	// 文件系统根目录再向上应原地不动（Windows 为 C:\，Unix 为 /）
+	rootPath := string(filepath.Separator)
+	if vol := filepath.VolumeName(t.TempDir()); vol != "" {
+		rootPath = vol + string(filepath.Separator)
+	}
+	root := &sftpModel{localCwd: rootPath, selLocal: map[string]struct{}{}, selRemote: map[string]struct{}{}}
 	nextRoot, cmd := root.goUp()
-	if cmd != nil || nextRoot.localCwd != "/" {
+	if cmd != nil || nextRoot.localCwd != rootPath {
 		t.Fatalf("根目录向上应原地不动，实际 %q cmd=%v", nextRoot.localCwd, cmd != nil)
 	}
 
 	// 进入子目录应使用 filepath.Join（本地路径不带 POSIX 混用）
+	parent := t.TempDir()
 	m3 := &sftpModel{
-		localCwd:       "/tmp/sc-local",
+		localCwd:       parent,
 		localEntries:   []fs.FileInfo{benchFileInfo{name: "sub", dir: true}},
 		selLocal:       map[string]struct{}{},
 		selRemote:      map[string]struct{}{},
@@ -110,7 +115,7 @@ func TestSFTPLocalNavigationUsesFilepath(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("进入目录应加载本地列表")
 	}
-	if want := filepath.Join("/tmp/sc-local", "sub"); next3.localCwd != want {
+	if want := filepath.Join(parent, "sub"); next3.localCwd != want {
 		t.Fatalf("enterCurrent 应使用 filepath.Join，期望 %q 实际 %q", want, next3.localCwd)
 	}
 }
@@ -147,7 +152,7 @@ func TestSFTPTransferDoneKeepsCursor(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	m.cwd = env.Root
+	m.cwd = env.RemoteRoot
 	m.entries = nil
 	m, _ = m.Update(m.loadList()())
 	if len(m.entries) != 5 {
