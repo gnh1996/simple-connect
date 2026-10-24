@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/charmbracelet/x/term"
 	"golang.org/x/crypto/ssh"
@@ -303,10 +304,14 @@ func runOnce(in io.Reader, tracker *oscTracker, inPipe io.WriteCloser, waitDone 
 	select {
 	case err := <-waitDone:
 		close(stop)
-		// 仅对可唤醒的输入源等待输入泵退出（unix pollInput 会因 stop 立即返回）；
-		// Windows 阻塞读无法被 stop 唤醒，等待会挂住会话退出，故不等待。
+		// 仅对可唤醒的输入源等待输入泵退出（unix pollInput / Windows cancelableStdin
+		// 会因 stop 立即返回）。超时兜底：取消失败时宁可留下残留读取，也不能挂死会话退出。
 		if canStop {
-			<-pumpDone
+			select {
+			case <-pumpDone:
+			case <-time.After(pumpExitTimeout):
+				applog.Errorf("等待输入泵退出超时，残留读取可能吞掉下一个按键")
+			}
 		}
 		// 远程进程正常退出（含 exit 0/非 0、信号）视为正常结束
 		if err == nil {
@@ -545,10 +550,15 @@ func (h *Handle) Cwd() string {
 	return h.tracker.Cwd()
 }
 
-// stoppable 支持在 detach 时主动停止的输入源（unix 非阻塞轮询 stdin 实现）
+// stoppable 支持在 detach/会话结束时主动停止的输入源
+// （unix pollInput / busyInput，Windows cancelableStdin）
 type stoppable interface {
 	setStop(chan struct{})
 }
+
+// pumpExitTimeout 等待输入泵退出的上限：正常路径（poll 唤醒 / CancelIoEx）为微秒级，
+// 仅防御取消失败导致返回 TUI 前挂死。
+const pumpExitTimeout = time.Second
 
 // pumpInput 读取本地输入，经热键检测后转发远程会话。
 // 检测到 Ctrl+X f 时关闭 detached 并返回（**挂起**：不关闭输入管道与会话）；
@@ -564,6 +574,13 @@ func pumpInput(w io.WriteCloser, in io.Reader, stop chan struct{}, detached chan
 		}
 		n, err := in.Read(buf)
 		if err != nil {
+			// stop 已关闭说明是主动停止（Windows CancelIoEx 取消读取同样以错误返回），
+			// 此时不得关闭远程输入管道——否则会把"挂起/会话已结束"误当成本地输入 EOF。
+			select {
+			case <-stop:
+				return
+			default:
+			}
 			_ = w.Close() // 输入流结束 → 远程收到 EOF
 			return
 		}

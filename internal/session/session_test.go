@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -626,5 +627,57 @@ func TestRunOnceWaitsForInputPump(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("输入泵退出后 runOnce 未返回")
+	}
+}
+
+// closeTracker 记录输入管道是否被关闭（关闭代表向远程发送了 EOF）。
+type closeTracker struct {
+	closed atomic.Bool
+}
+
+func (c *closeTracker) Write(p []byte) (int, error) { return len(p), nil }
+func (c *closeTracker) Close() error {
+	c.closed.Store(true)
+	return nil
+}
+
+// TestPumpInputStopDoesNotCloseRemoteInput 回归：主动停止（会话结束/detach）时读取
+// 返回 EOF/取消错误，不得关闭远程输入管道——否则挂起的会话会被误发 EOF 而终止。
+func TestPumpInputStopDoesNotCloseRemoteInput(t *testing.T) {
+	in := newGateReader()
+	stop := make(chan struct{})
+	in.setStop(stop)
+	w := &closeTracker{}
+	detached := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		pumpInput(w, in, stop, detached)
+		close(done)
+	}()
+
+	select {
+	case <-in.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("输入泵未开始读取")
+	}
+	close(stop)
+	close(in.release) // 放行读取（返回 io.EOF）
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("输入泵未退出")
+	}
+	if w.closed.Load() {
+		t.Fatal("主动停止时关闭了远程输入管道（会向远程发 EOF）")
+	}
+}
+
+// TestPumpInputEOFClosesRemoteInput 对照：真实输入流结束（无 stop）仍须向远程发 EOF。
+func TestPumpInputEOFClosesRemoteInput(t *testing.T) {
+	w := &closeTracker{}
+	pumpInput(w, strings.NewReader(""), make(chan struct{}), make(chan struct{}))
+	if !w.closed.Load() {
+		t.Fatal("输入流真实结束时应关闭远程输入管道")
 	}
 }
