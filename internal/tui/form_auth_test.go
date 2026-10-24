@@ -183,7 +183,7 @@ func TestFormEditHostWithNewPasswordKeepsFieldChanges(t *testing.T) {
 	if got.Name != "新名" || got.Host != "10.9.9.9" {
 		t.Fatalf("编辑字段被丢弃: %+v", got)
 	}
-	if p, ok := root.Store.Password(got); !ok || p != "newpass" {
-		t.Fatalf("密码未更新: ok=%v p=%q", ok, p)
+	if p, ok, err := root.Store.Password(got); err != nil || !ok || p != "newpass" {
+		t.Fatalf("密码未更新: err=%v ok=%v p=%q", err, ok, p)
 	}
 }

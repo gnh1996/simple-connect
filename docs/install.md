@@ -89,7 +89,7 @@ simple-connect 是开源的未签名工具，首次下载运行时 Defender 可�
 
 ## 升级 / 重复安装
 
-安装脚本可重复执行，升级无需先卸载：新版本覆盖同一安装路径（Linux/macOS 为 `~/.local/bin/simple-ssh`，Windows 为 `%LOCALAPPDATA%\simple-connect\simple-ssh.exe`）。连接配置（`~/.config/simple-connect/hosts.json`）与 keyring 中的密码独立于二进制文件，升级不会丢失。
+安装脚本可重复执行，升级无需先卸载：新版本覆盖同一安装路径（Linux/macOS 为 `~/.local/bin/simple-ssh`，Windows 为 `%LOCALAPPDATA%\simple-connect\simple-ssh.exe`）。连接配置（`~/.config/simple-connect/hosts.json`）、加密密码本（`vault.age`）与密钥文件（`vault.key`）独立于二进制文件，升级不会丢失。若把密钥移到 U 盘并用 `--key-file` 指定，请确保升级后启动参数不变。
 
 - **原子替换**：先写入安装目录下的临时文件，成功后一次 rename 覆盖；下载/构建失败会自动清理临时文件，现有安装保持原样，不会留下损坏的半截二进制。
 - **Linux / macOS**：可替换正在运行的二进制（运行中的进程继续使用旧版本），重启 `simple-ssh` 后生效。

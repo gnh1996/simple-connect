@@ -28,6 +28,11 @@ const (
 	fieldKeyIdx      = 6
 )
 
+const (
+	passwordSavedPlaceholder = "已保存（留空保持，Ctrl+D 清除）"
+	passwordClearPlaceholder = "将清除已保存密码（输入新密码取消）"
+)
+
 // choiceField 单选字段
 type choiceField struct {
 	options []string
@@ -42,6 +47,10 @@ type formModel struct {
 	editing  *model.Host // nil 表示新增
 	password string
 	err      string
+
+	// clearPassword 标记“编辑时按 Ctrl+D 清除已保存密码”。用户随后输入新密码
+	// 或退格会取消该标记（见 Update）。
+	clearPassword bool
 }
 
 func newFormModel(s *store.Store, editing *model.Host) *formModel {
@@ -71,7 +80,7 @@ func newFormModel(s *store.Store, editing *model.Host) *formModel {
 			authField.index = 0
 		}
 		if editing.HasPassword {
-			passInput.Placeholder = "已保存（留空保持不变）"
+			passInput.Placeholder = passwordSavedPlaceholder
 		}
 	}
 
@@ -163,6 +172,13 @@ func (m *formModel) Update(msg tea.Msg) (*formModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
 		k := msg.Key()
+		if m.cursor == fieldPasswordIdx && m.editing != nil && m.editing.HasPassword &&
+			k.Mod.Contains(tea.ModCtrl) && k.Code == 'd' {
+			m.clearPassword = true
+			f.input.SetValue("")
+			f.input.Placeholder = passwordClearPlaceholder
+			return m, nil
+		}
 		switch k.Code {
 		case tea.KeyEsc:
 			return m, tea.Cmd(func() tea.Msg { return backToListMsg{} })
@@ -196,8 +212,24 @@ func (m *formModel) Update(msg tea.Msg) (*formModel, tea.Cmd) {
 
 	// 转发给当前聚焦的输入框
 	if f.input != nil {
+		// Ctrl+D 的“清除”标记应被任何实际改变密码框内容的输入取消：
+		// 不能只识别 KeyPressMsg，否则粘贴（tea.PasteMsg）和输入法提交会漏掉，
+		// 保存时把粘贴的新密码误当成“清除”。比较输入前后的值可覆盖所有插入路径。
+		clearPending := m.cursor == fieldPasswordIdx && m.clearPassword
+		before := f.input.Value()
 		in, cmd := f.input.Update(msg)
 		*f.input = in
+		if clearPending {
+			// 空框上退格不改变内容，但沿用旧交互：退格也取消清除标记。
+			backspace := false
+			if kp, ok := msg.(tea.KeyPressMsg); ok {
+				backspace = kp.Key().Code == tea.KeyBackspace
+			}
+			if f.input.Value() != before || backspace {
+				m.clearPassword = false
+				f.input.Placeholder = passwordSavedPlaceholder
+			}
+		}
 		return m, cmd
 	}
 	return m, nil
@@ -287,7 +319,14 @@ func (m *formModel) save() (*formModel, tea.Cmd) {
 			m.err = err.Error()
 			return m, nil
 		}
-		if pass != "" {
+		switch {
+		case h.Auth == model.AuthKey && h.HasPassword:
+			// 切到私钥认证后旧密码不再参与认证，顺手清除，避免留下不可见的旧凭据。
+			// 用 Update 后的 h.HasPassword（磁盘真实值），兼容多实例下编辑快照过期。
+			err = m.store.SetPassword(h, "")
+		case m.clearPassword:
+			err = m.store.SetPassword(h, "")
+		case pass != "":
 			err = m.store.SetPassword(h, pass)
 		}
 	} else {

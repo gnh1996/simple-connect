@@ -44,10 +44,8 @@ func upd(m *Root, msg tea.Msg) *Root {
 
 func testStore(t *testing.T) *store.Store {
 	t.Helper()
-	dir := t.TempDir()
-	_ = os.Setenv("XDG_CONFIG_HOME", dir)
-	t.Cleanup(func() { _ = os.Unsetenv("XDG_CONFIG_HOME") })
-	s, err := store.Load()
+	dir := filepath.Join(t.TempDir(), "simple-connect")
+	s, err := store.LoadWithOptions(store.Options{Dir: dir})
 	if err != nil {
 		t.Fatalf("store 加载失败: %v", err)
 	}

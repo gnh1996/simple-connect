@@ -250,8 +250,8 @@ func TestListScrollKeepsCursorVisible(t *testing.T) {
 	if m.cursor < start || m.cursor >= end {
 		t.Fatalf("光标应落在可视区 [%d,%d)，实际 %d", start, end, m.cursor)
 	}
-	if end-start != 10 {
-		t.Fatalf("可视条目应为 10 行（20-10），实际 %d", end-start)
+	if want := 10 - len(m.vaultLines()); end-start != want {
+		t.Fatalf("可视条目应为 %d 行（20-10-密码库路径行），实际 %d", want, end-start)
 	}
 	if !strings.Contains(m.View().Content, "host-30") {
 		t.Fatal("当前光标行应在渲染结果中")

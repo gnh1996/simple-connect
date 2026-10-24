@@ -387,6 +387,8 @@ func (m *listModel) handleNav(msg tea.KeyPressMsg) (*listModel, tea.Cmd) {
 					sel := m.filtered[m.cursor]
 					return m, tea.Cmd(func() tea.Msg { return navFormMsg{host: sel} })
 				}
+			case "p":
+				return m, tea.Cmd(func() tea.Msg { return navVaultMsg{} })
 			case "d":
 				if n > 0 {
 					m.confirmID = m.filtered[m.cursor].ID
@@ -415,13 +417,13 @@ func (m *listModel) handleNav(msg tea.KeyPressMsg) (*listModel, tea.Cmd) {
 // ---- 滚动与渲染 ----
 
 // bodyHeight 列表可视条目行数；0 表示尺寸未知（显示全部）。
-// 行数构成：外层 Padding 上下 2 + 标题 2 + 表头/分隔线 2 + 动态行 D +
-// footer 前空行 1 + 带边框 footer 3 = 10 + D，其余留给条目。
+// 行数构成：外层 Padding 上下 2 + 标题 2 + 密码库路径行 + 表头/分隔线 2 +
+// 动态行 D + footer 前空行 1 + 带边框 footer 3 = 10 + D + 状态行，其余留给条目。
 func (m *listModel) bodyHeight() int {
 	if m.height <= 0 {
 		return 0
 	}
-	body := m.height - 10 - len(m.dynamicLines())
+	body := m.height - 10 - len(m.dynamicLines()) - len(m.vaultLines())
 	if body < 1 {
 		body = 1
 	}
@@ -499,6 +501,11 @@ func (m *listModel) dynamicLines() []string {
 	return lines
 }
 
+// vaultLines 密码库/密钥路径状态行（完整路径在“密码库”页查看）。
+func (m *listModel) vaultLines() []string {
+	return vaultStatusLines(m.store.VaultInfo(), m.width)
+}
+
 // listLayout 列表列宽：终端过窄时先压缩目标列，再压缩名称列。
 type listLayout struct {
 	nameW   int
@@ -538,15 +545,15 @@ func (m *listModel) View() tea.View {
 	lay := m.layout()
 
 	title := styleTitle.Render("simple-connect") + styleDim.Render(" "+version.String())
-	keyring := ""
-	if !m.store.UsingKeyring() {
-		keyring = styleDim.Render(" [密码明文存储]")
-	}
 	b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top,
 		title,
-		styleDim.Render(fmt.Sprintf("   共 %d 个连接", len(m.hosts)))+keyring,
+		styleDim.Render(fmt.Sprintf("   共 %d 个连接", len(m.hosts))),
 	))
-	b.WriteString("\n\n")
+	b.WriteString("\n")
+	for _, l := range m.vaultLines() {
+		b.WriteString(l + "\n")
+	}
+	b.WriteString("\n")
 
 	if len(m.filtered) == 0 {
 		if len(m.hosts) == 0 {
@@ -613,8 +620,7 @@ func (m *listModel) renderRow(h *model.Host, idx int, lay listLayout) string {
 
 func renderListFooter() string {
 	keys := styleDim.Render(
-		"↑/↓ 移动  Enter 连接  f SFTP  a 新增  e 编辑  d 删除  s 刷新  / 过滤  q 退出",
+		"↑/↓ 移动  Enter 连接  f SFTP  a 新增  e 编辑  d 删除  p 密码库  s 刷新  / 过滤  q 退出",
 	)
-	hint := styleHint.Render("  免密: ssh-add")
-	return styleFooter.Render(lipgloss.JoinHorizontal(lipgloss.Top, keys, hint))
+	return styleFooter.Render(keys)
 }

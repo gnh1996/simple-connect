@@ -239,7 +239,8 @@ func (c *Client) NewTerminalSession(term string, rows, cols int) (*ssh.Session, 
 	return s, nil
 }
 
-// authMethods 根据认证方式生成认证方法（私钥 + 密码 + keyboard-interactive + agent）。
+// authMethods 根据认证方式生成认证方法：私钥认证 = 私钥 + agent；
+// 密码认证 = password + keyboard-interactive + agent。
 // 返回的 cleanup 在 SSH 握手完成后调用，用于关闭可能建立的 ssh-agent 连接
 // （agent 连接需在认证期间保持打开，握手结束即不再使用；无 agent 时为 no-op）。
 func authMethods(h *model.Host, password string) ([]ssh.AuthMethod, func()) {
@@ -251,9 +252,7 @@ func authMethods(h *model.Host, password string) ([]ssh.AuthMethod, func()) {
 		}
 	}
 	if password != "" {
-		methods = append(methods, ssh.Password(password))
-		// 兼容部分服务器使用 keyboard-interactive 认证
-		methods = append(methods, ssh.KeyboardInteractive(passwordAnswer(password)))
+		methods = append(methods, passwordAuthMethods(h, password)...)
 	}
 	// 代理认证兜底
 	if cb, closeAgent, err := agentSigner(); err == nil {
@@ -261,6 +260,19 @@ func authMethods(h *model.Host, password string) ([]ssh.AuthMethod, func()) {
 		cleanup = closeAgent
 	}
 	return methods, cleanup
+}
+
+// passwordAuthMethods 仅在密码认证方式下生成密码相关方法：
+// 私钥认证的主机不应因历史遗留密码而回落到密码认证。
+func passwordAuthMethods(h *model.Host, password string) []ssh.AuthMethod {
+	if password == "" || h == nil || h.Auth != model.AuthPassword {
+		return nil
+	}
+	return []ssh.AuthMethod{
+		ssh.Password(password),
+		// 兼容部分服务器使用 keyboard-interactive 认证
+		ssh.KeyboardInteractive(passwordAnswer(password)),
+	}
 }
 
 // passwordAnswer 用保存的密码应答 keyboard-interactive 提示。

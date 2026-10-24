@@ -12,11 +12,9 @@ import (
 )
 
 func TestStoreCRUD(t *testing.T) {
-	dir := t.TempDir()
-	os.Setenv("XDG_CONFIG_HOME", dir)
-	t.Cleanup(func() { os.Unsetenv("XDG_CONFIG_HOME") })
+	dir := filepath.Join(t.TempDir(), "simple-connect")
 
-	s, err := Load()
+	s, err := LoadWithOptions(Options{Dir: dir})
 	if err != nil {
 		t.Fatalf("加载失败: %v", err)
 	}
@@ -34,12 +32,12 @@ func TestStoreCRUD(t *testing.T) {
 	if err := s.SetPassword(h, "secret123"); err != nil {
 		t.Fatalf("保存密码失败: %v", err)
 	}
-	if pass, ok := s.Password(h); !ok || pass != "secret123" {
-		t.Fatalf("密码读取异常: ok=%v pass=%q", ok, pass)
+	if pass, ok, err := s.Password(h); err != nil || !ok || pass != "secret123" {
+		t.Fatalf("密码读取异常: err=%v ok=%v pass=%q", err, ok, pass)
 	}
 
 	// 重新加载验证持久化
-	s2, err := Load()
+	s2, err := LoadWithOptions(Options{Dir: dir})
 	if err != nil {
 		t.Fatalf("重新加载失败: %v", err)
 	}
@@ -50,8 +48,8 @@ func TestStoreCRUD(t *testing.T) {
 	if h2 == nil || h2.Name != "测试机" || !h2.HasPassword {
 		t.Fatalf("重载后数据异常: %+v", h2)
 	}
-	if pass, ok := s2.Password(h2); !ok || pass != "secret123" {
-		t.Fatalf("重载后密码异常: ok=%v", ok)
+	if pass, ok, err := s2.Password(h2); err != nil || !ok || pass != "secret123" {
+		t.Fatalf("重载后密码异常: err=%v ok=%v pass=%q", err, ok, pass)
 	}
 
 	if err := s2.Delete(h.ID); err != nil {
@@ -60,34 +58,8 @@ func TestStoreCRUD(t *testing.T) {
 	if len(s2.Hosts()) != 0 {
 		t.Fatal("删除后连接数应为 0")
 	}
-	if pass, ok := s2.Password(h2); ok && pass == "secret123" {
+	if pass, ok, _ := s2.Password(h2); ok && pass == "secret123" {
 		t.Fatal("删除后密码应被清除")
-	}
-}
-
-func TestFileSecrets(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "secrets.json")
-	fs := &fileSecrets{path: path}
-
-	if v, ok, _ := fs.Get("k"); ok || v != "" {
-		t.Fatal("空存储不应有值")
-	}
-	if err := fs.Set("k", "v1"); err != nil {
-		t.Fatalf("Set 失败: %v", err)
-	}
-	st, _ := os.Stat(path)
-	if st.Mode().Perm() != 0o600 {
-		t.Fatalf("文件权限应为 0600，实际 %v", st.Mode().Perm())
-	}
-	if v, ok, _ := fs.Get("k"); !ok || v != "v1" {
-		t.Fatalf("Get 失败: %v %v", ok, v)
-	}
-	if err := fs.Delete("k"); err != nil {
-		t.Fatalf("Delete 失败: %v", err)
-	}
-	if v, ok, _ := fs.Get("k"); ok || v != "" {
-		t.Fatal("删除后不应有值")
 	}
 }
 
@@ -95,9 +67,7 @@ func TestFileSecrets(t *testing.T) {
 // 每次调用都会 OpenFile 锁文件，fd 相互独立，可真实竞争 flock。
 func loadTempStore(t *testing.T, dir string) *Store {
 	t.Helper()
-	os.Setenv("XDG_CONFIG_HOME", dir)
-	t.Cleanup(func() { os.Unsetenv("XDG_CONFIG_HOME") })
-	s, err := Load()
+	s, err := LoadWithOptions(Options{Dir: filepath.Join(dir, "simple-connect")})
 	if err != nil {
 		t.Fatalf("加载失败: %v", err)
 	}
@@ -307,4 +277,29 @@ func TestStoreConcurrentReadWriteSameInstance(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// TestStoreUpdatePreservesPasswordFlag 回归：Update 不得用调用方旧快照里的
+// HasPassword 覆盖磁盘值（密码本才是密码是否存在的权威来源）。多实例场景下
+// A 打开表单后 B 保存了密码，A 再改字段时不能把标记写回 false。
+func TestStoreUpdatePreservesPasswordFlag(t *testing.T) {
+	_, s := newVaultTestStore(t)
+	h := &model.Host{Name: "原名", Host: "127.0.0.1", User: "root", Auth: model.AuthPassword}
+	if err := s.Add(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPassword(h, "pass"); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := *h
+	stale.Name = "改名"
+	stale.HasPassword = false // 模拟编辑期间另一实例保存了密码
+	if err := s.Update(&stale); err != nil {
+		t.Fatal(err)
+	}
+	got := s.Find(h.ID)
+	if got == nil || got.Name != "改名" || !got.HasPassword {
+		t.Fatalf("普通字段应更新、HasPassword 应保留: %+v", got)
+	}
 }

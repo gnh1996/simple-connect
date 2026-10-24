@@ -16,6 +16,7 @@ const (
 	pageList page = iota
 	pageForm
 	pageSFTP
+	pageVault
 )
 
 // 退出后主程序要执行的动作
@@ -33,8 +34,12 @@ const (
 type navListMsg struct{}
 type navFormMsg struct{ host *model.Host } // host 为 nil 表示新增
 type navSFTPMsg struct{ host *model.Host }
+type navVaultMsg struct{}
 type backToListMsg struct{}
 type formSavedMsg struct{}
+type vaultReadyMsg struct{}
+type vaultBackMsg struct{}
+type vaultQuitMsg struct{}
 
 // 连接与退出
 type connectMsg struct{ host *model.Host }
@@ -56,6 +61,7 @@ type Root struct {
 	list   *listModel
 	form   *formModel
 	sftp   *sftpModel
+	vault  *vaultModel
 	Action Action
 	HostID string
 }
@@ -69,6 +75,13 @@ func NewRoot(s *store.Store) *Root {
 // main 在 SSH/SFTP 往返（tea.Program 重建）间保存状态，避免过滤词、光标与
 // 在线状态被重置。
 func NewRootWithListState(s *store.Store, st *ListState) *Root {
+	if !s.VaultReady() {
+		return &Root{
+			Store: s,
+			page:  pageVault,
+			vault: newVaultModel(s, false),
+		}
+	}
 	return &Root{
 		Store: s,
 		page:  pageList,
@@ -112,7 +125,7 @@ func NewSFTPRoot(s *store.Store, h *model.Host, sess *session.Handle) *Root {
 }
 
 func (m *Root) Init() tea.Cmd {
-	// 三个页面各自显式处理，避免 switch over iota 常量漏 case 的告警
+	// 四个页面各自显式处理，避免 switch over iota 常量漏 case 的告警
 	switch m.page {
 	case pageSFTP:
 		if m.sftp != nil {
@@ -126,6 +139,10 @@ func (m *Root) Init() tea.Cmd {
 		if m.list != nil {
 			return m.list.Init()
 		}
+	case pageVault:
+		if m.vault != nil {
+			return m.vault.Init()
+		}
 	}
 	return nil
 }
@@ -137,6 +154,19 @@ func (m *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.HostID = msg.host.ID
 		return m, tea.Cmd(func() tea.Msg { return tea.Quit() })
 	case quitMsg:
+		m.Action = ActionQuit
+		return m, tea.Cmd(func() tea.Msg { return tea.Quit() })
+	case navVaultMsg:
+		m.vault = newVaultModel(m.Store, m.list != nil)
+		m.page = pageVault
+		return m, m.vault.Init()
+	case vaultReadyMsg, vaultBackMsg:
+		if !m.Store.VaultReady() {
+			m.Action = ActionQuit
+			return m, tea.Cmd(func() tea.Msg { return tea.Quit() })
+		}
+		return m.enterList()
+	case vaultQuitMsg:
 		m.Action = ActionQuit
 		return m, tea.Cmd(func() tea.Msg { return tea.Quit() })
 	case navFormMsg:
@@ -169,6 +199,12 @@ func (m *Root) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		sm, c := m.sftp.Update(msg)
 		m.sftp = sm
 		cmd = c
+	case pageVault:
+		if m.vault != nil {
+			vm, c := m.vault.Update(msg)
+			m.vault = vm
+			cmd = c
+		}
 	default:
 		lm, c := m.list.Update(msg)
 		m.list = lm
@@ -182,9 +218,19 @@ func (m *Root) returnToList() (tea.Model, tea.Cmd) {
 		m.sftp.close()
 		m.sftp = nil
 	}
+	return m.enterList()
+}
+
+// enterList 进入列表页：保留已有列表状态（从表单/SFTP/密码库返回时），
+// 若列表尚未创建（启动时因密钥问题停在密码库页）则新建。
+func (m *Root) enterList() (tea.Model, tea.Cmd) {
 	m.page = pageList
 	_ = m.Store.Reload() // 回到列表时同步最新配置（多实例并发编辑可见）
-	m.list.reload(m.Store.Hosts())
+	if m.list == nil {
+		m.list = newListModelWithState(m.Store, nil)
+	} else {
+		m.list.reload(m.Store.Hosts())
+	}
 	return m, m.list.Init()
 }
 
@@ -198,6 +244,10 @@ func (m *Root) View() tea.View {
 	case pageSFTP:
 		if m.sftp != nil {
 			v = m.sftp.View()
+		}
+	case pageVault:
+		if m.vault != nil {
+			v = m.vault.View()
 		}
 	default:
 		if m.list != nil {

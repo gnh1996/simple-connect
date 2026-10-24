@@ -257,7 +257,10 @@ func (m *sftpModel) Init() tea.Cmd {
 			// 会话挂起唤起：复用同一 SSH 连接（免重新认证，SFTP 通道独立）
 			conn, err = sftpc.NewConnFromSSH(m.sshClient)
 		} else {
-			pass, _ := m.store.Password(m.host)
+			pass, _, perr := m.store.Password(m.host)
+			if perr != nil {
+				return sftpConnMsg{err: perr}
+			}
 			opts := []sshc.Option{}
 			if m.hostKeyCallback != nil {
 				opts = append(opts, sshc.WithHostKeyCallback(m.hostKeyCallback))

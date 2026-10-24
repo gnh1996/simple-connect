@@ -18,7 +18,7 @@ simple-connect 是一个使用 Go 开发的 SSH/SFTP 连接管理 TUI 应用：
 | SSH | `golang.org/x/crypto/ssh` | 最新 |
 | SSH config | `github.com/kevinburke/ssh_config` | 最新 |
 | SFTP | `github.com/pkg/sftp` | 最新 |
-| 密钥存储 | `github.com/zalando/go-keyring` | 最新 |
+| 密钥存储 | `filippo.io/age`（X25519 + AEAD） | 最新 |
 
 ## 目录结构
 
@@ -26,23 +26,23 @@ simple-connect 是一个使用 Go 开发的 SSH/SFTP 连接管理 TUI 应用：
 main.go                  # 入口：TUI ⇄ 自建 SSH 会话 ⇄ SFTP 页循环（会话中热键可唤起 SFTP）
 internal/
   model/                 # 数据模型（Host、AuthType）
-  store/                 # 持久化：JSON 配置 + Secrets 接口（keyring / 文件兜底）
+  store/                 # 持久化：hosts.json + 加密密码本（age X25519）+ 本地密钥文件
   ssh/                   # SSH 客户端、状态探活、known_hosts、agent 检测、~/.ssh/config
   sftp/                  # SFTP 传输与浏览逻辑：Dial/List/Remove/Transfer/Upload/Download
   session/               # 自建交互会话：raw 模式 + PTY 透传 + resize（unix SIGWINCH / windows 轮询）
   exec/                  # 调用系统 ssh/sftp（跨平台，后备降级用）
   applog/                # 轻量错误日志落盘（用户缓存目录，0600）
-  tui/                   # Bubble Tea 界面（root/list/form/sftp 页面）
+  tui/                   # Bubble Tea 界面（root/list/form/sftp/vault 页面）
   testutil/              # 测试辅助：内存 SSH/SFTP 服务器（含 shell/keyboard-interactive）
 ```
 
 ## 连接机制（重点）
 
-- **自建会话**：`sshc.Connect`（读 keyring 保存的密码/密钥认证）→ `session.StartInteractive`（本地终端 raw 模式 + 远程 PTY 字节透传）。不做终端渲染，本地终端即渲染器，vim/tmux 与系统 ssh 表现一致。
+- **自建会话**：`sshc.Connect`（读加密密码本中的密码/密钥认证）→ `session.StartInteractive`（本地终端 raw 模式 + 远程 PTY 字节透传）。不做终端渲染，本地终端即渲染器，vim/tmux 与系统 ssh 表现一致。
 - **热键唤起 SFTP（挂起而非断开）**：会话中按 `Ctrl+X f` 只**挂起**透传并返回 `ErrDetach`——**不关闭 SSH 连接与远程 shell**，`oscTracker` 静音丢弃挂起期间输出（防污染 SFTP 页），目录/进程/连接全部保持。main 进入该主机 SFTP 页（`sftpLoop`），SFTP **复用同一 SSH 连接**（`sftpc.NewConnFromSSH`，免重新认证），`q` 后 `sess.Resume()` **原样恢复**同一会话（不清屏、不发任何字节，仅发一次尺寸同步 `WindowChange`；仅首次进入时在**请求 PTY 前**清屏（`clearScreen`，早于登录 banner，避免 banner 被擦除 + 空白闪烁）并注入 cwd 钩子），再次挂起则继续循环。`Session.Wait()` 只起一次 goroutine，经 channel 复用（`Handle.waitDone`）；detach 不调 `s.Close()`、不关 `StdinPipe`（避免 EOF）。输入经 `StdinPipe()` 手动泵（`pumpInput`，勿用 `s.Stdin`，会因内部 stdin goroutine 阻塞 `Wait` 死锁）；unix 下基于 `poll(2)` + 自管道阻塞读（`pollInput`，detach 时向自管道写字节唤醒干净退出，无 10ms 轮询延迟），Windows 阻塞读（detach 后残留读取 goroutine，下次按键自行退出，可能吞一键）。
 - **cwd 追踪（SSH 路径带到 SFTP）**：SSH 协议不提供 cwd 查询，靠 shell 在提示符前上报 OSC 133;cwd（`oscTracker` 解析，**解析后将该序列从输出中剔除**，不污染终端）。**注意 sshd 默认 `AcceptEnv` 拒绝 PROMPT_COMMAND**（env 注入失效），因此**首次进入会话时经 stdin 注入钩子命令**（`cwdHookCommand`）：先定义 `_sc_cwd` 函数，bash 追加 PROMPT_COMMAND（`${PROMPT_COMMAND:+...}` 展开，**`set -u` 安全**）、zsh 走 `precmd_functions` 追加（eval 包裹防 POSIX 语法错）、sh 静默降级，变量引用一律 `${VAR:-}`；远程 tmux 内用 passthrough 序列上报。回显隐藏靠 PTY 层 `ECHO=0`（pty-req 即关 ECHO）：**bash 的 readline 尊重该标志故注入命令不回显；zsh 的 ZLE 始终重绘，钩子命令与 `stty echo` 会在首屏留下约 4 行（观感问题，功能无影响）**。`stty echo` 由 `restoreRemoteEcho` **单独成行**发送（非 POSIX shell 解析钩子行失败时不致 ECHO 永久关闭而盲打）；钩子注入（`injectCwdHook`）与回显恢复各自记状态（`hookInjected`/`echoRestored`），写入失败时下次 Resume **只重试失败项**（已成功字节不重发，避免 PROMPT_COMMAND 重复追加）；清屏单独记 `cleared`，由 `clearScreen` 在 `Handle.start()` 请求 PTY **之前**执行（若晚于 PTY 建立，会擦掉已到达的登录 banner 并留下约 0.6s 空白，表现为连接闪烁），不受注入结果影响；命令本体无控制序列（避免干扰 readline）；成功后仅发送一次，恢复时不发。SFTP 打开时用 `sess.Cwd()` 定位远程栏。**oscTracker 跨 Write 边界处理易踩坑**：`scan` 在「无 ESC 序列」分支（`i<0`）不得向 `t.buf` 保留已透传数据（否则登录横幅等纯文本跨边界重复输出、光标错位）；`Write` 合并残留时须拷贝到独立切片避免与 `t.buf` 共享底层数组。**只对「`\x1b]133;cwd=` 前缀或其路径未收尾」的字节做跨边界保留（≤10 字节），其余一切（含 pi 这类 TUI 的 OSC 8/133、同步输出 `\x1b[?2026h..l`、光标定位/隐藏序列）一律立即原样透传，绝不因等某个 BEL 而扣住大段尾部**——否则会把每按键整帧差分重绘 TUI 的输出拆包延迟，残帧重绘擦掉输入法 preedit → 拼音选词阶段字母闪烁（系统 ssh 无字节处理故正常）。终止符兼容 BEL 与 ST（`ESC \`）；前缀匹配后超阈值（`oscMaxKeep`）仍无终止符时**整体透传而非截断**（不静默丢字节）；写本地终端在锁外进行（stdout 单 writer，避免慢写阻塞 detach 静音）。改前必看 `TestOSCTrackerNoDuplicateOnBoundary` 与 `TestOSCTrackerPiterminalNoHold`。
 - **~/.ssh/config**：`sshc.Connect` 会合并 config（`Host` 别名、`User`、`Port`、`IdentityFile`、`ProxyJump`），跳板经隧道链式连接，跳板复用目标保存的密码。**注意：必须基于解析后的 `*ssh_config.Config` 取值（`sshConfigGetter`），禁止直接用 `ssh_config.Get`**——后者在无匹配条目时返回默认值（Port=22、IdentityFile=~/.ssh/identity），会把不在 config 中的主机改错端口和认证方式（严重 bug，已有回归测试 `TestResolveSSHConfigNoConfigMatch`）。
-- **认证**：`authMethods` = 私钥 + 密码 + keyboard-interactive（保存密码应答）+ ssh-agent，依次尝试。
+- **认证**：`authMethods` 按主机认证方式生成：私钥认证 = 私钥 + ssh-agent；密码认证 = password + keyboard-interactive（保存密码应答）+ ssh-agent。**私钥认证主机即使残留历史密码也不得回落到密码认证**（`passwordAuthMethods` 按 `h.Auth` 门控）。
 - **内嵌 SFTP**：列表页进入用 `sshc.ConnectRaw` 独立连接（不合并 config，避免测试污染与意外行为）；会话挂起唤起复用 `sess.SSHClient()`（`NewConnFromSSH`，不重新认证）。
 - **降级**：自建会话失败时 main 提示是否降级用系统 `ssh`。
 - **TerminalModes** 与 OpenSSH 对齐（ECHO/ECHOE/ICRNL/ONLCR/OPOST/CS8 等）。
@@ -69,7 +69,9 @@ internal/
 - **本地路径用 `filepath`、远程路径用 `path`**：SFTP 本地栏导航（`enterCurrent`/`goUp`/`mkdir`）一律 `filepath.Join`/`localParent`（filepath.Dir），Windows 盘符路径下 `path.Dir` 会直接坏；远程栏保持 POSIX `path`。
 - **并发安全**：跨 goroutine 共享状态（传输进度等）必须加锁，禁止在 Cmd 闭包内直接修改 UI 模型字段（存在数据竞争）。
 - **关联匹配优先数据库/服务端处理**：SFTP 目录读取、删除等一律走 `pkg/sftp` 原生接口，禁止本地缓存后拼接。
-- **凭据安全**：密码不落明文配置（hosts.json），经 `store.Secrets` 接口存入系统 keyring，无 keyring 时兜底文件（0600），并在 UI 显示"密码明文存储"警告。
+- **凭据安全（加密密码本）**：密码写入 `vault.age`（age X25519 + AEAD），密钥文件 `vault.key` 保存 age identity（0600），默认与密码本同目录。保存时保留上一份加密 `vault.age.bak`；实际删除密码条目时同步移除 `.bak`（删除无密码主机不影响备份），重置会删 `.bak`。`config.json` 的 `key_path` 记录自定义密钥路径；启动参数 `--key-file` 仅一次性覆盖、不写配置。TUI 列表展示两者路径，密钥在配置目录内时提示「建议独立保管」；`p` 进入密码库页可改路径/重置。**有 `vault.age` 时绝不自动生成新密钥**；密钥缺失/不匹配只允许改路径或重置。重置=删除当前 `vault.age`/`.bak`/旧密钥，生成新密钥对和空密码本，清空 `has_password`，不提供恢复。**不迁移旧版 `secrets.json` / keyring**：新版不读取、不删除旧数据，升级后需重新输入密码。
+- **密码清除**：表单编辑密码主机时 `Ctrl+D` 清除已保存密码；切换到私钥认证保存时自动清除旧密码，避免不可见的残留凭据。`Ctrl+D` 后的清除标记会被任何实际改变密码框内容的输入取消（含粘贴/IME，不能只判断 `KeyPressMsg`）。
+- **密码标记一致性**：`hosts.json` 的 `has_password` 是密码本的派生标记；`Store.Update` 保留磁盘值（不随表单旧快照覆盖），由 `SetPassword`/启动对账维护。
 - **免密引导**：密码认证且已保存密码时 `connectHint()` 返回空（自建会话直连免密）；仅当未保存密码、密钥未入 agent、agent 未运行时进入"待确认"状态（Enter 二次确认 / Esc 取消）。agent 检测在 `internal/ssh/agent_check.go`（跨平台：unix 走 `SSH_AUTH_SOCK`，Windows 走 OpenSSH agent 命名管道），仅本地毫秒级检查，禁止在连接后阻塞。
 
 ## 测试要求
@@ -81,6 +83,8 @@ internal/
 - 注意：测试服务器 `WithServerWorkingDirectory` 只对相对路径生效，测试中远程路径一律基于 `env.Root` 拼绝对路径。
 - 注意：`sshc.Connect` 会读取真实 `~/.ssh/config`，**测试一律用 `ConnectRaw`/`sftpc.Dial`** 避免污染；config 合并逻辑用注入的 `configGetter` 单测覆盖。
 - 新增功能必须补测试；修改传输/导航逻辑必须跑通 e2e 测试，并可用 `go test -race` 校验并发安全。
+- 密码本测试用 `store.LoadWithOptions(Options{Dir: ...})` 隔离目录，**不读写任何系统 keyring**。覆盖：age 密文/权限、密钥缺失不自动生成、密钥不匹配不改写、自定义 `--key-file`/`config.json`、重置删除与重建、并发 `SetPassword`。
+- 表单密码清除（`Ctrl+D`、切私钥自动清除）与 `passwordAuthMethods` 按认证方式门控需有回归测试。
 
 ## 验证命令
 
@@ -95,4 +99,4 @@ go test ./... -count=1
 - 自建会话使用 `charmbracelet/x/term` 设置/恢复本地终端 raw 模式（unix + Windows console）；resize 转发 unix 用 `SIGWINCH`、Windows 用轮询。
 - 系统命令 `ssh`/`sftp` 仅作降级后备（`internal/exec/launcher.go`）；Windows 下缺失时提示安装。
 - Windows 下通过 `hide_windows.go`（build tag `windows`）隐藏控制台窗口。
-- keyring 后端随平台自动切换（macOS Keychain / Linux Secret Service / Windows 凭据管理器）。
+- 密码本与密钥文件均为跨平台普通文件；密钥路径在 TUI/`--key-file` 中指定，**不依赖系统 keyring/Keychain/DPAPI**。旧版 `secrets.json` / keyring 数据不读取、不迁移。

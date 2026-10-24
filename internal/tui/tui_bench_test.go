@@ -3,7 +3,7 @@ package tui
 import (
 	"fmt"
 	"io/fs"
-	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -15,19 +15,8 @@ import (
 // benchStore 基准专用 store（临时配置目录，避免污染真实配置）
 func benchStore(b *testing.B) *store.Store {
 	b.Helper()
-	dir := b.TempDir()
-	old, had := os.LookupEnv("XDG_CONFIG_HOME")
-	if err := os.Setenv("XDG_CONFIG_HOME", dir); err != nil {
-		b.Fatal(err)
-	}
-	b.Cleanup(func() {
-		if had {
-			_ = os.Setenv("XDG_CONFIG_HOME", old)
-		} else {
-			_ = os.Unsetenv("XDG_CONFIG_HOME")
-		}
-	})
-	s, err := store.Load()
+	dir := filepath.Join(b.TempDir(), "simple-connect")
+	s, err := store.LoadWithOptions(store.Options{Dir: dir})
 	if err != nil {
 		b.Fatal(err)
 	}

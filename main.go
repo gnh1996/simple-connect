@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -40,10 +41,12 @@ func reportErr(prefix string, err error) {
 }
 
 func run() error {
+	keyFile := flag.String("key-file", "", "密码本密钥文件路径（默认与密码本同目录）")
+	flag.Parse()
 	if err := ensureInteractiveTTY(); err != nil {
 		return err
 	}
-	s, err := store.Load()
+	s, err := store.LoadWithOptions(store.Options{KeyFile: strings.TrimSpace(*keyFile)})
 	if err != nil {
 		return err
 	}
@@ -134,7 +137,10 @@ func sftpLoop(s *store.Store, h *model.Host, sess *session.Handle) error {
 // startSSH 使用保存的凭据建立自建交互会话并透传。
 // detach（Ctrl+X f）时返回挂起的 *session.Handle 与 ErrDetach；会话正常结束返回 nil。
 func startSSH(s *store.Store, h *model.Host) (*session.Handle, error) {
-	pass, _ := s.Password(h)
+	pass, _, err := s.Password(h)
+	if err != nil {
+		return nil, fmt.Errorf("读取密码失败: %w", err)
+	}
 	// 连接所有权在本函数内已显式管理（defer + transferred）：成功/挂起由会话接管，
 	// 其余路径释放。静态检查无法跨函数推断 StartInteractive 的所有权转移，故抑制。
 	//noinspection GoResourceLeak
